@@ -10,17 +10,17 @@ from jax import jit, vmap, grad, random, lax
 #     # 'enhacement' : jnp.array((52, 5), dtype=int)
 # }
 
-seed = 42
-key = random.key(seed)
-order = random.permutation(key, 52)
-ranks = order % 13
-suits = order // 13
-
+# seed = 42
+# key = random.key(seed)
+# order = random.permutation(key, 52)
+# ranks = order % 13
+# suits = order // 13
 
 @jit
 def scoreHand(rank, suit, valid):
     rank_counts = (jax.nn.one_hot(rank, 13) * valid[:, None]).sum(axis=0)
     suit_counts = (jax.nn.one_hot(suit, 4) * valid[:, None]).sum(axis=0)
+    scoring_mask = valid
 
     top_ranks = jnp.sort(rank_counts)[::-1]
     top_suits = jnp.sort(suit_counts)[::-1]
@@ -28,8 +28,8 @@ def scoreHand(rank, suit, valid):
     is_foak = top_ranks[0] >= 4
     is_full = (top_ranks[0] == 3) & (top_ranks[1] == 2)
 
-    # add the ace as a low bit just for straight detection
     present = rank_counts > 0
+    # add the ace as a low bit just for straight detection
     ace_low = jnp.concatenate([present[12:], present])
     is_straight = jnp.convolve(ace_low, jnp.ones(5)).max() == 5
 
