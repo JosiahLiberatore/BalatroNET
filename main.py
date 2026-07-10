@@ -16,6 +16,18 @@ from jax import jit, vmap, grad, random, lax
 # ranks = order % 13
 # suits = order // 13
 
+MASK_CHOICE = jnp.array([0, 1, 0, 0, 0, 1, 1, 1, 2])
+
+# index-aligned with HAND_NAMES (and the argmax flag array, and MASK_CHOICE)
+#                       SF  4oak  full  flush strt  3oak  2pair pair  high
+BASE_CHIPS = jnp.array([100,  60,   40,   35,   30,   30,   20,   10,   5])
+BASE_MULT  = jnp.array([  8,   7,    4,    4,    4,    3,    2,    2,   1])
+BASE_CARD_CHIPS = jnp.array([2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11])
+
+# index i = position i in the argmax flag array above — keep the two in sync
+HAND_NAMES = ["straight_flush", "four_kind", "full_house", "flush", "straight",
+              "three_kind", "two_pair", "pair", "high_card"]
+
 @jit
 def scoreHand(rank, suit, valid):
     rank_counts = (jax.nn.one_hot(rank, 13) * valid[:, None]).sum(axis=0)
@@ -40,33 +52,72 @@ def scoreHand(rank, suit, valid):
     is_straight_flush = is_flush & is_straight
 
     handtype = jnp.argmax(jnp.array([is_straight_flush, is_foak, is_full, is_flush, is_straight, is_toak, is_twopair, is_pair, True]))
-    return handtype
+
+    # set the scoring mask (played cards that score)
+    valid_mask = valid.astype(bool)
+    mask_all = valid_mask
+    mask_group = (rank_counts[rank] >= 2) & valid_mask
+    highest_card = jnp.argmax(jnp.where(valid_mask, rank, -1))
+    mask_high = jax.nn.one_hot(highest_card, 5).astype(bool) & valid_mask
+
+    masks = jnp.stack([mask_all, mask_group, mask_high])
+    scoring_mask = masks[MASK_CHOICE[handtype]]
+
+    # calculate chips x mult
+    chips = BASE_CHIPS[handtype]
+    mult = BASE_MULT[handtype]
+
+    # What I want is on each rank, and if scoring mask is true, lookup
+    # BASE_CARD_CHIPS[i] where i = rank
+    card_chips = rank & scoring_mask
 
 
-# index i = position i in the argmax flag array above — keep the two in sync
-HAND_NAMES = ["straight_flush", "four_kind", "full_house", "flush", "straight",
-              "three_kind", "two_pair", "pair", "high_card"]
+
+
+    return handtype, scoring_mask
+
+    #return chips * mult
+    return jnp.argmax(handtype)
+
 
 
 TEST_HANDS = [
-    ("high card",      [12, 11, 7, 3, 1],   [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "high_card"),
-    ("pair",           [11, 11, 5, 2, 0],   [2, 3, 1, 0, 3], [1, 1, 1, 1, 1], "pair"),
-    ("two pair",       [11, 11, 5, 5, 0],   [2, 3, 1, 0, 3], [1, 1, 1, 1, 1], "two_pair"),
-    ("three of a kind",[5, 5, 5, 11, 0],    [1, 0, 3, 2, 3], [1, 1, 1, 1, 1], "three_kind"),
-    ("straight",       [3, 4, 5, 6, 7],     [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "straight"),
-    ("ace-low straight",[12, 0, 1, 2, 3],   [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "straight"),
-    ("flush",          [1, 4, 7, 9, 11],    [2, 2, 2, 2, 2], [1, 1, 1, 1, 1], "flush"),
-    ("full house",     [11, 11, 5, 5, 5],   [2, 3, 1, 0, 3], [1, 1, 1, 1, 1], "full_house"),
-    ("four of a kind", [5, 5, 5, 5, 11],    [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "four_kind"),
-    ("straight flush", [3, 4, 5, 6, 7],     [3, 3, 3, 3, 3], [1, 1, 1, 1, 1], "straight_flush"),
+    # (name, ranks, suits, valid, expected type, expected scoring mask)
+    ("high card",      [12, 11, 7, 3, 1],   [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "high_card",   [1, 0, 0, 0, 0]),
+    ("pair",           [11, 11, 5, 2, 0],   [2, 3, 1, 0, 3], [1, 1, 1, 1, 1], "pair",        [1, 1, 0, 0, 0]),
+    ("two pair",       [11, 11, 5, 5, 0],   [2, 3, 1, 0, 3], [1, 1, 1, 1, 1], "two_pair",    [1, 1, 1, 1, 0]),
+    ("three of a kind",[5, 5, 5, 11, 0],    [1, 0, 3, 2, 3], [1, 1, 1, 1, 1], "three_kind",  [1, 1, 1, 0, 0]),
+    ("straight",       [3, 4, 5, 6, 7],     [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "straight",    [1, 1, 1, 1, 1]),
+    ("ace-low straight",[12, 0, 1, 2, 3],   [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "straight",    [1, 1, 1, 1, 1]),
+    ("flush",          [1, 4, 7, 9, 11],    [2, 2, 2, 2, 2], [1, 1, 1, 1, 1], "flush",       [1, 1, 1, 1, 1]),
+    ("full house",     [11, 11, 5, 5, 5],   [2, 3, 1, 0, 3], [1, 1, 1, 1, 1], "full_house",  [1, 1, 1, 1, 1]),
+    ("four of a kind", [5, 5, 5, 5, 11],    [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "four_kind",   [1, 1, 1, 1, 0]),
+    ("straight flush", [3, 4, 5, 6, 7],     [3, 3, 3, 3, 3], [1, 1, 1, 1, 1], "straight_flush", [1, 1, 1, 1, 1]),
     # traps:
-    ("2-card pair",    [11, 11, 0, 0, 0],   [2, 3, 0, 0, 0], [1, 1, 0, 0, 0], "pair"),
-    ("4-card no-straight",[3, 4, 5, 6, 0],  [0, 1, 2, 3, 0], [1, 1, 1, 1, 0], "high_card"),
-    ("pair-in-run",    [3, 3, 4, 5, 6],     [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "pair"),
+    ("2-card pair",    [11, 11, 0, 0, 0],   [2, 3, 0, 0, 0], [1, 1, 0, 0, 0], "pair",        [1, 1, 0, 0, 0]),
+    ("4-card no-straight",[3, 4, 5, 6, 0],  [0, 1, 2, 3, 0], [1, 1, 1, 1, 0], "high_card",   [0, 0, 0, 1, 0]),
+    ("pair-in-run",    [3, 3, 4, 5, 6],     [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "pair",        [1, 1, 0, 0, 0]),
+    # mask traps: padding slots share ranks with real cards — the & valid seatbelt
+    ("deuce pair",     [0, 0, 0, 0, 0],     [0, 1, 0, 0, 0], [1, 1, 0, 0, 0], "pair",        [1, 1, 0, 0, 0]),
+    # mask trap: padding holds an ace — the where(valid, rank, -1) sentinel
+    ("high card + junk ace", [7, 3, 12, 12, 12], [0, 1, 0, 0, 0], [1, 1, 0, 0, 0], "high_card", [1, 0, 0, 0, 0]),
+    ("single card",    [9, 0, 0, 0, 0],     [2, 0, 0, 0, 0], [1, 0, 0, 0, 0], "high_card",   [1, 0, 0, 0, 0]),
+    # position traps: groups scattered across slots — mask must follow the cards, not the slot order
+    ("mid pair",       [7, 11, 3, 3, 1],    [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "pair",        [0, 0, 1, 1, 0]),
+    ("split two pair", [5, 11, 5, 2, 11],   [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "two_pair",    [1, 1, 1, 0, 1]),
+    ("split trips",    [11, 5, 11, 3, 11],  [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "three_kind",  [1, 0, 1, 0, 1]),
+    ("mid kicker quads",[5, 5, 11, 5, 5],   [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "four_kind",   [1, 1, 0, 1, 1]),
+    ("high card last", [1, 3, 7, 2, 12],    [0, 1, 2, 3, 0], [1, 1, 1, 1, 1], "high_card",   [0, 0, 0, 0, 1]),
 ]
 
 if __name__ == "__main__":
-    for name, r, s, v, expected in TEST_HANDS:
-        got = HAND_NAMES[int(scoreHand(jnp.array(r), jnp.array(s), jnp.array(v)))]
-        status = "PASS" if got == expected else "FAIL"
-        print(f"{status}  {name:20s} got: {got:15s} expected: {expected}")
+    for name, r, s, v, expected, expected_mask in TEST_HANDS:
+        out = scoreHand(jnp.array(r), jnp.array(s), jnp.array(v))
+        got = HAND_NAMES[out[0]]
+        got_mask = out[1]
+        type_ok = got == expected
+        mask_ok = bool(jnp.array_equal(got_mask, jnp.array(expected_mask, dtype=bool)))
+        status = "PASS" if (type_ok and mask_ok) else "FAIL"
+        got_m = "".join(str(int(m)) for m in got_mask)
+        want_m = "".join(str(m) for m in expected_mask)
+        print(f"{status}  {name:22s} type: {got:15s} (want {expected:15s}) mask: {got_m} (want {want_m})")
