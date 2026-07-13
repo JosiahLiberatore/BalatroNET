@@ -30,3 +30,6 @@ wandb/
 .idea/
 Thumbs.db
 .DS_Store
+
+# local-only benchmark (not part of the project)
+bench_scorehand.py
