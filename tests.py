@@ -1,8 +1,10 @@
 """Test suites — scoreHand table today, env suites as the env grows."""
 
+import jax
 import jax.numpy as jnp
 
 from scoring import scoreHand, HAND_NAMES
+from env import balatroEnvState, deal, MAX_HAND_SIZE, MAX_DECK_SIZE
 
 TEST_HANDS = [
     # (name, ranks, suits, valid, expected type, expected scoring mask, expected score)
@@ -57,5 +59,63 @@ def run_tests():
         print(f"scoreHand: all {len(TEST_HANDS)} tests passed")
 
 
+def _hand_lanes(vals):
+    """32-wide hand array from the first few lanes; -1 = empty lane."""
+    a = jnp.full(MAX_HAND_SIZE, -1, dtype=jnp.int32)
+    return a.at[:len(vals)].set(jnp.array(vals, dtype=jnp.int32))
+
+
+def _valid_lanes(bits):
+    """32-wide bool mask from the first few lanes; rest False."""
+    m = jnp.zeros(MAX_HAND_SIZE, dtype=bool)
+    return m.at[:len(bits)].set(jnp.array(bits, dtype=bool))
+
+
+def run_deal_test():
+    # Scenario: deck is the identity order (card id == deck position), so the
+    # opening 8 cards were ids 0-7 and deck_ptr sits at 8. The player then
+    # discarded lanes 2, 5, 6 — three holes. deal must fill them from the top
+    # of the deck IN ORDER (lane 2 <- card 8, lane 5 <- card 9, lane 6 <- card 10),
+    # advance deck_ptr to 11, and touch NOTHING else.
+    key = jax.random.key(0)
+    pre = balatroEnvState(
+        hand=_hand_lanes([0, 1, -1, 3, 4, -1, -1, 7]),
+        hand_size=jnp.int32(8),
+        hand_valid=_valid_lanes([1, 1, 0, 1, 1, 0, 0, 1]),
+        deck=jnp.arange(MAX_DECK_SIZE, dtype=jnp.int32),
+        deck_size=jnp.int32(52),
+        deck_ptr=jnp.int32(8),
+        hands=jnp.int32(3),
+        discards=jnp.int32(2),
+        round=jnp.int32(1),
+        ante=jnp.int32(1),
+        chips_scored=jnp.int32(60),
+        blind_target=jnp.int32(300),
+        key=key,
+    )
+    expected = pre._replace(
+        hand=_hand_lanes([0, 1, 8, 3, 4, 9, 10, 7]),
+        hand_valid=_valid_lanes([1, 1, 1, 1, 1, 1, 1, 1]),
+        deck_ptr=jnp.int32(11),
+    )
+
+    got = deal(pre)
+    failures = []
+    for field in balatroEnvState._fields:
+        g, e = getattr(got, field), getattr(expected, field)
+        if field == "key":
+            same = bool(jnp.array_equal(jax.random.key_data(g), jax.random.key_data(e)))
+        else:
+            same = bool(jnp.array_equal(g, e))
+        if not same:
+            failures.append(f"FAIL  deal: field '{field}'\n      got:  {g}\n      want: {e}")
+    if failures:
+        print("\n".join(failures))
+        print(f"deal: {len(failures)} field(s) wrong")
+    else:
+        print("deal: refill test passed")
+
+
 if __name__ == "__main__":
     run_tests()
+    run_deal_test()
