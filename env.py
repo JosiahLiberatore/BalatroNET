@@ -73,23 +73,46 @@ def reset(key, deckSize, handSize):
     )
 
 
-@jit
+def show(state: balatroEnvState, label=""):
+    """Pretty-print a state. Plain Python — call it on concrete states only
+    (outside jit, or on the result of a jitted function), never inside one."""
+    n = int(state.hand_size)
+    cards = [f"{int(c):>3d}" if v else "  ." for c, v in
+             zip(state.hand[:n], state.hand_valid[:n])]
+    ptr, size = int(state.deck_ptr), int(state.deck_size)
+    upcoming = " ".join(str(int(c)) for c in state.deck[ptr:min(ptr + 8, size)])
+    print(f"--- {label or 'state'} ---")
+    print(f"  hand  [{' '.join(cards)}]   ({int(state.hand_valid.sum())}/{n} full)")
+    print(f"  deck  ptr {ptr}/{size}, next: {upcoming}{' ...' if ptr + 8 < size else ''}")
+    print(f"  hands {int(state.hands)}  discards {int(state.discards)}"
+          f"  |  ante {int(state.ante)} round {int(state.round)}"
+          f"  |  chips {int(state.chips_scored)}/{int(state.blind_target)}")
+
+# @jit
 def deal(state : balatroEnvState):
+
     deal_count = state.hand_size - state.hand_valid.sum()
     empty = ~state.hand_valid
 
+    print(state.hand_valid)
+
+    show(state)
+
     queue = jnp.cumsum(empty)
+
+    
 
     print(empty)
 
-
+    print(queue)
 
     # new_hand = hand_valid.aray
 
-    # return state._replace(hand=new_hand)
+    # return state._replace(hand=new_hand,
+    #                        deck_ptr = deal_count + state.deck_ptr,
 
+    #                          )
 
-    pass
 
 
 if __name__ == "__main__":
@@ -118,11 +141,8 @@ if __name__ == "__main__":
     )
 
     got = deal(pre)
-    print("--- deal returned ---")
     if got is None:
-        print("None (deal has no return yet)")
+        print("--- deal returned None (no return yet) ---")
     else:
-        print("hand[:12]:      ", got.hand[:12])
-        print("hand_valid[:12]:", got.hand_valid[:12].astype(int))
-        print("deck_ptr:       ", got.deck_ptr)
-        print("want hand[:8]:   [0 1 8 3 4 9 10 7], valid all 1, ptr 11")
+        show(got, "deal returned")
+    print("want hand[:8]:   [0 1 8 3 4 9 10 7], valid all 1, ptr 11")
