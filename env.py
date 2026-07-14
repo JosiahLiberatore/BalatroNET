@@ -30,17 +30,25 @@ class balatroEnvState(NamedTuple):
     key : jax.random.key
 
 class balatroAction(NamedTuple):
-    verb : jnp.int32 # Play or Discard
-    select : jnp.array(MAX_HAND_SIZE) # cards in hand
+    verb : jnp.int32 # 0 = Play, 1 = Discard
+    select : jnp.ndarray # (32, ), bool
 
 
 @jit
 def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvState, float, bool]:
-    #deal hand
 
-
-
+    state = deal(state)
+    # what was the action?
     # play
+    # get scoreHand input (suit[5], rank[5], valid[5])
+
+    state.hand_valid
+    action.select
+
+    played_hand = action.select & state.hand_valid
+
+    
+
         # score
         # deal
     # discard
