@@ -1,8 +1,7 @@
 # BalatroNET — working notes
 
 ## next:
-Finish reset (grow (deck, key) into a full EnvState: hand slots + valid mask via refill,
-plays/discards/chips counters, key INSIDE state), then env_step(state, action):
+env_step(state, action):
 1. derive played cards from the action (verb + 32-lane select mask) — compact selected
    slots down to scoreHand's 5 lanes with the SAME stable-argsort trick as the dead-card sort
 2. score * (verb == PLAY) — no branch
@@ -24,14 +23,22 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       to the back via STABLE argsort on the bool mask (stability preserves shuffle order =
       fair shuffle of live cards); spends subkey, carries key; smoke-tested: clean partition
       at 52, every id exactly once. Returns (deck, key) — not yet a full EnvState
-- [ ] EnvState NamedTuple + finish reset — hand slots + valid, plays/discards/chips scalars,
-      key inside state; refill() helper (fill empty slots while under hand_size: cumsum trick)
+- [x] EnvState NamedTuple (balatroEnvState) + full reset + deal — deal jitted & passing
+      (cumsum queue + gather + fill mask); spec test uses a NON-identity deck
+      (deck[i] = i+13 mod 52) so src-vs-deck[src] mixups can't pass green (commit e8c8c43)
 - [ ] play/discard actions + round loop (blind progression)
 - [ ] later: joker pipeline (trigger points, lax.switch table, slot state, modifiers/aura struct, card-writers via carry)
 
 ## design decisions (so far)
 - struct-of-arrays everywhere; staple into one tensor only in observe()
 - cards = 5 fields: rank, suit, enhancement, edition, seal — closed set, jokers only read/write these
+- CARD ID CONVENTION (pinned): id 0-51 is IDENTITY only — rank = id % 13, suit = id // 13,
+  derived on the fly, never stored. Duplicate cards = the same id appearing in multiple lanes.
+  Enhancements/editions/seals are INSTANCE properties: later they live in collection arrays
+  indexed by a permanent instance slot (card_id[128], enhancement[128], ...), and deck/hand
+  switch from holding ids to holding instance indices (one extra gather hop: card_id[hand] % 13).
+  Current code is this design with the indirection collapsed (card_id[i] = i), so the
+  migration is mechanical when enhancements arrive.
 - hand = indices into deck + valid mask; attributes gathered through one index list
 - never sort/permute an attribute array alone — permute indices, or collapse to histograms
 - branch → compute-all-then-select (where/argmax); search → per-element question (gathers)
