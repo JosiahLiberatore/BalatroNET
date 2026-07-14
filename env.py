@@ -29,16 +29,24 @@ class balatroEnvState(NamedTuple):
     blind_target : jnp.int32
     key : jax.random.key
 
+class balatroAction(NamedTuple):
+    verb : jnp.int32 # Play or Discard
+    select : jnp.array(MAX_HAND_SIZE) # cards in hand
+
 
 @jit
-def env_step(state: balatroEnvState) -> tuple[balatroEnvState, float, bool]:
+def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvState, float, bool]:
     #deal hand
+
+
 
     # play
         # score
         # deal
     # discard
         # deal
+    
+
 
     next_state = balatroEnvState(playerHand=jnp.zeros((MAX_HAND_SIZE)))
 
@@ -72,22 +80,6 @@ def reset(key, deckSize, handSize):
         key=key,
     )
 
-
-def show(state: balatroEnvState, label=""):
-    """Pretty-print a state. Plain Python — call it on concrete states only
-    (outside jit, or on the result of a jitted function), never inside one."""
-    n = int(state.hand_size)
-    cards = [f"{int(c):>3d}" if v else "  ." for c, v in
-             zip(state.hand[:n], state.hand_valid[:n])]
-    ptr, size = int(state.deck_ptr), int(state.deck_size)
-    upcoming = " ".join(str(int(c)) for c in state.deck[ptr:min(ptr + 8, size)])
-    print(f"--- {label or 'state'} ---")
-    print(f"  hand  [{' '.join(cards)}]   ({int(state.hand_valid.sum())}/{n} full)")
-    print(f"  deck  ptr {ptr}/{size}, next: {upcoming}{' ...' if ptr + 8 < size else ''}")
-    print(f"  hands {int(state.hands)}  discards {int(state.discards)}"
-          f"  |  ante {int(state.ante)} round {int(state.round)}"
-          f"  |  chips {int(state.chips_scored)}/{int(state.blind_target)}")
-
 @jit
 def deal(state : balatroEnvState):
     deal_count = state.hand_size - state.hand_valid.sum()
@@ -104,6 +96,22 @@ def deal(state : balatroEnvState):
         hand_valid=new_hand_valid,
         deck_ptr=state.deck_ptr+deal_count
     )
+
+def show(state: balatroEnvState, label=""):
+    """Pretty-print a state. Plain Python — call it on concrete states only
+    (outside jit, or on the result of a jitted function), never inside one."""
+    n = int(state.hand_size)
+    cards = [f"{int(c):>3d}" if v else "  ." for c, v in
+             zip(state.hand[:n], state.hand_valid[:n])]
+    ptr, size = int(state.deck_ptr), int(state.deck_size)
+    upcoming = " ".join(str(int(c)) for c in state.deck[ptr:min(ptr + 8, size)])
+    print(f"--- {label or 'state'} ---")
+    print(f"  hand  [{' '.join(cards)}]   ({int(state.hand_valid.sum())}/{n} full)")
+    print(f"  deck  ptr {ptr}/{size}, next: {upcoming}{' ...' if ptr + 8 < size else ''}")
+    print(f"  hands {int(state.hands)}  discards {int(state.discards)}"
+          f"  |  ante {int(state.ante)} round {int(state.round)}"
+          f"  |  chips {int(state.chips_scored)}/{int(state.blind_target)}")
+
 
 
 if __name__ == "__main__":
