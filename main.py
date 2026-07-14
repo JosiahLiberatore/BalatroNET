@@ -6,11 +6,12 @@ Entry point. Runs the test suites today; becomes the training loop later.
 from jax import random
 
 from env import reset
-from tests import run_tests, run_deal_test
+from tests import run_tests, run_deal_test, run_env_step_test
 
 if __name__ == "__main__":
     run_tests()
     run_deal_test()
+    run_env_step_test()
 
     seed = 42
     key = random.key(seed)

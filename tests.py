@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from scoring import scoreHand, HAND_NAMES
-from env import balatroEnvState, deal, MAX_HAND_SIZE, MAX_DECK_SIZE
+from env import balatroEnvState, balatroAction, deal, env_step, MAX_HAND_SIZE, MAX_DECK_SIZE
 
 TEST_HANDS = [
     # (name, ranks, suits, valid, expected type, expected scoring mask, expected score)
@@ -119,6 +119,90 @@ def run_deal_test():
         print("deal: refill test passed")
 
 
+def run_env_step_test():
+    # Scenario: mid-round, full 8-card hand, agent PLAYs a scattered two pair.
+    # Conventions this test pins down: verb 0 = PLAY (1 = DISCARD);
+    # rank = id % 13, suit = id // 13; reward = the hand's score (dense, for now);
+    # done = (chips_scored >= blind_target) | (hands == 0).
+    #
+    #   lane:   0    1    2    3    4    5    6    7
+    #   id:     2   24   33   11    5   46   44   27
+    #   rank:   2   11    7   11    5    7    5    1     (11 = K, 5 = 7, 7 = 9)
+    #
+    # select lanes 1, 3, 4, 6 -> K K 7 7 = two pair. Scattered on purpose
+    # (exercises stable-argsort compaction), and lanes 2/5 hold an UNselected
+    # pair of 9s — if step scores the whole hand instead of the selection,
+    # the result comes out wrong.
+    #
+    # Score: ranks [11, 11, 5, 5] is the same two pair as the scoreHand test
+    # row -> (20 + 10+10+7+7) * 2 = 108. chips 60 -> 168 (< 300), hands 3 -> 2,
+    # so done stays False.
+    #
+    # Deck: positions 0-7 hold the hand's ids (they WERE dealt — ptr is 8),
+    # positions 8+ hold the remaining 44 ids ascending: deck[8..11] = 0, 1, 3, 4.
+    # NOT identity (deck[8] != 8), so a src-vs-deck[src] mixup refills with
+    # 8, 9, 10, 11 instead and fails visibly. Refill: lane1<-0, lane3<-1,
+    # lane4<-3, lane6<-4, ptr -> 12.
+    hand_ids = [2, 24, 33, 11, 5, 46, 44, 27]
+    rest = [i for i in range(52) if i not in hand_ids]
+    key = jax.random.key(0)
+    pre = balatroEnvState(
+        hand=_hand_lanes(hand_ids),
+        hand_size=jnp.int32(8),
+        hand_valid=_valid_lanes([1, 1, 1, 1, 1, 1, 1, 1]),
+        deck=jnp.array(hand_ids + rest + list(range(52, MAX_DECK_SIZE)),
+                       dtype=jnp.int32),
+        deck_size=jnp.int32(52),
+        deck_ptr=jnp.int32(8),
+        hands=jnp.int32(3),
+        discards=jnp.int32(2),
+        round=jnp.int32(1),
+        ante=jnp.int32(1),
+        chips_scored=jnp.int32(60),
+        blind_target=jnp.int32(300),
+        key=key,
+    )
+    action = balatroAction(
+        verb=jnp.int32(0),  # PLAY
+        select=_valid_lanes([0, 1, 0, 1, 1, 0, 1, 0]),
+    )
+    expected = pre._replace(
+        hand=_hand_lanes([2, 0, 33, 1, 3, 46, 4, 27]),
+        hand_valid=_valid_lanes([1, 1, 1, 1, 1, 1, 1, 1]),
+        deck_ptr=jnp.int32(12),
+        hands=jnp.int32(2),
+        chips_scored=jnp.int32(168),
+    )
+    expected_reward = 108
+    expected_done = False
+
+    try:
+        got, reward, done = env_step(pre, action)
+    except Exception as e:
+        print(f"env_step: NOT RUNNABLE yet ({type(e).__name__}: {e})")
+        return
+
+    failures = []
+    for field in balatroEnvState._fields:
+        g, e = getattr(got, field), getattr(expected, field)
+        if field == "key":
+            same = bool(jnp.array_equal(jax.random.key_data(g), jax.random.key_data(e)))
+        else:
+            same = bool(jnp.array_equal(g, e))
+        if not same:
+            failures.append(f"FAIL  env_step: field '{field}'\n      got:  {g}\n      want: {e}")
+    if int(reward) != expected_reward:
+        failures.append(f"FAIL  env_step: reward\n      got:  {int(reward)}\n      want: {expected_reward}")
+    if bool(done) != expected_done:
+        failures.append(f"FAIL  env_step: done\n      got:  {bool(done)}\n      want: {expected_done}")
+    if failures:
+        print("\n".join(failures))
+        print(f"env_step: {len(failures)} check(s) wrong")
+    else:
+        print("env_step: two-pair play test passed")
+
+
 if __name__ == "__main__":
     run_tests()
     run_deal_test()
+    run_env_step_test()
