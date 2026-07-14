@@ -72,17 +72,20 @@ def _valid_lanes(bits):
 
 
 def run_deal_test():
-    # Scenario: deck is the identity order (card id == deck position), so the
-    # opening 8 cards were ids 0-7 and deck_ptr sits at 8. The player then
-    # discarded lanes 2, 5, 6 — three holes. deal must fill them from the top
-    # of the deck IN ORDER (lane 2 <- card 8, lane 5 <- card 9, lane 6 <- card 10),
+    # Scenario: deck[i] = i + 13 (mod 52) — deliberately NOT the identity, so
+    # confusing a deck POSITION (src) with the CARD at that position shows up
+    # as visibly wrong values. Opening 8 cards were deck[0..7] = 13..20 and
+    # deck_ptr sits at 8. The player then discarded lanes 2, 5, 6 — three
+    # holes. deal must fill them from the top of the deck IN ORDER
+    # (lane 2 <- deck[8]=21, lane 5 <- deck[9]=22, lane 6 <- deck[10]=23),
     # advance deck_ptr to 11, and touch NOTHING else.
     key = jax.random.key(0)
     pre = balatroEnvState(
-        hand=_hand_lanes([0, 1, -1, 3, 4, -1, -1, 7]),
+        hand=_hand_lanes([13, 14, -1, 16, 17, -1, -1, 20]),
         hand_size=jnp.int32(8),
         hand_valid=_valid_lanes([1, 1, 0, 1, 1, 0, 0, 1]),
-        deck=jnp.arange(MAX_DECK_SIZE, dtype=jnp.int32),
+        deck=jnp.concatenate([(jnp.arange(52, dtype=jnp.int32) + 13) % 52,
+                              jnp.arange(52, MAX_DECK_SIZE, dtype=jnp.int32)]),
         deck_size=jnp.int32(52),
         deck_ptr=jnp.int32(8),
         hands=jnp.int32(3),
@@ -94,7 +97,7 @@ def run_deal_test():
         key=key,
     )
     expected = pre._replace(
-        hand=_hand_lanes([0, 1, 8, 3, 4, 9, 10, 7]),
+        hand=_hand_lanes([13, 14, 21, 16, 17, 22, 23, 20]),
         hand_valid=_valid_lanes([1, 1, 1, 1, 1, 1, 1, 1]),
         deck_ptr=jnp.int32(11),
     )

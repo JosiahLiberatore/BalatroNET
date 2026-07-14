@@ -88,47 +88,40 @@ def show(state: balatroEnvState, label=""):
           f"  |  ante {int(state.ante)} round {int(state.round)}"
           f"  |  chips {int(state.chips_scored)}/{int(state.blind_target)}")
 
-# @jit
+@jit
 def deal(state : balatroEnvState):
-
     deal_count = state.hand_size - state.hand_valid.sum()
     empty = ~state.hand_valid
-
-    print(state.hand_valid)
-
-    show(state)
-
     queue = jnp.cumsum(empty)
+    src = state.deck_ptr + queue - 1
+    fill = empty & (queue - 1 < deal_count)
 
-    
+    new_hand = jnp.where(fill, state.deck[src], state.hand)
+    new_hand_valid = (jnp.arange(MAX_HAND_SIZE) < state.hand_size) | fill
 
-    print(empty)
-
-    print(queue)
-
-    # new_hand = hand_valid.aray
-
-    # return state._replace(hand=new_hand,
-    #                        deck_ptr = deal_count + state.deck_ptr,
-
-    #                          )
-
+    return state._replace(
+        hand=new_hand,
+        hand_valid=new_hand_valid,
+        deck_ptr=state.deck_ptr+deal_count
+    )
 
 
 if __name__ == "__main__":
     # dev scratch: `python env.py` runs deal on the test scenario from tests.py
-    # (deck = identity order, opening 8 dealt, lanes 2/5/6 discarded).
+    # (deck[i] = i+13 mod 52 — NOT identity, so src vs deck[src] mixups are
+    # visible; opening 8 dealt = cards 13..20, lanes 2/5/6 discarded).
     # NOTE: comment out the @jit on deal while developing — plain print() then
     # shows real arrays instead of tracers.
     hand = jnp.full(MAX_HAND_SIZE, -1, dtype=jnp.int32).at[:8].set(
-        jnp.array([0, 1, -1, 3, 4, -1, -1, 7], dtype=jnp.int32))
+        jnp.array([13, 14, -1, 16, 17, -1, -1, 20], dtype=jnp.int32))
     hand_valid = jnp.zeros(MAX_HAND_SIZE, dtype=bool).at[:8].set(
         jnp.array([1, 1, 0, 1, 1, 0, 0, 1], dtype=bool))
     pre = balatroEnvState(
         hand=hand,
         hand_size=jnp.int32(8),
         hand_valid=hand_valid,
-        deck=jnp.arange(MAX_DECK_SIZE, dtype=jnp.int32),
+        deck=jnp.concatenate([(jnp.arange(52, dtype=jnp.int32) + 13) % 52,
+                              jnp.arange(52, MAX_DECK_SIZE, dtype=jnp.int32)]),
         deck_size=jnp.int32(52),
         deck_ptr=jnp.int32(8),
         hands=jnp.int32(3),
@@ -145,4 +138,4 @@ if __name__ == "__main__":
         print("--- deal returned None (no return yet) ---")
     else:
         show(got, "deal returned")
-    print("want hand[:8]:   [0 1 8 3 4 9 10 7], valid all 1, ptr 11")
+    print("want hand[:8]:   [13 14 21 16 17 22 23 20], valid all 1, ptr 11")
