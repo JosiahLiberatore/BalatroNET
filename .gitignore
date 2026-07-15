@@ -26,6 +26,7 @@ wandb/
 *.npz
 
 # Editors / OS
+tempCodeRunnerFile.py
 .vscode/
 .idea/
 Thumbs.db
