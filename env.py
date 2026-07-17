@@ -37,56 +37,47 @@ class balatroAction(NamedTuple):
     select : jnp.ndarray # (32, ), bool
 
 
-#@jit
+
+@jit
 def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvState, float, bool]:
 
-    # what was the action?
-    # play
-    # get scoreHand input (suit[5], rank[5], valid[5])
-
     hand = state.hand
-    select = action.select
-
-    doublebackwardsantiinversion = ~select
-
-    order = jnp.argsort(doublebackwardsantiinversion)
-
-    cumsum = jnp.cumsum(select)
-
+    select = action.select & state.hand_valid
+    order = jnp.argsort(~select)
     cardularcards = hand[order][:5]
 
     valid = select[order][:5]
 
-    jnp.sum(select)
-
-
     suit = (cardularcards // 13)[:5]
     rank = (cardularcards % 13)[:5]
 
-    type, fjd, score = scoreHand(suit, rank, valid)
+    _, _, score = scoreHand(rank, suit, valid)
+
+    score = score * (action.verb == 0)
     
     # update the state
 
+    new_hand_valid = state.hand_valid & ~select
 
-
-
-
+    new_state = state._replace(hands=state.hands-(action.verb == 0),
+                            discards=state.discards-(action.verb == 1),
+                            hand_valid=new_hand_valid,
+                            chips_scored=state.chips_scored+score
+                            )
 
     # dbg(hand=state.hand,
     #     valid=state.hand_valid,
-    #     select=action.select,
-    #     cumsum=cumsum,
     #     cardularcards=cardularcards,
     #     order=order,
-    #     playvalid=valid
+    #     playvalid=valid,
+    #     select=select,
+    #     antiselect=~select,
+    #     new_hand_valid=new_hand_valid
     #     )
 
+    next_state = deal(new_state)
 
-    # show(state)
-
-    next_state = deal(state)
-
-    done = 0
+    done = (next_state.chips_scored >= state.blind_target) | (next_state.hands == 0)
     return next_state, score, done
 
 def _hand_lanes(vals):
