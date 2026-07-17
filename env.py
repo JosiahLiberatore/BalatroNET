@@ -24,6 +24,8 @@ class balatroEnvState(NamedTuple):
     deck : jnp.ndarray # (128) int
     deck_size : jnp.int32
     deck_ptr : jnp.int32
+    handcount : jnp.int32
+    discardcount : jnp.int32
     hands: jnp.int32
     discards: jnp.int32
     round: jnp.int32
@@ -45,6 +47,7 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     select = action.select & state.hand_valid
     order = jnp.argsort(~select)
     cardularcards = hand[order][:5]
+    verb = jnp.where(state.discards > 0, action.verb, 0)
 
     valid = select[order][:5]
 
@@ -53,14 +56,14 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
 
     _, _, score = scoreHand(rank, suit, valid)
 
-    score = score * (action.verb == 0)
+    score = score * (verb == 0)
     
     # update the state
 
     new_hand_valid = state.hand_valid & ~select
 
-    new_state = state._replace(hands=state.hands-(action.verb == 0),
-                            discards=state.discards-(action.verb == 1),
+    new_state = state._replace(hands=state.hands-(verb == 0),
+                            discards=state.discards-(verb == 1),
                             hand_valid=new_hand_valid,
                             chips_scored=state.chips_scored+score
                             )
@@ -107,6 +110,8 @@ def run_deal_test():
         deck_ptr=jnp.int32(8),
         hands=jnp.int32(3),
         discards=jnp.int32(2),
+        handcount=jnp.int32(4),
+        discardcount=jnp.int32(3),
         round=jnp.int32(1),
         ante=jnp.int32(1),
         chips_scored=jnp.int32(60),
@@ -157,6 +162,8 @@ def run_env_step_test():
         deck_ptr=jnp.int32(8),
         hands=jnp.int32(3),
         discards=jnp.int32(2),
+        handcount=jnp.int32(4),
+        discardcount=jnp.int32(3),
         round=jnp.int32(1),
         ante=jnp.int32(1),
         chips_scored=jnp.int32(60),
@@ -223,6 +230,8 @@ def reset(key, deckSize, handSize):
         deck_ptr=jnp.int32(handSize),
         hands=jnp.int32(4),
         discards=jnp.int32(3),
+        handcount=jnp.int32(4),
+        discardcount=jnp.int32(3),
         round=jnp.int32(1),
         ante=jnp.int32(1),
         chips_scored=jnp.int32(0),
