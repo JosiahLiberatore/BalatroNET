@@ -18,10 +18,10 @@ MAX_DECK_SIZE = 128
 class balatroEnvState(NamedTuple):
     # consumnables = jnp.ndarray
     # jokers = jnp.ndarray
-    hand: jnp.ndarray
+    hand: jnp.ndarray # (32) int
     hand_size : jnp.int32
-    hand_valid : jnp.array
-    deck : jnp.ndarray
+    hand_valid : jnp.array # (32) bool
+    deck : jnp.ndarray # (128) int
     deck_size : jnp.int32
     deck_ptr : jnp.int32
     hands: jnp.int32
@@ -37,36 +37,57 @@ class balatroAction(NamedTuple):
     select : jnp.ndarray # (32, ), bool
 
 
-# @jit
+#@jit
 def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvState, float, bool]:
 
     # what was the action?
     # play
     # get scoreHand input (suit[5], rank[5], valid[5])
 
-    print(state.hand_valid)
+    hand = state.hand
+    select = action.select
+
+    doublebackwardsantiinversion = ~select
+
+    order = jnp.argsort(doublebackwardsantiinversion)
+
+    cumsum = jnp.cumsum(select)
+
+    cardularcards = hand[order][:5]
+
+    valid = select[order][:5]
+
+    jnp.sum(select)
+
+
+    suit = (cardularcards // 13)[:5]
+    rank = (cardularcards % 13)[:5]
+
+    type, fjd, score = scoreHand(suit, rank, valid)
     
-    print(action.select)
+    # update the state
 
-    print(state.hand)
 
-    playable_hand = state.hand >= 0 & action.select
 
-    print(playable_hand)
-    
-    # scoreHand()
 
-        # score
-        # deal
-    # discard
-        # deal
-    
 
+
+    # dbg(hand=state.hand,
+    #     valid=state.hand_valid,
+    #     select=action.select,
+    #     cumsum=cumsum,
+    #     cardularcards=cardularcards,
+    #     order=order,
+    #     playvalid=valid
+    #     )
+
+
+    # show(state)
 
     next_state = deal(state)
 
-    reward = done = 0
-    return next_state, reward, done
+    done = 0
+    return next_state, score, done
 
 def _hand_lanes(vals):
     """32-wide hand array from the first few lanes; -1 = empty lane."""
@@ -171,24 +192,24 @@ def run_env_step_test():
         print(f"env_step: NOT RUNNABLE yet ({type(e).__name__}: {e})")
         return
 
-    # failures = []
-    # for field in balatroEnvState._fields:
-    #     g, e = getattr(got, field), getattr(expected, field)
-    #     if field == "key":
-    #         same = bool(jnp.array_equal(jax.random.key_data(g), jax.random.key_data(e)))
-    #     else:
-    #         same = bool(jnp.array_equal(g, e))
-    #     if not same:
-    #         failures.append(f"FAIL  env_step: field '{field}'\n      got:  {g}\n      want: {e}")
-    # if int(reward) != expected_reward:
-    #     failures.append(f"FAIL  env_step: reward\n      got:  {int(reward)}\n      want: {expected_reward}")
-    # if bool(done) != expected_done:
-    #     failures.append(f"FAIL  env_step: done\n      got:  {bool(done)}\n      want: {expected_done}")
-    # if failures:
-    #     print("\n".join(failures))
-    #     print(f"env_step: {len(failures)} check(s) wrong")
-    # else:
-    #     print("env_step: two-pair play test passed")
+    failures = []
+    for field in balatroEnvState._fields:
+        g, e = getattr(got, field), getattr(expected, field)
+        if field == "key":
+            same = bool(jnp.array_equal(jax.random.key_data(g), jax.random.key_data(e)))
+        else:
+            same = bool(jnp.array_equal(g, e))
+        if not same:
+            failures.append(f"FAIL  env_step: field '{field}'\n      got:  {g}\n      want: {e}")
+    if int(reward) != expected_reward:
+        failures.append(f"FAIL  env_step: reward\n      got:  {int(reward)}\n      want: {expected_reward}")
+    if bool(done) != expected_done:
+        failures.append(f"FAIL  env_step: done\n      got:  {bool(done)}\n      want: {expected_done}")
+    if failures:
+        print("\n".join(failures))
+        print(f"env_step: {len(failures)} check(s) wrong")
+    else:
+        print("env_step: two-pair play test passed")
 
 @jit
 def reset(key, deckSize, handSize):
@@ -235,20 +256,113 @@ def deal(state : balatroEnvState):
         deck_ptr=state.deck_ptr+deal_count
     )
 
+RANK_CHARS = "23456789TJQKA"   # rank = id % 13, so index 0 is the Two, 12 the Ace
+SUIT_CHARS = "CDHS"            # display only — scoring never names suits, ids are the truth
+
+def _card_name(cid):
+    """'KH'-style name for a live card id; raw number for anything else."""
+    if 0 <= cid < 52:
+        return RANK_CHARS[cid % 13] + SUIT_CHARS[cid // 13]
+    return str(cid)
+
 def show(state: balatroEnvState, label=""):
-    """Pretty-print a state. Plain Python — call it on concrete states only
-    (outside jit, or on the result of a jitted function), never inside one."""
+    """Pretty-print the FULL state, one section per concern, plus invariant
+    checks so a corrupted state announces itself. Plain Python — call it on
+    concrete states only (outside jit, or on the result of a jitted
+    function), never inside one."""
     n = int(state.hand_size)
-    cards = [f"{int(c):>3d}" if v else "  ." for c, v in
-             zip(state.hand[:n], state.hand_valid[:n])]
+    hand = [int(c) for c in state.hand]
+    valid = [bool(v) for v in state.hand_valid]
     ptr, size = int(state.deck_ptr), int(state.deck_size)
-    upcoming = " ".join(str(int(c)) for c in state.deck[ptr:min(ptr + 8, size)])
-    print(f"--- {label or 'state'} ---")
-    print(f"  hand  [{' '.join(cards)}]   ({int(state.hand_valid.sum())}/{n} full)")
-    print(f"  deck  ptr {ptr}/{size}, next: {upcoming}{' ...' if ptr + 8 < size else ''}")
-    print(f"  hands {int(state.hands)}  discards {int(state.discards)}"
-          f"  |  ante {int(state.ante)} round {int(state.round)}"
-          f"  |  chips {int(state.chips_scored)}/{int(state.blind_target)}")
+    deck = [int(c) for c in state.deck]
+
+    def row(name, cells):
+        print(f"  {name:<6s}" + "".join(f"{str(c):>4s}" for c in cells))
+
+    title = label or "state"
+    print(f"=== {title} " + "=" * max(4, 56 - len(title)))
+
+    # --- hand: lanes as columns, ids + names + mask stacked ---------------
+    print(f"hand   ({sum(valid[:n])}/{n} lanes full)")
+    row("lane", range(n))
+    row("id", hand[:n])
+    row("card", [_card_name(c) if v else "." for c, v in zip(hand[:n], valid[:n])])
+    row("valid", [int(v) for v in valid[:n]])
+    weird = [i for i in range(n, MAX_HAND_SIZE) if valid[i] or hand[i] != -1]
+    if weird:
+        print(f"  WARN  phantom lanes not empty: {weird}")
+    else:
+        print(f"  lanes {n}..{MAX_HAND_SIZE - 1}: empty (id -1, valid 0)")
+
+    # --- deck: pointer, undealt window, dead zone -------------------------
+    print(f"deck   ptr {ptr}/{size} ({size - ptr} undealt, "
+          f"{MAX_DECK_SIZE - size} dead slots parked behind)")
+    nxt = deck[ptr:min(ptr + 8, size)]
+    row("next", nxt)
+    row("card", [_card_name(c) for c in nxt])
+    if ptr + 8 < size:
+        print(f"  ... {size - ptr - 8} more undealt")
+
+    # --- round counters + blind progress ----------------------------------
+    print(f"round  hands {int(state.hands)}   discards {int(state.discards)}"
+          f"   round {int(state.round)}   ante {int(state.ante)}")
+    chips, target = int(state.chips_scored), int(state.blind_target)
+    frac = 0.0 if target <= 0 else min(chips / target, 1.0)
+    filled = int(round(frac * 20))
+    print(f"blind  {chips}/{target} chips  [{'#' * filled}{'.' * (20 - filled)}]"
+          f"  {int(frac * 100)}%")
+
+    # --- rng ---------------------------------------------------------------
+    print(f"key    {[int(x) for x in jax.random.key_data(state.key)]}"
+          f"  (raw uint32 pair)")
+
+    # --- invariants ---------------------------------------------------------
+    dealt = set(deck[:ptr])
+    checks = [
+        ("deck is a permutation of 0..127",
+         sorted(deck) == list(range(MAX_DECK_SIZE))),
+        ("live ids fill deck[:deck_size]",
+         all(c < size for c in deck[:size])),
+        ("valid hand ids were all dealt (in deck[:ptr])",
+         all(hand[i] in dealt for i in range(n) if valid[i])),
+    ]
+    bad = [name for name, ok in checks if not ok]
+    if bad:
+        for b in bad:
+            print(f"  WARN  invariant broken: {b}")
+    else:
+        print("checks permutation OK | live zone OK | hand ids dealt OK")
+
+
+def dbg(n=None, **rows):
+    """Workbench printer: stack any raw arrays lane-aligned for eyeballing
+    intermediates while building.  Bool rows print as 0 / 1 bitmaps so masks
+    read at a glance; int rows as numbers; float rows to 2 decimals.
+
+        dbg(n=10, valid=state.hand_valid, select=action.select, fill=fill)
+
+    n limits how many lanes print (default: longest row). Concrete arrays
+    only — inside @jit these are valueless tracers; un-jit while developing."""
+    rows = {k: jnp.atleast_1d(v) for k, v in rows.items()}
+    if n is None:
+        n = max(int(v.shape[0]) for v in rows.values())
+    cells = {}
+    for name, v in rows.items():
+        out = []
+        for x in v[:n]:
+            if v.dtype == bool:
+                out.append("1" if bool(x) else "0")
+            elif jnp.issubdtype(v.dtype, jnp.floating):
+                out.append(f"{float(x):.2f}")
+            else:
+                out.append(str(int(x)))
+        out += [""] * (n - len(out))          # short rows leave blank lanes
+        cells[name] = out
+    w = max(3, max(len(c) for row in cells.values() for c in row) + 1)
+    label_w = max(6, max(len(k) for k in rows) + 2)
+    print(" " * label_w + "".join(f"{i:>{w}d}" for i in range(n)))
+    for name, row_cells in cells.items():
+        print(f"{name:<{label_w}}" + "".join(f"{c:>{w}s}" for c in row_cells))
 
 
 
