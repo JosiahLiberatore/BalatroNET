@@ -5,6 +5,19 @@ from env import balatroAction, balatroEnvState
 from env import MAX_DECK_SIZE, MAX_HAND_SIZE
 from env import _hand_lanes, _valid_lanes, show, dbg
 
+def init_params(key):
+
+    key1, key2 = jax.random.split(key)
+
+    params = {}
+
+    params[0] = jax.random.normal(key1, (601, 128)) * 0.02
+    params[1] = jnp.zeros(128)
+    params[2] = jax.random.normal(key2, (128, 33)) * 0.02
+    params[3] = jnp.zeros(33)
+
+    return params
+
 #@jit
 def observe(state: balatroEnvState):
 
@@ -26,7 +39,7 @@ def observe(state: balatroEnvState):
     undealt = (pos >= state.deck_ptr) & (pos < state.deck_size)
     undealt_mask = jnp.zeros(52).at[state.deck].set(undealt.astype(float))
 
-    dbg(n = 30, hand = hand, deck=deck, undealt=undealt, undealt_mask=undealt_mask)
+    # dbg(n = 30, hand = hand, deck=deck, undealt=undealt, undealt_mask=undealt_mask)
 
     obs = jnp.concatenate([ranks, suits, hands, discards, chips_target, ante, round, undealt_mask])
 
@@ -42,12 +55,42 @@ def observe(state: balatroEnvState):
 
 
 def policy(params, obs):
-    pass
+    # params -> { "W1": (601, 128), "b1": (128, ), "W2" : (128, 33), "b2", (33,)}
+
+    W1 = params[0]
+    b1 = params[1]
+    W2 = params[2]
+    b2 = params[3]
+
+    h = jnp.tanh(obs @ W1 + b1)
+    logits = h @ W2 + b2
+    return logits
 
 
+def act(params, state : balatroEnvState, key):
 
-def act(params, obs, key):
-    pass
+    # act = balatroAction(verb=0, select = jnp.zeros(32))
+
+    obs = observe(state)
+
+    dbg(hand_valid = state.hand_valid)
+
+    state.hand_size
+
+    logits = policy(params, obs)
+
+    select = logits[1:MAX_HAND_SIZE+1]
+    verb = logits[0]
+
+
+    select_logits = select + jnp.where(obs.valid)
+
+    print(select)
+    print(verb)
+
+    flips = jax.random.uniform(key, (33,))
+
+    return 0
 
 
 if __name__ == "__main__":
@@ -81,10 +124,8 @@ if __name__ == "__main__":
 
     # show(state, "agent dev state")
 
-    obs = observe(state)
-    if obs is None:
-        print("observe: no return yet")
-    else:
-        print(f"obs shape {obs.shape}, dtype {obs.dtype}")
-        dbg(obs=obs)
+    key = jax.random.key(42)
 
+    model = init_params(key)
+
+    res = act(model, state, key)
