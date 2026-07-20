@@ -86,9 +86,13 @@ def act(params, state : balatroEnvState, key):
     select = jax.random.uniform(key1, (32,)) < select_probs
     verb = jax.random.uniform(key2) < verb_prob
 
+    temp = jnp.concat([verb_prob[None], select_probs])
+
     act = balatroAction(verb=verb.astype(jnp.int32), select=select.astype(jnp.int32))
 
-    return act
+    log_prob = jnp.where(jnp.concat([verb[None], select]) > 0, jnp.log(temp), jnp.log(1-temp)).sum()
+
+    return act, log_prob
 
 
 if __name__ == "__main__":
@@ -127,6 +131,7 @@ if __name__ == "__main__":
 
     model = init_params(init_key)
 
-    res = act(model, state, act_key)
-    print(f"verb {res.verb}")
+    res, log_prob = act(model, state, act_key)
+    print(f"verb {res.verb}, log_prob {log_prob}")
     dbg(select=res.select, hand_valid=state.hand_valid)
+    
