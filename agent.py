@@ -69,28 +69,26 @@ def policy(params, obs):
 
 def act(params, state : balatroEnvState, key):
 
-    # act = balatroAction(verb=0, select = jnp.zeros(32))
-
+    key1, key2 = jax.random.split(key)
     obs = observe(state)
-
-    dbg(hand_valid = state.hand_valid)
-
-    state.hand_size
-
     logits = policy(params, obs)
 
     select = logits[1:MAX_HAND_SIZE+1]
     verb = logits[0]
 
+    select_logits = jnp.where(state.hand_valid, select, -jnp.inf)
 
-    select_logits = select + jnp.where(obs.valid)
+    verb_logit = jnp.where(state.discards > 0, verb, -jnp.inf)
 
-    print(select)
-    print(verb)
+    select_probs = jax.nn.sigmoid(select_logits)
+    verb_prob = jax.nn.sigmoid(verb_logit)
 
-    flips = jax.random.uniform(key, (33,))
+    select = jax.random.uniform(key1, (32,)) < select_probs
+    verb = jax.random.uniform(key2) < verb_prob
 
-    return 0
+    act = balatroAction(verb=verb.astype(jnp.int32), select=select.astype(jnp.int32))
+
+    return act
 
 
 if __name__ == "__main__":
@@ -125,7 +123,10 @@ if __name__ == "__main__":
     # show(state, "agent dev state")
 
     key = jax.random.key(42)
+    init_key, act_key = jax.random.split(key)
 
-    model = init_params(key)
+    model = init_params(init_key)
 
-    res = act(model, state, key)
+    res = act(model, state, act_key)
+    print(f"verb {res.verb}")
+    dbg(select=res.select, hand_valid=state.hand_valid)
