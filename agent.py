@@ -6,11 +6,9 @@ from env import MAX_DECK_SIZE, MAX_HAND_SIZE
 from env import _hand_lanes, _valid_lanes, show, dbg
 
 def init_params(key):
-
     key1, key2 = jax.random.split(key)
 
     params = {}
-
     params[0] = jax.random.normal(key1, (601, 128)) * 0.02
     params[1] = jnp.zeros(128)
     params[2] = jax.random.normal(key2, (128, 33)) * 0.02
@@ -18,7 +16,6 @@ def init_params(key):
 
     return params
 
-#@jit
 def observe(state: balatroEnvState):
 
     hand = state.hand
@@ -134,4 +131,3 @@ if __name__ == "__main__":
     res, log_prob = act(model, state, act_key)
     print(f"verb {res.verb}, log_prob {log_prob}")
     dbg(select=res.select, hand_valid=state.hand_valid)
-    
