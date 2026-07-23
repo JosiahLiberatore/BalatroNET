@@ -28,17 +28,23 @@ def rollout(params, key):
 
 
 def train_step(params, key):
+    # runs
     keys = jax.random.split(key, 512)
-    rewards, log_probs, actions = jax.vmap(rollout, in_axes=(None, 0))(params, keys)
+    def loss_fn(params):
+        rewards, log_probs, actions = jax.vmap(rollout, in_axes=(None, 0))(params, keys)
+        returns = jax.lax.cumsum(rewards, axis=1, reverse=True)
+        advantage = returns - returns.mean(axis=0)
+        loss = -(log_probs * advantage).mean()
+        return loss
 
-    advantage = jax.lax.cumsum(rewards, axis=1, reverse=True)
 
-    loss = -(log_probs * advantage).mean()
+    loss, grads = jax.value_and_grad(loss_fn)(params)
 
-    
 
     print(loss)
 
+    print(grads[0])
+    
 
     pass
 
