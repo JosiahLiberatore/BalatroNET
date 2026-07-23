@@ -28,7 +28,16 @@ def rollout(params, key):
 
 
 def train_step(params, key):
+    keys = jax.random.split(key, 512)
+    rewards, log_probs, actions = jax.vmap(rollout, in_axes=(None, 0))(params, keys)
 
+    advantage = jax.lax.cumsum(rewards, axis=1, reverse=True)
+
+    loss = -(log_probs * advantage).mean()
+
+    
+
+    print(loss)
 
 
     pass
@@ -44,13 +53,17 @@ if __name__ == "__main__":
     key, init_key = jax.random.split(key)
     model = init_params(init_key)
 
-    print(f"expected real-step log_prob ~ {expected:.4f}\n")
-    for i, k in enumerate(jax.random.split(key, 3)):
-        rewards, log_probs, actions = rollout(model, k)
-        print(f"rollout {i}:")
-        for step in range(7):
-            verb = "discard" if actions.verb[step] else "play   "
-            select = "".join(str(int(b)) for b in actions.select[step][:8])
-            print(f"  step {step}:  {verb} {select}   log_prob {log_probs[step]:+9.4f}   reward {rewards[step]:8.1f}")
-        print(f"  total reward {rewards.sum():.1f}\n")
+    for x in range(1):
+        key, subkey = jax.random.split(key)
+        train_step(model, subkey)
+
+    # print(f"expected real-step log_prob ~ {expected:.4f}\n")
+    # for i, k in enumerate(jax.random.split(key, 3)):
+    #     rewards, log_probs, actions = rollout(model, k)
+    #     print(f"rollout {i}:")
+    #     for step in range(7):
+    #         verb = "discard" if actions.verb[step] else "play   "
+    #         select = "".join(str(int(b)) for b in actions.select[step][:8])
+    #         print(f"  step {step}:  {verb} {select}   log_prob {log_probs[step]:+9.4f}   reward {rewards[step]:8.1f}")
+    #     print(f"  total reward {rewards.sum():.1f}\n")
 
