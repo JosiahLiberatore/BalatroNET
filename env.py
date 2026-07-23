@@ -44,7 +44,7 @@ class balatroAction(NamedTuple):
 def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvState, float, bool]:
 
     hand = state.hand
-    select = action.select & state.hand_valid
+    select = (action.select & state.hand_valid).astype(bool)
     order = jnp.argsort(~select)
     cardularcards = hand[order][:5]
     verb = jnp.where(state.discards > 0, action.verb, 0)
