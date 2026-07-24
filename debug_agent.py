@@ -80,7 +80,7 @@ def inspect_episode(params, key):
     state = reset(sk, 52, 8)
     blind = int(state.blind_target)
     print(f"=== episode  (blind target {blind}) ===")
-    print(" st  action   hand (*=selected)                made           rew   chips  h/d   deck   p_dsc   logp")
+    print(" st  action   hand (*=selected)                made          sel    rew   chips  h/d   deck   p_dsc   logp")
     total, plays, discards = 0, 0, 0
     for step in range(7):
         verb_prob, select_probs = _policy_probs(params, state)
@@ -102,6 +102,8 @@ def inspect_episode(params, key):
         hand_str = " ".join(cells)
 
         made = hand if eff_verb == 0 else "--"
+        # raw = every lane the policy flipped on; eff = after valid mask + 5-cap
+        n_sel = f"{int(action.select.sum()):2d}/{int(sel.sum())}"
         pre_chips = int(state.chips_scored)
         hd = f"{int(state.hands)}/{int(state.discards)}"
         deck = f"{int(state.deck_ptr):2d}/{int(state.deck_size)}"
@@ -115,7 +117,7 @@ def inspect_episode(params, key):
             discards += 1
         total += reward
         verbname = "PLAY" if eff_verb == 0 else "DISCARD"
-        print(f" {step:2d}  {verbname:7s}  {hand_str:31s}  {made:12s} {reward:4d}  {pre_chips:3d}/{blind}  {hd:4s} {deck}  {float(verb_prob):5.2f}  {float(log_prob):+6.2f}")
+        print(f" {step:2d}  {verbname:7s}  {hand_str:31s}  {made:12s} {n_sel:5s} {reward:4d}  {pre_chips:3d}/{blind}  {hd:4s} {deck}  {float(verb_prob):5.2f}  {float(log_prob):+6.2f}")
         if bool(done):
             break
     cleared = total >= blind
