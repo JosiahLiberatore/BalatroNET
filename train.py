@@ -1,13 +1,17 @@
+import datetime
+import os
+
 import jax
 import jax.numpy as jnp
+from tensorboardX import SummaryWriter
 
 from env import balatroAction, balatroEnvState
 from env import MAX_DECK_SIZE, MAX_HAND_SIZE
 from env import _hand_lanes, _valid_lanes, show, dbg, reset, env_step
 from agent import init_params, observe, policy, act
 
+LEARNT_RATE = 5e-2
 
-# reset, set up train_step loop
 def rollout(params, key):
 
     def step_fn(carry: tuple[balatroEnvState, jax.Array, jax.Array], x):
@@ -26,7 +30,7 @@ def rollout(params, key):
 
     return output
 
-
+@jax.jit
 def train_step(params, key):
     # runs
     keys = jax.random.split(key, 512)
@@ -34,19 +38,21 @@ def train_step(params, key):
         rewards, log_probs, actions = jax.vmap(rollout, in_axes=(None, 0))(params, keys)
         returns = jax.lax.cumsum(rewards, axis=1, reverse=True)
         advantage = returns - returns.mean(axis=0)
+        advantage = advantage / (advantage.std() + 1e-9)
         loss = -(log_probs * advantage).mean()
-        return loss
+        mean_return = rewards.sum(axis=1).mean()
+        return loss, mean_return
 
+    (loss, mean_return), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-    loss, grads = jax.value_and_grad(loss_fn)(params)
+    lr = LEARNT_RATE
 
+    params = jax.tree.map(lambda p, g: p - (lr * g), params, grads)
 
-    print(loss)
-
-    print(grads[0])
-    
-
-    pass
+    # instrumentation only: nothing below feeds the update above
+    grad_norm = jnp.sqrt(sum(jnp.sum(g * g) for g in jax.tree.leaves(grads)))
+    metrics = {"return": mean_return, "loss": loss, "grad_norm": grad_norm}
+    return params, metrics
 
 if __name__ == "__main__":
     # dev scratch: eyeball rollout. Fresh params -> probs ~ 0.5, so every REAL
@@ -59,9 +65,34 @@ if __name__ == "__main__":
     key, init_key = jax.random.split(key)
     model = init_params(init_key)
 
-    for x in range(1):
+    # absolute path anchored to THIS script, so no matter where python is
+    # launched from (terminal, Code Runner, ...) runs always land in the same
+    # place: D:\Claude\BalatroNET\runs. Each run gets its own timestamped
+    # subfolder so old curves stay for comparison.
+    runs_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+    run_dir = os.path.join(runs_root, f"{datetime.datetime.now():%Y%m%d-%H%M%S}")
+    writer = SummaryWriter(run_dir)
+    print(f"logging to {run_dir}")
+    print(f"view with:  tensorboard --logdir {runs_root}")
+
+    STEPS = 2500
+    for step in range(STEPS):
         key, subkey = jax.random.split(key)
-        train_step(model, subkey)
+        model, metrics = train_step(model, subkey)
+        for name, value in metrics.items():
+            writer.add_scalar(name, float(value), step)
+        if step % 25 == 0:
+            print(f"step {step:4d}   return {float(metrics['return']):7.2f}   "
+                  f"loss {float(metrics['loss']):8.3f}   "
+                  f"grad_norm {float(metrics['grad_norm']):8.3f}")
+
+    writer.close()
+
+    # checkpoint the trained weights so debug_agent.py can inspect them later
+    from debug_agent import save_params
+    save_params(model)
+    print(f"done. view with:  tensorboard --logdir {runs_root}")
+    print("inspect with:  python debug_agent.py")
 
     # print(f"expected real-step log_prob ~ {expected:.4f}\n")
     # for i, k in enumerate(jax.random.split(key, 3)):

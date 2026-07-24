@@ -16,27 +16,27 @@ MAX_DECK_SIZE = 128
 
 
 class balatroEnvState(NamedTuple):
-    # consumnables = jnp.ndarray
-    # jokers = jnp.ndarray
-    hand: jnp.ndarray # (32) int
-    hand_size : jnp.int32
-    hand_valid : jnp.array # (32) bool
-    deck : jnp.ndarray # (128) int
-    deck_size : jnp.int32
-    deck_ptr : jnp.int32
-    handcount : jnp.int32
-    discardcount : jnp.int32
-    hands: jnp.int32
-    discards: jnp.int32
-    round: jnp.int32
-    ante: jnp.int32
-    chips_scored : jnp.int32
-    blind_target : jnp.int32
-    key : jax.random.key
+    # consumables : jax.Array   # (N,)   int32   -- future
+    # jokers      : jax.Array   # (N,)   int32   -- future
+    hand         : jax.Array   # (32,)  int32   -- card id per lane, -1 = empty
+    hand_size    : jax.Array   # scalar int32   -- number of lanes currently in play
+    hand_valid   : jax.Array   # (32,)  bool    -- which lanes hold a live card
+    deck         : jax.Array   # (128,) int32   -- permutation of card ids
+    deck_size    : jax.Array   # scalar int32   -- live cards; rest are dead slots
+    deck_ptr     : jax.Array   # scalar int32   -- next card to deal
+    handcount    : jax.Array   # scalar int32   -- hands granted this round
+    discardcount : jax.Array   # scalar int32   -- discards granted this round
+    hands        : jax.Array   # scalar int32   -- hands remaining
+    discards     : jax.Array   # scalar int32   -- discards remaining
+    round        : jax.Array   # scalar int32
+    ante         : jax.Array   # scalar int32
+    chips_scored : jax.Array   # scalar int32   -- progress toward blind
+    blind_target : jax.Array   # scalar int32   -- chips needed to clear
+    key          : jax.Array   # PRNG key (new-style typed key)
 
 class balatroAction(NamedTuple):
-    verb : jnp.int32 # 0 = Play, 1 = Discard
-    select : jnp.ndarray # (32, ), bool
+    verb   : jax.Array   # scalar int32   -- 0 = Play, 1 = Discard
+    select : jax.Array   # (32,)  bool    -- which lanes to act on
 
 
 
