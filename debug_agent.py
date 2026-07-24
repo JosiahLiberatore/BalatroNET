@@ -85,7 +85,7 @@ def inspect_episode(params, key):
     for step in range(7):
         verb_prob, select_probs = _policy_probs(params, state)
         key, sk = jax.random.split(key)
-        action, log_prob = act(params, state, sk)
+        action, log_prob, _ = act(params, state, sk)
 
         # env forces PLAY when no discards remain; show the EFFECTIVE verb,
         # and the EFFECTIVE selection (valid lanes, first 5, like env_step)
@@ -139,7 +139,7 @@ def behavior_stats(params, key, n=256):
         for step in range(7):
             verb_prob, select_probs = _policy_probs(params, state)
             key, sk = jax.random.split(key)
-            action, _ = act(params, state, sk)
+            action, _, _ = act(params, state, sk)
 
             eff_verb = int(action.verb) if int(state.discards) > 0 else 0
             tot_selected += int((action.select.astype(bool) & state.hand_valid).sum())
