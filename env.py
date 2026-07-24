@@ -45,6 +45,7 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
 
     hand = state.hand
     select = (action.select & state.hand_valid).astype(bool)
+    select = select & (jnp.cumsum(select) <= 5)
     order = jnp.argsort(~select)
     cardularcards = hand[order][:5]
     verb = jnp.where(state.discards > 0, action.verb, 0)

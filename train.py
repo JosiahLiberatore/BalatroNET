@@ -45,9 +45,7 @@ def train_step(params, key):
 
     (loss, mean_return), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-    lr = LEARNT_RATE
-
-    params = jax.tree.map(lambda p, g: p - (lr * g), params, grads)
+    params = jax.tree.map(lambda p, g: p - (LEARNT_RATE * g), params, grads)
 
     # instrumentation only: nothing below feeds the update above
     grad_norm = jnp.sqrt(sum(jnp.sum(g * g) for g in jax.tree.leaves(grads)))
@@ -75,7 +73,7 @@ if __name__ == "__main__":
     print(f"logging to {run_dir}")
     print(f"view with:  tensorboard --logdir {runs_root}")
 
-    STEPS = 2500
+    STEPS = 5000
     for step in range(STEPS):
         key, subkey = jax.random.split(key)
         model, metrics = train_step(model, subkey)

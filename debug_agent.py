@@ -65,6 +65,7 @@ def _binary_entropy(p):
 def _played_hand(state, action):
     """Reproduce env_step's selection to name the hand the agent would make."""
     select = (action.select & state.hand_valid).astype(bool)
+    select = select & (jnp.cumsum(select) <= 5)   # env's 5-card cap
     order = jnp.argsort(~select)
     cards = state.hand[order][:5]
     valid5 = select[order][:5]
@@ -77,34 +78,47 @@ def _played_hand(state, action):
 def inspect_episode(params, key):
     key, sk = jax.random.split(key)
     state = reset(sk, 52, 8)
-    print(f"=== episode  (blind target {int(state.blind_target)}) ===")
+    blind = int(state.blind_target)
+    print(f"=== episode  (blind target {blind}) ===")
+    print(" st  action   hand (*=selected)                made           rew   chips  h/d   deck   p_dsc   logp")
     total, plays, discards = 0, 0, 0
     for step in range(7):
         verb_prob, select_probs = _policy_probs(params, state)
         key, sk = jax.random.split(key)
         action, log_prob = act(params, state, sk)
 
-        # env forces PLAY when no discards remain; show the EFFECTIVE verb
+        # env forces PLAY when no discards remain; show the EFFECTIVE verb,
+        # and the EFFECTIVE selection (valid lanes, first 5, like env_step)
         eff_verb = int(action.verb) if int(state.discards) > 0 else 0
-        n_sel = int((action.select.astype(bool) & state.hand_valid).sum())
-        ent = _binary_entropy(jnp.concatenate([verb_prob[None], select_probs]))
-        hand, names, _ = _played_hand(state, action)   # from the PRE-step state
+        sel = action.select.astype(bool) & state.hand_valid
+        sel = sel & (jnp.cumsum(sel) <= 5)
+        hand, _, _ = _played_hand(state, action)       # from the PRE-step state
+
+        n = int(state.hand_size)
+        cells = []
+        for i in range(n):
+            name = _card_name(int(state.hand[i])) if bool(state.hand_valid[i]) else "--"
+            cells.append(f"{name:2s}{'*' if bool(sel[i]) else ' '}")
+        hand_str = " ".join(cells)
+
+        made = hand if eff_verb == 0 else "--"
+        pre_chips = int(state.chips_scored)
+        hd = f"{int(state.hands)}/{int(state.discards)}"
+        deck = f"{int(state.deck_ptr):2d}/{int(state.deck_size)}"
 
         state, reward, done = env_step(state, action)
         reward = int(reward)
 
         if eff_verb == 0:
-            what = f"PLAY    {hand:12s} [{' '.join(names)}]"
             plays += 1
         else:
-            what = "DISCARD"
             discards += 1
         total += reward
-        print(f" step {step}: {what:40s} {n_sel} cards  reward {reward:4d}   "
-              f"(verb_p {float(verb_prob):.2f}  entropy {ent:4.1f}  logp {float(log_prob):+.2f})")
+        verbname = "PLAY" if eff_verb == 0 else "DISCARD"
+        print(f" {step:2d}  {verbname:7s}  {hand_str:31s}  {made:12s} {reward:4d}  {pre_chips:3d}/{blind}  {hd:4s} {deck}  {float(verb_prob):5.2f}  {float(log_prob):+6.2f}")
         if bool(done):
             break
-    cleared = total >= int(state.blind_target)
+    cleared = total >= blind
     print(f" -> {plays} plays, {discards} discards, total {total}, "
           f"cleared: {'YES' if cleared else 'no'}\n")
 
