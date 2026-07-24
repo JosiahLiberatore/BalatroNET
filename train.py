@@ -95,7 +95,7 @@ if __name__ == "__main__":
     print(f"logging to {run_dir}")
     print(f"view with:  tensorboard --logdir {runs_root}")
 
-    STEPS = 15000
+    STEPS = 50000
     for step in range(STEPS):
         key, subkey = jax.random.split(key)
         model, m, v, t, metrics = train_step(model, subkey, m, v, t)
