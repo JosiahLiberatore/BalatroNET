@@ -7,13 +7,19 @@ A reinforcement learning agent built natively in JAX to play and learn Balatro.
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
-pip install -U jax
+pip install jax tensorboardX tensorboard
 ```
+
+JAX runs CPU-only on Windows; GPU needs WSL2 or a cloud runtime.
 
 ## Run
 
 ```bash
-python main.py
+python train.py          # train (resumes from runs/ckpt_latest.pkl)
+python train.py fresh     # ignore any checkpoint, start over
+python debug_agent.py     # inspect a trained policy (episode + 256-ep stats)
+tensorboard --logdir runs # view training curves
+python main.py            # run the env/scoring test suites
 ```
 
 ## v0.1 Results
