@@ -22,6 +22,15 @@ import os
 import sys
 import pickle
 
+# the suit pips (♠♥♦♣) are non-cp1252; force utf-8 so the Windows console
+# doesn't choke when printing them
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+# on legacy Windows conhost this flips on ANSI escape processing; a no-op in
+# Windows Terminal / VS Code where colors already work
+if sys.platform == "win32":
+    os.system("")
+
 import jax
 import jax.numpy as jnp
 
@@ -32,6 +41,29 @@ from scoring import scoreHand, HAND_NAMES
 
 RUNS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
 DEFAULT_CKPT = os.path.join(RUNS_ROOT, "params_latest.pkl")
+
+# env names suits as letters (C D H S); swap in pips for the human-facing readout
+SUIT_EMOJI = {"C": "♣", "D": "♦", "H": "♥", "S": "♠"}
+# 4-color deck: hearts red, diamonds blue, clubs green, spades black
+RESET = "\033[0m"
+SUIT_COLOR = {"♥": "\033[91m", "♦": "\033[94m", "♣": "\033[92m", "♠": "\033[30m"}
+
+def _emoji_name(cid):
+    """'K♠'-style name: _card_name gives 'KS', we replace the suit letter."""
+    name = _card_name(int(cid))
+    if len(name) == 2 and name[1] in SUIT_EMOJI:
+        return name[0] + SUIT_EMOJI[name[1]]
+    return name
+
+def _color_card(cid):
+    """(colored_str, visible_width) for a card cell: colorize just the suit pip
+    so ANSI escapes never enter the width-measured length."""
+    name = _emoji_name(cid)
+    if len(name) == 2 and name[1] in SUIT_COLOR:
+        col = SUIT_COLOR[name[1]]
+        colored = f"{name[0]}{col}{name[1]}{RESET}" if col else name
+        return colored, 2
+    return name, len(name)
 
 
 # ---------- checkpoint io (params is a dict of jax arrays) ----------
@@ -95,11 +127,18 @@ def inspect_episode(params, key):
         hand, _, _ = _played_hand(state, action)       # from the PRE-step state
 
         n = int(state.hand_size)
-        cells = []
+        cells, vis = [], 0
         for i in range(n):
-            name = _card_name(int(state.hand[i])) if bool(state.hand_valid[i]) else "--"
-            cells.append(f"{name:2s}{'*' if bool(sel[i]) else ' '}")
+            if bool(state.hand_valid[i]):
+                card, w = _color_card(int(state.hand[i]))
+            else:
+                card, w = "--", 2
+            cells.append(f"{card}{'*' if bool(sel[i]) else ' '}")
+            vis += w + 1
+        # pad by VISIBLE width (color escapes are zero-width); the old :31s
+        # counted the escapes and would ragged the trailing columns
         hand_str = " ".join(cells)
+        hand_str += " " * max(0, 31 - (vis + (n - 1)))
 
         made = hand if eff_verb == 0 else "--"
         # raw = every lane the policy flipped on; eff = after valid mask + 5-cap
@@ -117,7 +156,7 @@ def inspect_episode(params, key):
             discards += 1
         total += reward
         verbname = "PLAY" if eff_verb == 0 else "DISCARD"
-        print(f" {step:2d}  {verbname:7s}  {hand_str:31s}  {made:12s} {n_sel:5s} {reward:4d}  {pre_chips:3d}/{blind}  {hd:4s} {deck}  {float(verb_prob):5.2f}  {float(log_prob):+6.2f}")
+        print(f" {step:2d}  {verbname:7s}  {hand_str}  {made:12s} {n_sel:5s} {reward:4d}  {pre_chips:3d}/{blind}  {hd:4s} {deck}  {float(verb_prob):5.2f}  {float(log_prob):+6.2f}")
         if bool(done):
             break
     cleared = total >= blind
