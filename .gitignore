@@ -31,6 +31,7 @@ tempCodeRunnerFile.py
 .idea/
 Thumbs.db
 .DS_Store
+~$*   # Office lock/temp files (e.g. ~$jokers_checklist.xlsx)
 
 # local-only benchmark (not part of the project)
 bench_scorehand.py
