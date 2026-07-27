@@ -172,6 +172,9 @@ def behavior_stats(params, key, n=256):
     tot_score_when_play = n_plays_scored = 0
     tot_verb_p = tot_entropy = n_decisions = 0
     cleared = 0
+    # what hand types does it actually PLAY, and what do they earn? A policy
+    # dumping High Cards when pairs are on the board shows up right here.
+    hand_counts, hand_reward = {}, {}
 
     for _ in range(n):
         key, sk = jax.random.split(key)
@@ -183,6 +186,8 @@ def behavior_stats(params, key, n=256):
             action, _, _ = act(params, state, sk)
 
             eff_verb = int(action.verb) if int(state.discards) > 0 else 0
+            # name the hand from the PRE-step state (env_step reassigns `state`)
+            played = _played_hand(state, action)[0] if eff_verb == 0 else None
             tot_selected += int((action.select.astype(bool) & state.hand_valid).sum())
             tot_verb_p += float(verb_prob)
             tot_entropy += _binary_entropy(jnp.concatenate([verb_prob[None], select_probs]))
@@ -193,6 +198,8 @@ def behavior_stats(params, key, n=256):
             ep_reward += reward
             if eff_verb == 0:
                 tot_plays += 1
+                hand_counts[played] = hand_counts.get(played, 0) + 1
+                hand_reward[played] = hand_reward.get(played, 0) + reward
                 if reward > 0:
                     tot_score_when_play += reward
                     n_plays_scored += 1
@@ -212,6 +219,11 @@ def behavior_stats(params, key, n=256):
     print(f" mean score / play    {tot_score_when_play / max(n_plays_scored,1):8.1f}   (two-pair is 108)")
     print(f" mean verb P(discard) {tot_verb_p / max(n_decisions,1):8.2f}")
     print(f" mean entropy         {tot_entropy / max(n_decisions,1):8.2f}   (fresh policy ~ ln2 * active decisions)")
+
+    print(f"\n=== hand types played (over {tot_plays} plays) ===")
+    for name in sorted(hand_counts, key=hand_counts.get, reverse=True):
+        c = hand_counts[name]
+        print(f" {name:16s} {c:5d}  {c / max(tot_plays,1):6.1%}   mean reward {hand_reward[name] / c:6.1f}")
 
 
 if __name__ == "__main__":
