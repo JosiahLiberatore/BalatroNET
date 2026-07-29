@@ -72,13 +72,60 @@ A joker = a row over orthogonal axes: (TRIGGER, CONDITION, EFFECT, VALUE, STATE)
 ONE generic evaluator reads the axes. Adding a joker = adding a row, NOT a code branch.
 ~30 confirmed jokers in the sheet are pure rows already (Greedy, Fibonacci, Jolly, Scary Face...).
 - TRIGGER : ONCE_MAIN | PER_SCORED | PER_HELD  (+ out-of-scoring: END_OF_ROUND, ON_DISCARD,
-            ON_SHOP, ON_BLIND_SELECT, ON_SOLD, ON_PACK_OPEN, ON_BOSS)
+            ON_SHOP, ON_BLIND_SELECT, ON_SOLD, ON_PACK_OPEN, ON_PACK_SKIP (Red Card +3 mult), ON_BOSS)
 - CONDITION: (kind, param) — suit | rank_in | is_face | hand_has | count_cmp | rank_suit(FROM_STATE)
             | none | POSITION (NEW, see gaps)
 - EFFECT  : ADD_MULT | ADD_CHIPS | XMULT  (combined adds allowed, e.g. Scholar = chips+mult)
-- VALUE   : float
-- STATE   : None | SCALE_COUNTER (Green, Ride the Bus, Seltzer countdown) | ROTATE (The Idol,
-            Mail-In Rebate, Ancient — env flips a rank/suit memory each round). All fit an int.
+- VALUE   : float — the update-rule PARAMETER (seed + increment), NOT the number scoring reads
+            (see "VALUE + STATE unify" subsection below)
+- STATE   : None | SCALE_COUNTER (Green, Ride the Bus, Seltzer countdown)
+            | ROTATE_GLOBAL   (Ancient — uniform 25% over the 4 suits each round, DECK-INDEPENDENT,
+              pure RNG; state = suit 0-3)
+            | ROTATE_FROM_DECK (The Idol = a card id 0-51; Mail-In Rebate = a rank 0-12 — sampled from
+              the values PRESENT in the current deck each round; refresh READS mutable deck state and
+              must run AFTER that round's deck mutations). All fit an int.
+
+### VALUE + STATE unify: scoring reads ONE live value `v` (source-agnostic)
+The scoring mechanism is already agnostic to WHERE a number comes from — Duo hands it 2.0, Obelisk hands
+it 1+0.2*count, the multiply doesn't care. But splitting the number across VALUE (static) vs STATE
+(derived) forces the evaluator to BRANCH ("read VALUE, or compute f(STATE)?") — which re-breaks the very
+agnosticism scoring already has. Fix: give every joker a mutable live value v (float), seeded from VALUE
+at acquire. Scoring ALWAYS reads v and applies it by EFFECT — no branch.
+  Duo:     v = 2.0, never changes
+  Obelisk: v starts 1.0, +0.2 on its trigger
+  Green:   v = running mult, +1/hand, -1/discard
+VALUE then DEMOTES from "the amount" to the update-rule PARAMETER (seed + increment size), consumed by
+the update step, never by scoring.
+So a memory-joker = TWO rules, not a tuple-with-a-hook:
+  scoring rule  (TRIGGER, CONDITION, EFFECT)                    -- READS v
+  update rule   (update_trigger, update_condition, delta/reset) -- WRITES v
+A static joker (Duo) has the identity update rule (v = seed forever). This kills the per-joker hook — the
+thing that made scoring non-agnostic. Cost (honest): the update rule isn't always a scalar — Green is
++1/-1 across two triggers, Ride the Bus / Obelisk RESET on a condition — so it genuinely needs
+(trigger, condition, delta, reset), a real second mini-row, not a number. You trade the VALUE/STATE split
+for a scoring-rule/update-rule split: more uniform, kills the branch, not free.
+The split that SURVIVES: live scoring magnitude (v, float, read uniformly) vs discrete CONTROL memory
+(int: ROTATE selector, Seltzer countdown, Dusk gate) — those aren't magnitudes scoring multiplies, they
+select/gate. A cleaner boundary than VALUE-vs-STATE, which cut across both.
+=> joker_value : (MAX_JOKERS,) float32 holds the live v per slot; joker_state (int) keeps the discrete
+   control memory. Scoring reads joker_value; the update pass writes it.
+
+VALUE-SOURCE axis (HOW v is resolved) — one mechanism, v = resolve(joker, state), run in a RESOLVE pass
+BEFORE scoring; scoring stays agnostic (reads joker_value). The three sources differ only in what resolve
+READS:
+  CONSTANT : reads nothing, returns the seed              (Duo 2.0)
+  COUNTER  : reads the joker's own stored memory          (Obelisk, Green — evolved by the update rule)
+  QUERY    : reads GLOBAL state, resolved FRESH each hand  (Joker Stencil, Bootstraps, Steel/Stone Joker)
+QUERY stays pure DATA: a query_kind selector into a fixed menu of state-reductions,
+v = base + per_unit * count(query_kind, state). The resolve pass switches over query_kind (a bounded
+menu), NOT over joker id.
+  query_kind menu: EMPTY_JOKER_SLOTS (Stencil), MONEY_DIV_5 (Bootstraps), DECK_STEEL_COUNT (Steel),
+                   DECK_STONE_COUNT (Stone), UNCOMMON_JOKERS (Baseball), ... (grow the MENU, not the code)
+  Joker Stencil = (ONCE_MAIN, none, XMULT, SOURCE=QUERY, query_kind=EMPTY_JOKER_SLOTS, per_unit=1.0)
+                  ("included" = count slots NOT held by a non-Stencil joker)
+MID-ROUND: a QUERY over slots/money/deck CHANGES when you sell/buy mid-blind -> resolve fresh each hand,
+cache NEVER (cheap: a reduction over fixed-shape arrays). Same "continuous pure function" rule as the
+budget scalars, now on scoring magnitudes.
 
 ### The engine: data says WHAT each cell contributes; the ORDERED SCAN says HOW they combine
 Key reconciliation: the evaluator's per-joker (add_mult, add_chips, xmult) return is fine for the
@@ -122,6 +169,10 @@ raises the trigger count on the first-face card; Photograph's condition re-passe
 - Categories beyond the (T,C,E,V) tuple, each its own small handler (NOT the generic evaluator):
   PASSIVE rule-mods (stage 0), COPY (Blueprint/Brainstorm), BOSS hooks (Matador ADD_MONEY / Mr.Bones
   PREVENT_DEATH / Luchador+Chicot DISABLE_BOSS), econ/shop mods (deferred with the shop layer).
+- ROTATE_FROM_DECK refresh needs a "sample uniformly over a boolean present-mask" primitive (52 ids for
+  Idol, 13 ranks for Mail-In): masked-argmax over random keys, argmax(where(present, uniform, -inf)).
+  Deck-coupled -> run the refresh AFTER that round's deck mutations. Ancient (ROTATE_GLOBAL) skips it: a
+  flat randint(0,4).
 
 ### State-write EFFECT family (spawns / transforms / destroys / money)
 The EFFECT axis has two kinds. Scoring effects write the (chips,mult) carry (ADD_MULT/ADD_CHIPS/XMULT).
@@ -139,6 +190,40 @@ stage-0 rule-mod that DOUBLES the prob param). DNA fits TODAY — spawning a rea
 write into the MAX_CARDS=128 headroom (copy played instance's attrs to next free slot, bump deck_size,
 place in hand); no reshape. SPAWNING a consumable is cheap (write an id into a slot); USING a
 consumable (what a Tarot/Spectral/Planet does) is a whole separate deferred subsystem, shop-tier.
+ADD_MONEY is a BIG family and takes the SAME VALUE-SOURCE axis as scoring effects, across every trigger:
+  Golden Joker  = (END_OF_ROUND, none, ADD_MONEY, SRC=CONSTANT 4)
+  Cloud 9       = (END_OF_ROUND, none, ADD_MONEY, SRC=QUERY DECK_NINE_COUNT per=1)
+  Rocket        = (END_OF_ROUND, none, ADD_MONEY, SRC=COUNTER seed 1; +2 on boss defeat)
+  Business Card = (PER_SCORED,  IS_FACE, ADD_MONEY, SRC=CONSTANT 2, prob=0.5)
+Distinct from SELL_VALUE writes (Egg / Gift Card raise joker_sell_value, NOT money).
+
+### Budget-write EFFECT family (round-setup scalars) + mid-round SELL / USE actions
+Third EFFECT family (sibling of scoring-writes and state-writes): budget-writes touch the ROUND budget
+scalars the DECK also sets — handcount / discardcount / hand_size.
+  Drunkard   = (ON_BLIND_SELECT, none, ADD_DISCARD, 1, None)                        passive while held
+  Merry Andy = (ON_BLIND_SELECT, none, ADD_DISCARD +3 & SUB_HANDSIZE 1, ..., None)  compound row
+  Burglar    = (ON_BLIND_SELECT, none, ADD_HAND +3 & SET_DISCARD 0,     ..., None)  SET, not ADD
+MODEL (corrects "recompute at round start"): budget is a PURE FUNCTION of (deck_base, held jokers),
+correct CONTINUOUSLY. handcount/discardcount/hand_size = deck_base + Σ held budget-jokers, read whenever.
+That is exactly why selling Merry Andy MID-ROUND restores hand size on the spot — its input to the
+function left. A hand_size INCREASE mid-round just runs the shared deal/refill helper (deal up to the new
+capacity = "+1 card now"). Recompute-on-change also makes SELL correct for free (no leak on sell).
+Burglar breaks pure summation: "+3 hands AND discards=0" is two writes, one a SET; SET-vs-ADD don't
+commute (Drunkard +1 then Burglar =0 -> 0; reverse -> 1). So budget rows carry a small delta-vector (or a
+tiny handler) + a defined order — the XMULT-threading lesson, now on budget scalars.
+
+SELL is a mid-BLIND action (Balatro sells anytime), NOT shop-only. A sell = compound handler
+(money += joker_sell_value; clear slot; recompute budget -> maybe deal); special-handler bucket with
+COPY/BOSS, not a (T,C,E,V) row. CONSUMABLES get the SAME treatment: USE and SELL are mid-round actions
+too (a Tarot/Planet/Spectral fires mid-blind between hands), each a compound handler writing state
+(enhance cards / level hands / money) and consuming the slot — the ACTION exists in the space now, even
+though the full USE EFFECT (what each consumable does) stays the deferred subsystem.
+So the BLIND-phase action space is: play, discard, sell-joker-k, use-consumable-k, sell-consumable-k —
+not just play/discard. Sell/use lanes live in BOTH phases, masked to occupied slots.
+ACTION-SPACE FORK (env owner's call): a step that both sells AND plays is ambiguous. Either verb goes
+multi-valued (play / discard / sell-k / use-k + slot selector), or each action-type gets its own masked
+lanes and a step is one atomic type. Current act() = binary verb + 32 select bits; sell/use is the first
+push past binary. Also nudges MAX_STEPS up (sells/uses are steps, bounded by MAX_JOKERS + MAX_CONSUMABLES).
 
 ### STATE SHAPE to bake NOW (shape changes = the breaking refactor: they invalidate obs dim,
 ### network input width, and every checkpoint. Functions grow forever; shape is frozen once.)
@@ -146,8 +231,12 @@ consumable (what a Tarot/Spectral/Planet does) is a whole separate deferred subs
 ### count is DATA — clamp beyond the cap and count the divergence (see divergences list).
   -- OBSERVED (scoring-relevant; freeze these early, they set obs dim / network width) --
   jokers         : (MAX_JOKERS,) int32   — id per slot; slot ORDER = trigger order (COPY needs it)
-  joker_state    : (MAX_JOKERS,) int32   — SCALE_COUNTER / ROTATE / gate counters (store int, hook
-                                           computes any float, e.g. Obelisk xmult = 1 + 0.2*count)
+  joker_value    : (MAX_JOKERS,) float32 — the LIVE scoring magnitude v per slot (seeded from the row's
+                                           VALUE). Scoring reads THIS, source-agnostic; the update pass
+                                           writes it. (see "VALUE + STATE unify")
+  joker_state    : (MAX_JOKERS,) int32   — discrete CONTROL memory only: ROTATE selector, Seltzer/Dusk
+                                           gate counters. NOT scoring magnitudes (those live in
+                                           joker_value).
   joker_edition  : (MAX_JOKERS,) int32   — foil/holo/poly/negative (cheap, include even if unused)
   joker_disabled : (MAX_JOKERS,) bool    — SHARED debuff mask the engine reads at stage 0. Sources:
                                            perishable-expiry, boss-blind debuff, ... (all dormant in
@@ -224,6 +313,9 @@ KEY: MAX_STEPS does NOT touch param shape (net sees one obs -> one action per st
 rollout concern only) -> it's the FREEST dial: lengthen it every stage, weights carry over untouched.
 Latent v0.1 gap: a Blue deck (5+3=8) > length 7 would silently TRUNCATE -> MAX_STEPS must cover the max
 enabled hands+discards the moment decks turn on.
+Also: budget-JOKERS (Drunkard / Merry Andy / Burglar) raise the plays+discards ceiling, so MAX_STEPS is a
+function of the ENABLED JOKER POOL, not the deck alone — when that pool gates on, recompile with a bigger
+bound. (joker gate -> scan length; see the budget-write family in the joker-engine section.)
 
 ### deck type = reset scalars, not a shape change
 Blue = 5 hands, Red = 4 discards, Black = 3 hands + 1 joker slot. All COUNTS into fixed shapes
