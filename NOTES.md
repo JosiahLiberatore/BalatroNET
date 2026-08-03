@@ -322,16 +322,19 @@ Blue = 5 hands, Red = 4 discards, Black = 3 hands + 1 joker slot. All COUNTS int
 (handcount / discardcount / joker-slot-count — already state scalars in v0.1). Deck just picks their init
 values at reset. Zero reshape. (count is DATA, capacity is SHAPE — the same rule as hand/deck/jokers.)
 
-### obs layout: append-only union of DISJOINT blocks (NO lane reuse)
+### obs layout: a union of DISJOINT blocks (NO lane reuse)
   obs = [ SHARED     money, jokers(id/edition/sell), ante, round, phase_flag ]   -- live in both phases
       + [ BLIND-ONLY hand ranks/suits, hand_valid, hands/discards left, chips-vs-target, undealt mask ]  -- 0 in shop
       + [ SHOP-ONLY  shop offerings (2 slots), reroll cost, reroll count ]        -- 0 in blind
 No lane ever carries two meanings. Reusing card lanes for shop data would make the net score shop items
 with card-PLAYING weights (disambiguated only by a phase flag it must learn to respect) — the exact
 collision to avoid.
-CONTRACT: append at the TAIL only; never reorder or repurpose a lane. Break it and every prior ckpt still
-LOADS but means the wrong things (silent poison). To reuse v0.1's (601,128): put the 601 blind lanes FIRST
-in the same order, then append the shop block; graft = copy rows[0:601] from v0.1, small-init rows[601:].
+The DISJOINTNESS is the contract, and it is permanent — it is about what a lane MEANS, not about weights.
+Lane ORDER is not a contract: reorder/repurpose at will. That rule only ever bought ckpt grafting (reorder
+and an old ckpt still LOADS while meaning the wrong things), and we are NOT warm-starting from v0.1's flat-
+hands runs. If a cold start on a bigger env ever proves too hard, the answer is a CURRICULUM — ramp the env
+gates, one policy, learned in order — not a weight graft. That also keeps the obs free to be re-cut as the
+env grows, which is worth more than a warm start we would use once.
 
 ### phase isolation is (nearly) free on the current MLP — but it's a SHALLOW-net property
 grad of a W1 row is proportional to its input; off-phase lanes are 0 -> W1 is FULLY phase-partitioned
@@ -341,8 +344,8 @@ where(-inf)-masked -> gradient stopped -> W2 partitioned too. The ONLY parameter
 "prior focused training preserved" is true up to a 128-dim coupling, not "mostly".
 CAVEAT (aimed at the v0.2 attention plan): this clean partition is a property of the ONE hidden layer. A
 deeper / attention trunk has nonzero activations for BOTH phases past layer 1 -> its internal weights are
-fully shared -> the isolation is gone (transfer still helps, but "preserved" -> "co-adapts"). Bank on the
-append contract (survives architecture swaps), NOT on the isolation.
+fully shared -> the isolation is gone (transfer still helps, but "preserved" -> "co-adapts"). So do not
+bank on phase isolation for anything; it is a nice property of THIS net, not a design guarantee.
 
 ### economy math (base Balatro — for the blind formula + the shop)
 blind reward at cashout: Small $3 / Big $4 / Boss $5.   interest: $1 per $5 held, cap $5 (saturates $25).
@@ -353,7 +356,7 @@ joker price by rarity: use the Cost column in jokers_checklist.xlsx.
 ### the attention swap is a MEASUREMENT, not a plan step
 MLP weights do NOT graft onto an attention policy (different topology — (601,128) has no counterpart in
 token embeddings + QKV). That swap retrains from scratch. But weights were never the durable asset: the
-ENV + obs/action SEMANTICS are architecture-agnostic and carry 100%. The append-only union re-expresses
+ENV + obs/action SEMANTICS are architecture-agnostic and carry 100%. The disjoint union re-expresses
 in attention as TYPED TOKENS (card / shop-item / joker / phase-ctx): include/omit tokens instead of zero-
 padding lanes -> variable set sizes for free (a shop with N offerings is exactly a variable token set).
 SEQUENCING: build shop / jokers / multi-ante on the MLP FIRST. Its lasting value is as (a) the env's test
