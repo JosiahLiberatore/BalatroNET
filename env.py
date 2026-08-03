@@ -18,51 +18,69 @@ MAX_DECK_SIZE = 128
 class balatroEnvState(NamedTuple):
     # consumables : jax.Array   # (N,)   int32   -- future
     # jokers      : jax.Array   # (N,)   int32   -- future
+
+    # hand
     hand         : jax.Array   # (32,)  int32   -- card id per lane, -1 = empty
     hand_size    : jax.Array   # scalar int32   -- number of lanes currently in play
     hand_valid   : jax.Array   # (32,)  bool    -- which lanes hold a live card
+
+    # deck
     deck         : jax.Array   # (128,) int32   -- permutation of card ids
     deck_size    : jax.Array   # scalar int32   -- live cards; rest are dead slots
     deck_ptr     : jax.Array   # scalar int32   -- next card to deal
+
+    # budget
     handcount    : jax.Array   # scalar int32   -- hands granted this round
     discardcount : jax.Array   # scalar int32   -- discards granted this round
     hands        : jax.Array   # scalar int32   -- hands remaining
     discards     : jax.Array   # scalar int32   -- discards remaining
+
+    # round
     round        : jax.Array   # scalar int32
     ante         : jax.Array   # scalar int32
     chips_scored : jax.Array   # scalar int32   -- progress toward blind
     blind_target : jax.Array   # scalar int32   -- chips needed to clear
     key          : jax.Array   # PRNG key (new-style typed key)
 
+    # shop
+    shop_slots  : jax.Array    # (4, ) int32    -- holds ID of shop items
+
+
 class balatroAction(NamedTuple):
     verb   : jax.Array   # scalar int32   -- 0 = Play, 1 = Discard
     select : jax.Array   # (32,)  bool    -- which lanes to act on
 
 
+class Joker(NamedTuple):
+    TRIGGER : jax.Array # scalar int32
+    CONDITION : jax.Array # scalar int32
+    EFFECT : jax.Array # scalar int32
+    VALUE : jax.Array #  float
+    STATE : jax.Array #  float
 
 @jit
 def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvState, float, bool]:
 
+    # get the hand type
     hand = state.hand
     select = (action.select & state.hand_valid).astype(bool)
     select = select & (jnp.cumsum(select) <= 5)
     order = jnp.argsort(~select)
     cardularcards = hand[order][:5]
-    verb = jnp.where(state.discards > 0, action.verb, 0)
-
     valid = select[order][:5]
-
     suit = (cardularcards // 13)[:5]
     rank = (cardularcards % 13)[:5]
+    handtype, hand_mask, chips, mult = scoreHand(rank, suit, valid)
 
-    _, _, score = scoreHand(rank, suit, valid)
+    # score jokers
 
+
+    # get the verb
+    verb = jnp.where(state.discards > 0, action.verb, 0)
     score = score * (verb == 0)
     
     # update the state
-
     new_hand_valid = state.hand_valid & ~select
-
     new_state = state._replace(hands=state.hands-(verb == 0),
                             discards=state.discards-(verb == 1),
                             hand_valid=new_hand_valid,
@@ -79,6 +97,7 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     #     new_hand_valid=new_hand_valid
     #     )
 
+    # deal new hand
     next_state = deal(new_state)
 
     done = (next_state.chips_scored >= state.blind_target) | (next_state.hands == 0)

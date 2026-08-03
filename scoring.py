@@ -61,4 +61,4 @@ def scoreHand(rank, suit, valid):
     chips = (BASE_CARD_CHIPS[rank] * scoring_mask).sum() + BASE_CHIPS[handtype]
     mult = BASE_MULT[handtype]
 
-    return handtype, scoring_mask, chips*mult
+    return handtype, scoring_mask, chips, mult
