@@ -1,34 +1,23 @@
-"""Jokers as DATA — the axis enums, the static row table, the resolve pass.
+"""Jokers as DATA — axis enums, the static row table, the resolve pass.
 
-The spine (NOTES "jokers-as-data"): a joker is a ROW over orthogonal axes, and
-ONE generic evaluator reads the axes. Adding a joker = adding a row here, never
-a code branch in the scoring pipeline.
+A joker is a ROW over orthogonal axes, read by ONE generic evaluator. Adding a
+joker = adding a row, never a branch in the scoring pipeline.
 
-IMPORT DIRECTION (keeps the graph acyclic — do not break it):
+Import direction (acyclic — do not break):
+    arrays.py / jokers.py    no project imports
+    scoring.py               imports jokers
+    env.py                   imports both
 
-    jokers.py    enums + ROWS + resolve          imports NOTHING from the project
-    scoring.py   detect / base / staged scan     imports jokers (enums, rows)
-    env.py       state / step / shop / phase     imports both
+STATIC vs DYNAMIC, and note the INDEX — they are different axes:
+    JOKERS[joker_id]     the rule. Compile-time constant, one row per joker that
+                         EXISTS. JOKERS.VALUE is the update-rule PARAMETER.
+    joker_value[slot]    (EnvState) the LIVE magnitude v, float32, seeded from
+                         JOKERS.VALUE at acquire, written by the update pass.
+    joker_state[slot]    (EnvState) live discrete control memory, int32.
 
-That is why the Joker schema lives HERE and not in env.py: scoring must read the
-axis enums without dragging in EnvState, or the 21-row table in tests.py stops
-being cheap (every scoring test would have to build a full state pytree first).
-
-TWO THINGS ARE EASY TO CONFLATE — they are not the same:
-
-  STATIC  (this file)  ROWS[joker_id]  — the rule. Compile-time constant, one row
-                                        per joker id that exists in the game.
-                                        ROWS.VALUE is the update-rule PARAMETER
-                                        (seed + increment size).
-  DYNAMIC (EnvState)   joker_value[slot]  — the LIVE magnitude v, float32, seeded
-                                        from ROWS.VALUE at acquire, read by
-                                        scoring, written by the update pass.
-                       joker_state[slot]  — live discrete CONTROL memory (ROTATE
-                                        selector, Seltzer countdown), int32.
-
-NOTES calls this the "VALUE + STATE unify": scoring ALWAYS reads joker_value and
-applies it by EFFECT, with no branch on where the number came from. ROWS.SOURCE
-tells the RESOLVE pass how to produce v; it never reaches scoring.
+Scoring ALWAYS reads joker_value and applies it by EFFECT, never branching on
+where the number came from. SOURCE tells resolve() how to produce v; it never
+reaches scoring. rows_for() bridges id order -> slot order.
 """
 
 import jax.numpy as jnp
@@ -38,21 +27,17 @@ from typing import NamedTuple
 # ---------------------------------------------------------------------------
 # AXIS 1 — TRIGGER : when the row fires
 # ---------------------------------------------------------------------------
-# The first three are the scoring stages, and their ORDER is the stage order in
-# the pipeline (NOTES: the ordered scan is what makes XMULT correct — you cannot
-# collect per-joker then combine, because (4+4)*3 != (4*3)+4).
+# The first three are the scoring stages, in pipeline order. That ORDER is what
+# makes XMULT correct — you cannot collect per-joker then combine, because
+# (4+4)*3 != (4*3)+4.
 T_PER_SCORED      = 0    # stage 4 — per scored card, arrangement order
 T_PER_HELD        = 1    # stage 5 — per held card, arrangement order
 T_ONCE_MAIN       = 2    # stage 6 — once per hand, SLOT order
-# out-of-scoring triggers: these drive the update pass and the state-write family
+# out-of-scoring: these drive the update pass and the state-write family
 T_END_OF_ROUND    = 3    # Golden Joker, *Mime*
 T_ON_DISCARD      = 4    # Mail-In Rebate, Castle
-# the shop is TWO moments, not one, and different jokers want different ones.
-# ENTER is where the per-shop resources reset (Chaos re-arms its free reroll);
-# EXIT is a genuine once-per-shop firing (Perkeo). Collapsing them into a single
-# ON_SHOP forces one of the two to fire at the wrong end of the visit.
-T_ON_SHOP_ENTER   = 5    # Chaos the Clown
-T_ON_SHOP_EXIT    = 6    # Perkeo
+T_ON_SHOP_ENTER   = 5    # Chaos the Clown — where per-shop resources re-arm
+T_ON_SHOP_EXIT    = 6    # Perkeo — a genuine once-per-shop firing
 T_ON_BLIND_SELECT = 7    # the budget-write family lands here (Drunkard, Burglar)
 T_ON_SOLD         = 8    # Campfire, Invisible
 T_ON_PACK_OPEN    = 9    # Hallucination
@@ -68,22 +53,19 @@ TRIGGER_NAMES = ["PER_SCORED", "PER_HELD", "ONCE_MAIN", "END_OF_ROUND",
 # ---------------------------------------------------------------------------
 # AXIS 2 — CONDITION : (kind, param). Which card / whether the joker fires.
 # ---------------------------------------------------------------------------
-# NOTES splits this into TWO slots that share this one menu:
-#   GATE      — joker on/off this hand, checked once (Dusk=final_hand, Half Joker
-#               = cards_played<=3). Shape: hand-level question.
-#   PER-CARD  — fires on WHICH card (Greedy=Diamonds, Photograph=first face).
-# Same kinds, different slot; the stage decides which one it is asking.
+# Two slots share this menu; the stage decides which is being asked:
+#   GATE      joker on/off this hand, checked once   (Dusk, Half Joker)
+#   PER-CARD  fires on WHICH card                    (Greedy, Photograph)
 C_NONE        = 0    # always fires
 C_SUIT        = 1    # param = suit 0-3
 C_RANK_IN     = 2    # param = 13-bit rank mask
-C_IS_FACE     = 3    # J/Q/K (Pareidolia is a stage-0 rule-mod that widens this)
+C_IS_FACE     = 3    # J/Q/K (Pareidolia widens this — a stage-0 rule-mod)
 C_HAND_HAS    = 4    # param = handtype index into scoring.HAND_NAMES
 C_COUNT_CMP   = 5    # param = threshold (Half Joker: cards_played <= 3)
-C_RANK_SUIT   = 6    # read the target from joker_state (The Idol, Mail-In Rebate)
-C_POSITION    = 7    # param = ordinal. NOTES gap-fix: Photograph (first scored
-                     # face, X2 ONCE) and Hanging Chad (retrigger first card).
-                     # Without this a naive IS_FACE fires Photograph on EVERY
-                     # face -> X2 K * X2 Q = X4, and X16 under retrigger.
+C_RANK_SUIT   = 6    # target read from joker_state (The Idol, Mail-In Rebate)
+C_POSITION    = 7    # param = ordinal. Photograph (first scored face, X2 ONCE)
+                     # and Hanging Chad. A naive IS_FACE would fire Photograph on
+                     # EVERY face -> X2 K * X2 Q = X4, and X16 under retrigger.
 
 CONDITION_NAMES = ["NONE", "SUIT", "RANK_IN", "IS_FACE", "HAND_HAS",
                    "COUNT_CMP", "RANK_SUIT", "POSITION"]
@@ -92,13 +74,13 @@ CONDITION_NAMES = ["NONE", "SUIT", "RANK_IN", "IS_FACE", "HAND_HAS",
 # ---------------------------------------------------------------------------
 # AXIS 3 — EFFECT : what the row writes. THREE families, one enum.
 # ---------------------------------------------------------------------------
-# family A — SCORING writes: mutate the (chips, mult) carry threaded by the scan
+# family A — SCORING: mutate the (chips, mult) carry threaded by the scan
 E_ADD_MULT          = 0
 E_ADD_CHIPS         = 1
-E_XMULT             = 2    # must be first-class and scan-threaded, not summed
-E_RETRIGGER         = 3    # own axis really: count = 1 + sum of retrigger amounts
+E_XMULT             = 2    # scan-threaded, not summed
+E_RETRIGGER         = 3    # count = 1 + sum of retrigger amounts
 
-# family B — STATE writes: thread a side-effect channel, applied AFTER scoring
+# family B — STATE: a side-effect channel applied AFTER scoring
 E_ADD_MONEY         = 4
 E_TRANSFORM_CARD    = 5    # Midas -> gold
 E_DESTROY_CARD      = 6    # Sixth Sense
@@ -106,21 +88,18 @@ E_SPAWN_CARD        = 7    # DNA (writes into the MAX_CARDS=128 headroom)
 E_SPAWN_CONSUMABLE  = 8    # 8 Ball / Seance / Vagabond
 E_SELL_VALUE        = 9    # Egg / Gift Card — NOT money
 
-# family C — BUDGET writes: the round scalars the DECK also sets.
-# NOTES: budget is a PURE FUNCTION of (deck_base, held jokers), correct
-# CONTINUOUSLY — which is exactly why selling Merry Andy mid-round restores hand
-# size on the spot. SET does not commute with ADD (Drunkard +1 then Burglar =0
-# -> 0; reverse -> 1), so these need a defined order, same lesson as XMULT.
+# family C — BUDGET: round scalars the DECK also sets. Pure functions of
+# (deck_base, held jokers), recomputed CONTINUOUSLY — which is why selling Merry
+# Andy restores hand size on the spot. SET does not commute with ADD (Drunkard +1
+# then Burglar =0 -> 0; reverse -> 1), so they need a defined order.
 E_ADD_HAND          = 10
 E_ADD_DISCARD       = 11
 E_SET_DISCARD       = 12
 E_ADD_HANDSIZE      = 13
-E_ADD_REROLL        = 14   # Chaos the Clown — the ODD ONE OUT of this family.
-                           # Hands/discards/hand-size are pure functions of the
-                           # held loadout, so they recompute. Free rerolls are
+E_ADD_REROLL        = 14   # Chaos the Clown — the odd one out: free rerolls are
                            # CONSUMED, so "already spent it" is history the
-                           # loadout cannot answer — this one needs a live
-                           # EnvState field, +VALUE on buy, floored at 0 on sell.
+                           # loadout cannot answer. Needs a live EnvState field,
+                           # +VALUE on buy, floored at 0 on sell.
 
 EFFECT_NAMES = ["ADD_MULT", "ADD_CHIPS", "XMULT", "RETRIGGER", "ADD_MONEY",
                 "TRANSFORM_CARD", "DESTROY_CARD", "SPAWN_CARD",
@@ -131,17 +110,15 @@ EFFECT_NAMES = ["ADD_MULT", "ADD_CHIPS", "XMULT", "RETRIGGER", "ADD_MONEY",
 # ---------------------------------------------------------------------------
 # AXIS 4 — SOURCE : HOW the live value v is resolved. Read ONLY by resolve().
 # ---------------------------------------------------------------------------
-# The three sources differ only in what resolve() READS. Scoring never sees this
-# axis — it reads joker_value and stays agnostic.
 S_CONSTANT = 0    # reads nothing, returns VALUE                    (Joker, Duo)
-S_COUNTER  = 1    # reads the joker's own memory, evolved by update (Green, Obelisk)
+S_COUNTER  = 1    # reads its own memory, evolved by update  (Green, Obelisk)
 S_QUERY    = 2    # reads GLOBAL state, resolved FRESH each hand    (Bootstraps)
 
 SOURCE_NAMES = ["CONSTANT", "COUNTER", "QUERY"]
 
 # QUERY sub-menu — a selector into a fixed set of state-reductions, so QUERY
-# stays pure data: v = VALUE + PARAM * count(query_kind, state). The resolve pass
-# switches over query_kind (bounded menu), NEVER over joker id. Grow the MENU.
+# stays pure data: v = VALUE * count(query_kind, state). resolve() switches over
+# query_kind (bounded menu), NEVER over joker id. Grow the MENU.
 Q_NONE              = 0
 Q_MONEY_DIV_5       = 1    # Bootstraps
 Q_EMPTY_JOKER_SLOTS = 2    # Joker Stencil
@@ -150,9 +127,8 @@ Q_DECK_STONE_COUNT  = 4
 Q_DECK_NINE_COUNT   = 5    # Cloud 9
 Q_UNCOMMON_JOKERS   = 6    # Baseball Card
 
-# MID-ROUND correctness: a QUERY over slots/money/deck CHANGES when you buy or
-# sell mid-blind, so resolve runs fresh each hand and is NEVER cached. Cheap — a
-# reduction over fixed-shape arrays.
+# A QUERY over slots/money/deck CHANGES on a mid-blind buy or sell, so resolve
+# runs fresh each hand and is NEVER cached.
 
 
 # ---------------------------------------------------------------------------
@@ -160,11 +136,10 @@ Q_UNCOMMON_JOKERS   = 6    # Baseball Card
 # ---------------------------------------------------------------------------
 ST_NONE             = 0
 ST_SCALE_COUNTER    = 1    # Green, Ride the Bus, Seltzer countdown
-ST_ROTATE_GLOBAL    = 2    # Ancient — uniform over 4 suits/round, DECK-INDEPENDENT
+ST_ROTATE_GLOBAL    = 2    # Ancient — uniform over 4 suits/round, deck-independent
 ST_ROTATE_FROM_DECK = 3    # Idol (card id 0-51) / Mail-In (rank 0-12), sampled
-                           # from values PRESENT in the deck -> the refresh READS
-                           # mutable deck state and must run AFTER that round's
-                           # deck mutations.
+                           # from values PRESENT in the deck, so the refresh must
+                           # run AFTER that round's deck mutations.
 
 STATE_NAMES = ["NONE", "SCALE_COUNTER", "ROTATE_GLOBAL", "ROTATE_FROM_DECK"]
 
@@ -172,71 +147,34 @@ STATE_NAMES = ["NONE", "SCALE_COUNTER", "ROTATE_GLOBAL", "ROTATE_FROM_DECK"]
 # ---------------------------------------------------------------------------
 # AXIS 6 — COPYABLE : may Blueprint / Brainstorm copy this row?
 # ---------------------------------------------------------------------------
-# A copier does NOT have a trigger of its own — it inherits its TARGET's. A
-# Blueprint pointed at Greedy Joker fires PER_SCORED; pointed at Golden Joker it
-# fires END_OF_ROUND. So the copy is resolved by re-running the target's row in
-# the copier's slot, at whatever stage that row belongs to, and TRIGGER cannot
-# double as the "is this copyable" answer.
-#
-# Nor can the answer be DERIVED from the other axes. It correlates with the
-# budget family (a loadout-derived effect has nothing to re-fire) but the
-# correlation is not the rule — several rows that look perfectly copyable simply
-# are not. So it is DECLARED per row: one bool, hand-set, no inference.
-#
-# Default True, because most jokers are copyable — a row spells out
-# copyable=False only when it is one of the exceptions.
+# A copier inherits its TARGET's trigger — Blueprint on Greedy fires PER_SCORED,
+# on Golden fires END_OF_ROUND — so the copy re-runs the target's row in the
+# copier's slot, and TRIGGER cannot double as the copyable answer. Not derivable
+# from the other axes either (it correlates with the budget family but several
+# copyable-looking rows simply are not), so it is declared per row.
+# Default True; a row spells out copyable=False only for the exceptions.
 
 
-# ---------------------------------------------------------------------------
-# The row schema
-# ---------------------------------------------------------------------------
 class Joker(NamedTuple):
-    """One joker rule, as data.
-
-    Struct-of-arrays, per the project rule: read as a single row when the fields
-    are scalars (a table lookup), and as a whole loadout when they are
-    (MAX_JOKERS,) arrays (the gathered rows for every occupied slot). Same class,
-    different shape — nothing in the evaluator cares which it got.
-    """
+    """The row schema. Scalars = one row; (MAX_JOKERS,) arrays = a whole loadout."""
     TRIGGER    : jnp.ndarray   # int32   — T_*
     CONDITION  : jnp.ndarray   # int32   — C_*
     COND_PARAM : jnp.ndarray   # int32   — suit / rank mask / handtype / ordinal
     EFFECT     : jnp.ndarray   # int32   — E_*
-    SOURCE     : jnp.ndarray   # int32   — S_*   (resolve reads this, scoring never does)
+    SOURCE     : jnp.ndarray   # int32   — S_*  (resolve reads this, scoring never does)
     VALUE      : jnp.ndarray   # float32 — seed / per-unit / increment size
-    STATE      : jnp.ndarray   # int32   — ST_*  (More like State Type: KIND of memory, not the memory)
+    STATE      : jnp.ndarray   # int32   — ST_*, the KIND of memory, not the memory
     COPYABLE   : jnp.ndarray   # bool    — may Blueprint / Brainstorm copy this row
-
-
-# NOTE vs the version currently in env.py: two fields are added and one dtype
-# changes. Both are forced by rows NOTES has ALREADY encoded in the xlsx —
-# without them the table cannot express its own 65 confirmed rows:
-#   COND_PARAM  the sheet writes conditions as (kind, param): "RANK_IN {A}",
-#               "SUIT Diamonds". NOTES: 'CONDITION: (kind, param)'.
-#   SOURCE      the sheet's final schema is (T, COND, EFFECT, SRC, STATE) and
-#               writes "SRC=CONSTANT 2" — source and amount are one axis, two
-#               fields. VALUE alone cannot distinguish Duo's flat 2.0 from
-#               Bootstraps' 2.0-per-$5.
-#   STATE       int32, not float — NOTES: 'discrete CONTROL memory only ...
-#               All fit an int'. Magnitudes live in joker_value.
 
 
 # ---------------------------------------------------------------------------
 # AUTHORING RECORD — one joker per LINE. Compiled to columns below.
 # ---------------------------------------------------------------------------
-# Struct-of-arrays is right for JAX and wrong for humans: adding a joker to a
-# column-major literal means editing ten parallel arrays and counting commas to
-# keep them aligned, which is exactly how a Greedy row picks up Bootstraps'
-# cost. So the TABLE is authored row-wise in plain Python and TRANSPOSED into
-# the SoA form at import. Adding a joker = adding one line, and nothing
-# downstream notices — ROWS is still columns.
-#
-# Defaults carry the common case (no condition, constant value, no memory), so
-# a plain joker is a short line and only the unusual axes are spelled out.
+# SoA is right for JAX and wrong for humans, so author rows and transpose at
+# import. Defaults carry the common case; only unusual axes get spelled out.
 COMMON, UNCOMMON, RARE, LEGENDARY = 1, 2, 3, 4
 
-# suits, for COND_PARAM readability — the project-pinned convention
-# (scoring.py: 0=clubs, 1=diamonds, 2=hearts, 3=spades)
+# suits, for COND_PARAM readability (scoring.py: 0=clubs 1=diamonds 2=hearts 3=spades)
 CLUBS, DIAMONDS, HEARTS, SPADES = 0, 1, 2, 3
 
 
@@ -259,20 +197,11 @@ class JokerDef(NamedTuple):
 # ---------------------------------------------------------------------------
 # THE TABLE — a joker is one line. Its id is its row index.
 # ---------------------------------------------------------------------------
-# Reorder freely. An id is a row index, meaningful only WITHIN one training run
-# — reordering invalidates older checkpoints, and this project does not warm-
-# start from them (if that is ever wanted, it comes from a curriculum, not from
-# grafting weights). Nothing in the code hardcodes an id either: J_* look up
-# through JOKER_ID by name, so a reorder either keeps working or fails loudly at
-# import.
-#
-# The six required axes are positional and aligned; everything else is keyword
-# and shows up only where it differs from the default. Widths are sized for the
-# full 150-row import, so pouring in the rest of jokers_checklist.xlsx won't
-# reflow the file.
-#
-# The three rows here are one per SOURCE kind, so resolve() has a live example
-# of each branch.
+# Reorder freely: ids are meaningful only within one training run, nothing
+# hardcodes one (J_* resolve through JOKER_ID by name), and we do not warm-start
+# from old checkpoints. The six required axes are positional and aligned; widths
+# are sized for the full 150-row import. These three are one per SOURCE kind, so
+# resolve() has a live example of each branch.
 #
 #        name                     cost  rarity     trigger              effect                value    optional axes
 TABLE = [
@@ -286,12 +215,7 @@ TABLE = [
 # COMPILE — transpose the authored rows into columns, validating on the way.
 # ---------------------------------------------------------------------------
 def _validate(table):
-    """Catch transcription errors at IMPORT, pointing at the offending name.
-
-    Worth the twenty lines: 62 more rows are getting hand-copied out of a
-    spreadsheet, and a silently malformed row is a joker that quietly scores
-    zero rather than one that crashes.
-    """
+    """Catch transcription errors at IMPORT, naming the offending joker."""
     seen = set()
     for d in table:
         if d.name in seen:
@@ -301,9 +225,8 @@ def _validate(table):
             raise ValueError(f"{d.name}: rarity {d.rarity} outside 1..4")
         if d.cost < 0:
             raise ValueError(f"{d.name}: negative cost {d.cost}")
-        # SOURCE and QUERY are one axis in two fields — they must agree, or
-        # resolve() reads a menu selector that was never set (or ignores one
-        # that was).
+        # SOURCE and QUERY are one axis in two fields; disagreement means
+        # resolve() reads a selector nobody set, or ignores one somebody did.
         if (d.source == S_QUERY) != (d.query != Q_NONE):
             raise ValueError(
                 f"{d.name}: SOURCE/QUERY disagree — source={SOURCE_NAMES[d.source]}, "
@@ -329,15 +252,12 @@ def _compile(table):
 
 _validate(TABLE)
 
-ROWS = _compile(TABLE)
+JOKERS = _compile(TABLE)
 
-# QUERY selector, index-aligned with ROWS. Q_NONE for every non-QUERY row.
-ROW_QUERY = jnp.array([d.query for d in TABLE], jnp.int32)
-
-# Shop economics — static per-joker data, so it lives with the rows.
-# Costs are the Cost column of jokers_checklist.xlsx.
-ROW_COST   = jnp.array([d.cost   for d in TABLE], jnp.int32)
-ROW_RARITY = jnp.array([d.rarity for d in TABLE], jnp.int32)
+# index-aligned with JOKERS. Costs are the Cost column of jokers_checklist.xlsx.
+JOKER_QUERY  = jnp.array([d.query  for d in TABLE], jnp.int32)
+JOKER_COST   = jnp.array([d.cost   for d in TABLE], jnp.int32)
+JOKER_RARITY = jnp.array([d.rarity for d in TABLE], jnp.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -349,23 +269,17 @@ N_JOKERS    = len(TABLE)
 
 J_EMPTY = -1
 
-# Constants only for the jokers CODE names directly (shop pool, tests). Looked
-# up by name, not hand-numbered, so they cannot drift out of sync with TABLE —
-# and a typo'd name is a KeyError at import instead of a wrong joker at runtime.
+# Looked up by name, so a typo is a KeyError at import, not a wrong joker later.
 J_JOKER     = JOKER_ID["Joker"]
 J_GREEDY    = JOKER_ID["Greedy Joker"]
 J_BOOTSTRAP = JOKER_ID["Bootstraps"]
 
 
-# ---------------------------------------------------------------------------
-# Stage-0 RULE-MODS — passive jokers that patch the CONTEXT before scoring.
-# ---------------------------------------------------------------------------
 class RuleMods(NamedTuple):
-    """The stage-0 patch to the rules, as a handful of flags.
+    """Stage-0: passive jokers patch the RULES before detection runs.
 
-    This is the answer to 'does detect() need the jokers array?' — no. Detection
-    needs these booleans, which a separate pass derives FROM the jokers array.
-    Keeping it a flag struct is what lets scoring stay independent of EnvState.
+    Detection needs these five booleans, not the jokers array — which is what
+    lets scoring stay independent of EnvState.
     """
     four_fingers : jnp.ndarray   # bool — flushes/straights need only 4 cards
     shortcut     : jnp.ndarray   # bool — straights may have one-rank gaps
@@ -374,40 +288,38 @@ class RuleMods(NamedTuple):
     pareidolia   : jnp.ndarray   # bool — every card counts as a face card
 
 
-NO_MODS = RuleMods(*[jnp.bool_(False)] * 5)   # the v0.2 default: no rule-mods held
+NO_MODS = RuleMods(*[jnp.bool_(False)] * 5)   # v0.2 default: no rule-mods held
 
 
 # ---------------------------------------------------------------------------
 # STUBS — signatures and contracts pinned; bodies land with the joker pipeline.
 # ---------------------------------------------------------------------------
 def rows_for(ids):
-    """Gather the static rows for a loadout.
+    """Gather JOKERS from ID order into SLOT order. ids (MAX_JOKERS,) -> Joker.
 
-    ids : (MAX_JOKERS,) int32, joker id per slot, J_EMPTY for vacant.
-    ->    Joker whose fields are each (MAX_JOKERS,) — the whole loadout.
+    One `JOKERS.field[ids]` per field; what changes is the index axis:
+    JOKERS.EFFECT[3] is "joker id 3", rows_for(ids).EFFECT[3] is "whatever is in
+    SLOT 3". The scan walks slots, so it needs slot order. Output shape comes
+    from ids, which is why N_JOKERS never reaches anything downstream.
 
-    Empty slots must gather a HARMLESS row, not garbage: clamp the index and let
-    the caller's `active` mask zero the contribution. Never let a -1 index wrap
-    around to the last row (JAX clamps out-of-bounds gathers silently, which is
-    exactly how a vacant slot would start scoring like Bootstraps).
+    Vacant slots must gather a HARMLESS row: clamp the index, then let the
+    caller's `active` mask (ids != J_EMPTY) zero it. A raw -1 clamps silently to
+    the LAST row — that is how an empty slot starts scoring like Bootstraps.
     """
+
+    
     raise NotImplementedError
 
 
 def resolve(rows, query_kinds, active, ctx):
-    """RESOLVE pass — produce the live value v for every slot, BEFORE scoring.
-
-    The one place the three SOURCE kinds differ; downstream everything reads v.
+    """Produce the live value v per slot, BEFORE scoring. -> (MAX_JOKERS,) float32
 
         CONSTANT : v = VALUE
-        COUNTER  : v = joker_value  (already evolved by the update pass; passthrough)
+        COUNTER  : v = joker_value  (passthrough; update already evolved it)
         QUERY    : v = VALUE * count(query_kind, ctx)
 
     ctx carries the global reductions QUERY needs (money, free slots, deck
-    counts). Runs fresh every hand — never cached, because a mid-blind buy or
-    sell changes the answer.
-
-    -> (MAX_JOKERS,) float32
+    counts). Fresh every hand, never cached — a mid-blind buy changes the answer.
     """
     raise NotImplementedError
 
@@ -418,13 +330,9 @@ def rule_mods(rows, ids, active):
 
 
 def update(rows, joker_value, joker_state, trigger, ctx):
-    """UPDATE pass — the SECOND rule each joker carries, writing v and memory.
+    """UPDATE pass — the SECOND rule each row carries. -> (joker_value, joker_state)
 
-    NOTES is explicit that this is not free: the update rule is genuinely
-    (trigger, condition, delta, reset), a real mini-row, because Green is +1/-1
-    across two triggers and Ride the Bus / Obelisk RESET on a condition. What it
-    buys is the removal of the per-joker hook that made scoring non-agnostic.
-
-    -> (joker_value, joker_state)
+    Genuinely (trigger, condition, delta, reset), a mini-row of its own: Green is
+    +1/-1 across two triggers, and Ride the Bus / Obelisk RESET on a condition.
     """
     raise NotImplementedError
