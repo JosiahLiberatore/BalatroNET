@@ -164,10 +164,10 @@ class Joker(NamedTuple):
     COND_PARAM : jnp.ndarray   # int32   — suit / rank mask / handtype / ordinal
     EFFECT     : jnp.ndarray   # int32   — E_*
     SOURCE     : jnp.ndarray   # int32   — S_*  (resolve reads this, scoring never does)
+    QUERY      : jnp.ndarray   # int32   - Q_
     VALUE      : jnp.ndarray   # float32 — seed / per-unit / increment size
     STATE      : jnp.ndarray   # int32   — ST_*, the KIND of memory, not the memory
     COPYABLE   : jnp.ndarray   # bool    — may Blueprint / Brainstorm copy this row
-
 
 # ---------------------------------------------------------------------------
 # AUTHORING RECORD — one joker per LINE. Compiled to columns below.
@@ -243,6 +243,7 @@ def _compile(table):
         COND_PARAM = col("param",   jnp.int32),
         EFFECT     = col("effect",  jnp.int32),
         SOURCE     = col("source",  jnp.int32),
+        QUERY      = col("query",   jnp.int32),
         VALUE      = col("value",   jnp.float32),
         STATE      = col("state",   jnp.int32),
         COPYABLE   = col("copyable", jnp.bool_),
@@ -266,6 +267,7 @@ JOKER_ID    = {name: i for i, name in enumerate(JOKER_NAMES)}
 N_JOKERS    = len(TABLE)
 
 J_EMPTY = -1
+MAX_JOKERS = 32
 
 # Looked up by name, so a typo is a KeyError at import, not a wrong joker later.
 J_JOKER     = JOKER_ID["Joker"]
@@ -306,7 +308,7 @@ def rows_for(ids):
     safe = jnp.clip(ids, 0, N_JOKERS - 1)
     return jax.tree.map(lambda col: col[safe], JOKERS)
 
-def resolve(rows, query_kinds, active, ctx):
+def resolve(rows, active, joker_value, ctx):
     """Produce the live value v per slot, BEFORE scoring. -> (MAX_JOKERS,) float32
         CONSTANT : v = VALUE
         COUNTER  : v = joker_value  (passthrough; update already evolved it)
@@ -319,7 +321,7 @@ def resolve(rows, query_kinds, active, ctx):
 
 
 
-    raise NotImplementedError
+    print(rows)
 
 
 def rule_mods(rows, ids, active):
@@ -342,7 +344,14 @@ if __name__ == "__main__":
 
     ids = jnp.array([0, 2])
 
-    rows_for(ids)
+    jonklers = rows_for(ids)
+
+    resolve(
+        jonklers,
+        active=jnp.array([True, True, False]),
+        joker_value=jnp.array([]),
+        ctx=jnp.array([])
+    )
 
 
     
