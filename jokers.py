@@ -21,9 +21,10 @@ reaches scoring. rows_for() bridges id order -> slot order.
 """
 
 import jax.numpy as jnp
+import jax
 from typing import NamedTuple
 
-
+# region AXES
 # ---------------------------------------------------------------------------
 # AXIS 1 — TRIGGER : when the row fires
 # ---------------------------------------------------------------------------
@@ -154,6 +155,7 @@ STATE_NAMES = ["NONE", "SCALE_COUNTER", "ROTATE_GLOBAL", "ROTATE_FROM_DECK"]
 # copyable-looking rows simply are not), so it is declared per row.
 # Default True; a row spells out copyable=False only for the exceptions.
 
+# endregion 
 
 class Joker(NamedTuple):
     """The row schema. Scalars = one row; (MAX_JOKERS,) arrays = a whole loadout."""
@@ -177,7 +179,6 @@ COMMON, UNCOMMON, RARE, LEGENDARY = 1, 2, 3, 4
 # suits, for COND_PARAM readability (scoring.py: 0=clubs 1=diamonds 2=hearts 3=spades)
 CLUBS, DIAMONDS, HEARTS, SPADES = 0, 1, 2, 3
 
-
 class JokerDef(NamedTuple):
     """One authored joker. Plain Python — never traced, never in a pytree."""
     name    : str
@@ -192,7 +193,6 @@ class JokerDef(NamedTuple):
     query   : int = Q_NONE
     state   : int = ST_NONE
     copyable: bool = True
-
 
 # ---------------------------------------------------------------------------
 # THE TABLE — a joker is one line. Its id is its row index.
@@ -209,7 +209,6 @@ TABLE = [
     JokerDef("Greedy Joker",         5, COMMON,    T_PER_SCORED,        E_ADD_MULT,           3.0, cond=C_SUIT, param=DIAMONDS),
     JokerDef("Bootstraps",           7, UNCOMMON,  T_ONCE_MAIN,         E_ADD_MULT,           2.0, source=S_QUERY, query=Q_MONEY_DIV_5),
 ]
-
 
 # ---------------------------------------------------------------------------
 # COMPILE — transpose the authored rows into columns, validating on the way.
@@ -259,7 +258,6 @@ JOKER_QUERY  = jnp.array([d.query  for d in TABLE], jnp.int32)
 JOKER_COST   = jnp.array([d.cost   for d in TABLE], jnp.int32)
 JOKER_RARITY = jnp.array([d.rarity for d in TABLE], jnp.int32)
 
-
 # ---------------------------------------------------------------------------
 # Joker ids — table position. -1 = empty slot.
 # ---------------------------------------------------------------------------
@@ -274,7 +272,6 @@ J_JOKER     = JOKER_ID["Joker"]
 J_GREEDY    = JOKER_ID["Greedy Joker"]
 J_BOOTSTRAP = JOKER_ID["Bootstraps"]
 
-
 class RuleMods(NamedTuple):
     """Stage-0: passive jokers patch the RULES before detection runs.
 
@@ -286,7 +283,6 @@ class RuleMods(NamedTuple):
     smeared      : jnp.ndarray   # bool — hearts/diamonds and spades/clubs are one suit
     splash       : jnp.ndarray   # bool — every played card scores
     pareidolia   : jnp.ndarray   # bool — every card counts as a face card
-
 
 NO_MODS = RuleMods(*[jnp.bool_(False)] * 5)   # v0.2 default: no rule-mods held
 
@@ -302,18 +298,16 @@ def rows_for(ids):
     SLOT 3". The scan walks slots, so it needs slot order. Output shape comes
     from ids, which is why N_JOKERS never reaches anything downstream.
 
-    Vacant slots must gather a HARMLESS row: clamp the index, then let the
-    caller's `active` mask (ids != J_EMPTY) zero it. A raw -1 clamps silently to
-    the LAST row — that is how an empty slot starts scoring like Bootstraps.
+    Vacant slots must gather a HARMLESS row: clip the index, then let the
+    caller's `active` mask (ids != J_EMPTY) zero it. A raw -1 WRAPS to the last
+    row (out-of-range indices clamp there too) — either way an empty slot starts
+    scoring like whatever the table happens to end with.
     """
-
-    
-    raise NotImplementedError
-
+    safe = jnp.clip(ids, 0, N_JOKERS - 1)
+    return jax.tree.map(lambda col: col[safe], JOKERS)
 
 def resolve(rows, query_kinds, active, ctx):
     """Produce the live value v per slot, BEFORE scoring. -> (MAX_JOKERS,) float32
-
         CONSTANT : v = VALUE
         COUNTER  : v = joker_value  (passthrough; update already evolved it)
         QUERY    : v = VALUE * count(query_kind, ctx)
@@ -321,6 +315,10 @@ def resolve(rows, query_kinds, active, ctx):
     ctx carries the global reductions QUERY needs (money, free slots, deck
     counts). Fresh every hand, never cached — a mid-blind buy changes the answer.
     """
+
+
+
+
     raise NotImplementedError
 
 
@@ -335,4 +333,16 @@ def update(rows, joker_value, joker_state, trigger, ctx):
     Genuinely (trigger, condition, delta, reset), a mini-row of its own: Green is
     +1/-1 across two triggers, and Ride the Bus / Obelisk RESET on a condition.
     """
+
+    
     raise NotImplementedError
+
+
+if __name__ == "__main__":
+
+    ids = jnp.array([0, 2])
+
+    rows_for(ids)
+
+
+    
