@@ -7,7 +7,8 @@ env_step(state, action):
 2. score * (verb == PLAY) — no branch
 3. consequences: chips += score, decrement plays/discards, void used slots (hand_valid False)
 4. refill (shared helper — reset and step both END with it, neither IS it)
-5. reward (chips progress toward blind target + win bonus) and done (plays out | blind beat)
+5. reward = cashout $ on clear, $0 on fail (see "reward = CASHOUT dollars" — supersedes the old
+   chips-progress reward) and done (plays out | blind beat)
 Decide action-REPAIR rules as comments BEFORE coding (agent will emit 6-card selections,
 empty selections, illegal discards — clamp/repair at the boundary, never throw).
 Sanity target: reset with a known seed, print the hand, score it with scoreHand by hand.
@@ -352,6 +353,34 @@ blind reward at cashout: Small $3 / Big $4 / Boss $5.   interest: $1 per $5 held
 reroll: base $5, +$1 per reroll this visit, resets each shop (Chaos the Clown = 1 free reroll/shop).
 shop card slots: 2 (basic shop = 2 buy slots + reroll; vouchers/booster packs deferred).
 joker price by rarity: use the Cost column in jokers_checklist.xlsx.
+
+### reward = CASHOUT dollars. Chips are NOT reward (pinned)
+Reward is what the game pays and nothing else:
+  cashout = blind reward (Small $3 / Big $4 / Boss $5)
+          + $1 per hand remaining
+          + interest (rate x $ held/5, capped)  -- included: it's what makes hoard-vs-spend learnable
+  interest rate/cap are DERIVED scalars, not constants — budget-family rule (pure function of base +
+  held jokers + owned vouchers, recomputed at read, never cached):
+    rate = $1 per $5  + $1 per held To the Moon (ADD_INTEREST_RATE, family-C row, stateless)
+    cap  = $5 base -> $10 Seed Money -> $20 Money Tree (vouchers)
+    interest = rate * min(floor(money/5), cap)  -- cap counts INCREMENTS, so rate scales max payout
+    checked: $25+Moon=$10, $50+Seed+Moon=$20, $100+Tree+Moon=$40, $41+Seed+Moon=$16 (floor: 8 incr)
+  a VOUCHER = a joker that can't be sold and occupies no slot: permanent for the run, one bool per
+  voucher (vouchers_owned), same effect enums, summed alongside held jokers in the derived scalars.
+  failed blind = $0. No chip term, no partial credit, no near-miss shaping — the game has none either.
+WHY (each load-bearing):
+- EFFICIENCY GRADIENT: under chip-sum reward, four pairs totaling 320 == one 316-chip straight. Under
+  cashout the straight pays strictly more ($1 per leftover hand) -> a built-in gradient toward the
+  coordinated hands v0.1 refused to play, with ZERO hand-type shaping.
+- ONE CURRENCY: blind phase and shop phase optimize the same number. Joker value is priced in the
+  reward's own units (buy -> clear faster -> more hands left -> more $) — no separate signal needed.
+- SCORE-FORMULA-PROOF: reward never reads the score, so decks that change the formula (Plasma:
+  ((chips+mult)/2)^2, x2 blinds) can't distort reward scale. (chips_scored stays int32 in state/obs;
+  the Plasma overflow question is separate and still open.)
+COST (accepted, eyes open): reward is a step function at the blind boundary — clearing at 299/300 pays
+like scoring zero. Sparse reward + cold start is handled by the CURRICULUM (ramp blind targets up from
+trivial so early policies clear often), never by re-adding a chip term. If a run stalls, the diagnostic
+is CLEAR RATE at the current gate — not entropy, not lr.
 
 ### the attention swap is a MEASUREMENT, not a plan step
 MLP weights do NOT graft onto an attention policy (different topology — (601,128) has no counterpart in
