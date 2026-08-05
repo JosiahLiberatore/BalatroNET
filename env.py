@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from jax import jit
 from typing import NamedTuple
 from scoring import scoreHand
+from arrays import first_n, compact, selected_cards
 
 MAX_HAND_SIZE = 32
 MAX_DECK_SIZE = 128
@@ -50,26 +51,14 @@ class balatroAction(NamedTuple):
     verb   : jax.Array   # scalar int32   -- 0 = Play, 1 = Discard
     select : jax.Array   # (32,)  bool    -- which lanes to act on
 
-
-class Joker(NamedTuple):
-    TRIGGER : jax.Array # scalar int32
-    CONDITION : jax.Array # scalar int32
-    EFFECT : jax.Array # scalar int32
-    VALUE : jax.Array #  float
-    STATE : jax.Array #  float
-
 @jit
 def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvState, float, bool]:
 
     # get the hand type
-    hand = state.hand
-    select = (action.select & state.hand_valid).astype(bool)
-    select = select & (jnp.cumsum(select) <= 5)
-    order = jnp.argsort(~select)
-    cardularcards = hand[order][:5]
-    valid = select[order][:5]
-    suit = (cardularcards // 13)[:5]
-    rank = (cardularcards % 13)[:5]
+    cardularcards, valid, select = selected_cards(state.hand, state.hand_valid,
+                                                  action.select.astype(bool), 5)
+    suit = cardularcards // 13
+    rank = cardularcards % 13
     handtype, hand_mask, chips, mult = scoreHand(rank, suit, valid)
 
     # score jokers
@@ -236,7 +225,7 @@ def reset(key, deckSize, handSize):
     deck = jax.random.permutation(subkey, MAX_DECK_SIZE)
 
     dead = deck >= deckSize
-    deck = deck[jnp.argsort(dead)]
+    deck = compact(deck, ~dead)          # live cards to the front, dead to the tail
 
     hand_valid = jnp.arange(MAX_HAND_SIZE) < handSize
     hand = jnp.where(hand_valid, deck[:MAX_HAND_SIZE], -1)
@@ -263,9 +252,9 @@ def reset(key, deckSize, handSize):
 def deal(state : balatroEnvState):
     deal_count = state.hand_size - state.hand_valid.sum()
     empty = ~state.hand_valid
-    queue = jnp.cumsum(empty)
-    src = state.deck_ptr + queue - 1
-    fill = empty & (queue - 1 < deal_count)
+    # each empty lane's position in the refill queue -> which deck slot feeds it
+    src = state.deck_ptr + jnp.cumsum(empty) - 1
+    fill = first_n(empty, deal_count)
 
     new_hand = jnp.where(fill, state.deck[src], state.hand)
     new_hand_valid = (jnp.arange(MAX_HAND_SIZE) < state.hand_size) | fill

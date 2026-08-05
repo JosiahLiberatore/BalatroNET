@@ -38,6 +38,7 @@ from env import balatroAction, balatroEnvState, MAX_HAND_SIZE
 from env import reset, env_step, _card_name
 from agent import init_params, observe, policy, act
 from scoring import scoreHand, HAND_NAMES
+from arrays import selected_cards
 
 RUNS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
 DEFAULT_CKPT = os.path.join(RUNS_ROOT, "params_latest.pkl")
@@ -95,15 +96,13 @@ def _binary_entropy(p):
 
 
 def _played_hand(state, action):
-    """Reproduce env_step's selection to name the hand the agent would make."""
-    select = (action.select & state.hand_valid).astype(bool)
-    select = select & (jnp.cumsum(select) <= 5)   # env's 5-card cap
-    order = jnp.argsort(~select)
-    cards = state.hand[order][:5]
-    valid5 = select[order][:5]
-    handtype, _, score = scoreHand(cards % 13, cards // 13, valid5)
+    """Name the hand the agent would make. Shares selected_cards with env_step,
+    so the readout cannot describe a selection the env didn't score."""
+    cards, valid5, _ = selected_cards(state.hand, state.hand_valid,
+                                      action.select.astype(bool), 5)
+    handtype, _, chips, mult = scoreHand(cards % 13, cards // 13, valid5)
     names = [_card_name(int(c)) for c, v in zip(cards, valid5) if bool(v)]
-    return HAND_NAMES[int(handtype)], names, int(score)
+    return HAND_NAMES[int(handtype)], names, int(chips * mult)
 
 
 # ---------- one episode, verbose ----------
@@ -122,8 +121,9 @@ def inspect_episode(params, key):
         # env forces PLAY when no discards remain; show the EFFECTIVE verb,
         # and the EFFECTIVE selection (valid lanes, first 5, like env_step)
         eff_verb = int(action.verb) if int(state.discards) > 0 else 0
-        sel = action.select.astype(bool) & state.hand_valid
-        sel = sel & (jnp.cumsum(sel) <= 5)
+        # the lane-order mask env_step will actually act on -> what gets a '*'
+        _, _, sel = selected_cards(state.hand, state.hand_valid,
+                                   action.select.astype(bool), 5)
         hand, _, _ = _played_hand(state, action)       # from the PRE-step state
 
         n = int(state.hand_size)
