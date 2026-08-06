@@ -293,7 +293,10 @@ NO_MODS = RuleMods(*[jnp.bool_(False)] * 5)   # v0.2 default: no rule-mods held
 # STUBS — signatures and contracts pinned; bodies land with the joker pipeline.
 # ---------------------------------------------------------------------------
 def rows_for(ids):
-    """Gather JOKERS from ID order into SLOT order. ids (MAX_JOKERS,) -> Joker.
+    """Gather JOKERS from ID order into SLOT order.
+
+    ids : (MAX_JOKERS,) int32  — joker id per held slot, J_EMPTY (-1) for vacant
+    ->    Joker, fields (MAX_JOKERS,)  — the static rules for what's held
 
     One `JOKERS.field[ids]` per field; what changes is the index axis:
     JOKERS.EFFECT[3] is "joker id 3", rows_for(ids).EFFECT[3] is "whatever is in
@@ -312,25 +315,55 @@ def resolve(rows, active, joker_value, ctx):
     """Produce the live value v per slot, BEFORE scoring. -> (MAX_JOKERS,) float32
         CONSTANT : v = VALUE
         COUNTER  : v = joker_value  (passthrough; update already evolved it)
-        QUERY    : v = VALUE * count(query_kind, ctx)
+        QUERY    : v = VALUE * ctx[QUERY]
 
-    ctx carries the global reductions QUERY needs (money, free slots, deck
-    counts). Fresh every hand, never cached — a mid-blind buy changes the answer.
+    rows        : Joker, fields (MAX_JOKERS,)  — gathered static rules, slot order
+                                                 (reads SOURCE / VALUE / QUERY only)
+    active      : (MAX_JOKERS,) bool           — ids != J_EMPTY; zeroes the ghost
+                                                 rows clip left in vacant slots
+    joker_value : (MAX_JOKERS,) float32        — live COUNTER memory from EnvState,
+                                                 written by update(), read here
+    ctx         : (N_QUERY_KINDS,) float32     — pre-answered query menu, ctx[k] =
+                                                 count for kind k; built by env from
+                                                 live state (money, slots, deck)
+
+    ctx is fresh every hand, never cached — a mid-blind buy changes the answer.
+    The output is ephemeral (this hand's read); never write it back to state.
     """
 
+    active_jokers = jnp.where(active, rows, 0.0)
 
+    print(active_jokers)
 
 
     print(rows)
 
 
 def rule_mods(rows, ids, active):
-    """Derive the stage-0 RuleMods flags from a loadout. -> RuleMods"""
+    """Derive the stage-0 RuleMods flags from a loadout. -> RuleMods (5 scalar bools)
+
+    rows   : Joker, fields (MAX_JOKERS,)  — gathered static rules, slot order
+    ids    : (MAX_JOKERS,) int32          — joker id per slot (rule-mod jokers are
+                                            identified by id, not by axis fields)
+    active : (MAX_JOKERS,) bool           — ids != J_EMPTY; a vacant slot's ghost
+                                            row must not raise a flag
+    """
     raise NotImplementedError
 
 
 def update(rows, joker_value, joker_state, trigger, ctx):
     """UPDATE pass — the SECOND rule each row carries. -> (joker_value, joker_state)
+
+    rows        : Joker, fields (MAX_JOKERS,)  — gathered static rules, slot order
+    joker_value : (MAX_JOKERS,) float32        — live COUNTER memory, read-modify-
+                                                 write (the array this pass OWNS)
+    joker_state : (MAX_JOKERS,) int32          — live discrete control memory
+                                                 (ROTATE selector, countdowns)
+    trigger     : scalar int32                 — the T_* event firing now; each
+                                                 slot updates only if its update
+                                                 rule listens to this trigger
+    ctx         : (N_QUERY_KINDS,) float32     — same pre-answered menu resolve
+                                                 gets (conditions may read it)
 
     Genuinely (trigger, condition, delta, reset), a mini-row of its own: Green is
     +1/-1 across two triggers, and Ride the Bus / Obelisk RESET on a condition.
@@ -349,7 +382,7 @@ if __name__ == "__main__":
     resolve(
         jonklers,
         active=jnp.array([True, True, False]),
-        joker_value=jnp.array([]),
+        joker_value=jnp.array([4.0, 2.0, 6.9]),
         ctx=jnp.array([])
     )
 
