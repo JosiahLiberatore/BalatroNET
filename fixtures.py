@@ -23,14 +23,13 @@ tests / agent scratch blocks. Nothing in the env may import it.
 import jax
 import jax.numpy as jnp
 
-from env import balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE
+from env import balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_CONSUMABLES
 # the card-name convention has ONE definition, in env (show() prints with it)
 from env import RANK_CHARS, SUIT_CHARS
 from jokers import (JOKER_ID, J_EMPTY, MAX_JOKERS, N_QUERY_KINDS,
                     Q_MONEY_DIV_5, rows_for, resolve)
 
 EMPTY = -1
-MAX_CONSUMABLES = 2   # local until consumables are real and env owns the constant
 EMPTY_CHARS = {".", "-", "_"}   # any of these authors an empty lane
 
 
@@ -161,17 +160,23 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           deck_ptr=None, hands=3, discards=2, handcount=4, discardcount=3,
           round=1, ante=1, chips_scored=0, blind_target=300,
           shop_slots=(EMPTY, EMPTY, EMPTY, EMPTY), jokers=(), consumables=(),
-          game_stage=0, key=0):
+          joker_value=None, money=0, game_stage=0, key=0):
     """Author a balatroEnvState from the fields the scenario is actually about.
 
-    hand       card-name string, or a list of ids. '.' is an empty lane.
-    valid      defaults to "every authored lane that holds a card"
-    hand_size  defaults to the number of authored lanes
-    deck       defaults to deck_after(hand) — the deck a mid-round state implies
-    deck_ptr   defaults to hand_size, i.e. the opening hand has just been dealt
-    key        an int seed, or a real PRNG key to pass straight through
+    hand        card-name string, or a list of ids. '.' is an empty lane.
+    valid       defaults to "every authored lane that holds a card"
+    hand_size   defaults to the number of authored lanes
+    deck        defaults to deck_after(hand) — the deck a mid-round state implies
+    deck_ptr    defaults to hand_size, i.e. the opening hand has just been dealt
+    joker_value defaults to the fresh-buy seed (VALUE per occupied slot, else 0)
+    key         an int seed, or a real PRNG key to pass straight through
     """
     ids = cards(hand)
+    jids = joker_ids(jokers)
+    if joker_value is None:
+        joker_value = jnp.where(jids != J_EMPTY, rows_for(jids).VALUE, 0.0)
+    else:
+        joker_value = lanes(joker_value, MAX_JOKERS, 0.0, jnp.float32)
     if hand_size is None:
         hand_size = len(ids)
     if valid is None:
@@ -184,7 +189,8 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         key = jax.random.key(key)
 
     return balatroEnvState(
-        jokers=joker_ids(jokers),
+        jokers=jids,
+        joker_value=joker_value,
         consumables=lanes(cards(consumables), MAX_CONSUMABLES),
         hand=lanes(ids),
         hand_size=jnp.int32(hand_size),
@@ -203,6 +209,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         key=key,
         shop_slots=jnp.asarray(shop_slots, dtype=jnp.int32),
         game_stage=jnp.int32(game_stage),
+        money=jnp.int32(money),
     )
 
 
