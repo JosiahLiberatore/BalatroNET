@@ -286,7 +286,7 @@ NO_MODS = RuleMods(*[jnp.bool_(False)] * 5)   # default: no rule-mod jokers held
 # ---------------------------------------------------------------------------
 # STUBS — signatures and contracts are fixed. Bodies come with the joker pipeline.
 # ---------------------------------------------------------------------------
-def rows_for(ids):
+def rows_for(ids) -> Joker:
     """Gather JOKERS from id order into slot order.
 
     ids : (MAX_JOKERS,) int32  — joker id per held slot, J_EMPTY (-1) for vacant
@@ -303,7 +303,7 @@ def rows_for(ids):
     safe = jnp.clip(ids, 0, N_JOKERS - 1)
     return jax.tree.map(lambda col: col[safe], JOKERS)
 
-def resolve(rows, active, joker_value, ctx):
+def resolve(rows: Joker, active, joker_value, ctx):
     """Produce the live value v per slot, before scoring. -> (MAX_JOKERS,) float32
         CONSTANT : v = VALUE
         COUNTER  : v = joker_value  (update() has already evolved it)
@@ -336,7 +336,7 @@ def resolve(rows, active, joker_value, ctx):
     return jnp.where(active, v, 0.0)
 
 
-def rule_mods(rows, ids, active):
+def rule_mods(rows: Joker, ids, active):
     """Derive the stage-0 RuleMods flags from a loadout. -> RuleMods (5 scalar bools)
 
     rows   : Joker, fields (MAX_JOKERS,)  — gathered static rules, slot order
@@ -348,7 +348,7 @@ def rule_mods(rows, ids, active):
     raise NotImplementedError
 
 
-def update(rows, joker_value, joker_state, trigger, ctx):
+def update(rows: Joker, joker_value, joker_state, trigger, ctx):
     """Update pass — the second rule each row carries. -> (joker_value, joker_state)
 
     rows        : Joker, fields (MAX_JOKERS,)  — gathered static rules, slot order
@@ -365,7 +365,6 @@ def update(rows, joker_value, joker_state, trigger, ctx):
     The update rule is (trigger, condition, delta, reset). Green Joker is
     +1/-1 across two triggers. Ride the Bus and Obelisk reset on a condition.
     """
-
 
     raise NotImplementedError
 
@@ -389,5 +388,4 @@ if __name__ == "__main__":
     #   slot 2  vacant    v = 0.0
     v = resolve(rows, active, joker_value, ctx)
     print(v)
-
 

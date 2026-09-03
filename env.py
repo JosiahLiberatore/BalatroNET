@@ -9,8 +9,8 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 from typing import NamedTuple
-from scoring import scoreHand
-from jokers import MAX_JOKERS, J_EMPTY
+from scoring import scoreHand, joker_score
+from jokers import MAX_JOKERS, J_EMPTY, N_QUERY_KINDS, Q_MONEY_DIV_5
 from jokers import rows_for, resolve, update
 from arrays import first_n, compact, selected_cards
 
@@ -60,7 +60,7 @@ class balatroAction(NamedTuple):
     verb   : jax.Array   # scalar int32   -- 0 = Play, 1 = Discard
     select : jax.Array   # (32,)  bool    -- which lanes to act on
 
-#@jit
+@jit
 def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvState, float, bool]:
 
     # get the hand type
@@ -70,16 +70,21 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     rank = cardularcards % 13
     handtype, hand_mask, chips, mult = scoreHand(rank, suit, valid)
 
-    # score jokers -- lands when joker_value and money enter the state.
-    # Then: rows_for(state.jokers), resolve, joker_score(chips, mult, ...).
-
+    # get joker lookups from IDs
     rows = rows_for(state.jokers)
 
-    # dbg takes keyword rows only, and needs concrete arrays: comment out the
-    # @jit on env_step while developing, then e.g.
-    dbg(n=8, effect=rows.EFFECT, value=rows.VALUE)
+    # boolean mask for active
+    active = state.jokers != J_EMPTY
 
-    score = chips * mult
+    # calculate queries
+    ctx = jnp.zeros(N_QUERY_KINDS, jnp.float32).at[Q_MONEY_DIV_5].set(state.money // 5)
+
+
+    v = resolve(rows, active, joker_value=state.joker_value, ctx=ctx)
+
+    chips, mult = joker_score(chips, mult, handtype, rank, suit, hand_mask, rows, active, v)
+
+    score = jnp.floor(chips * mult).astype(jnp.int32)
 
     # get the verb
     verb = jnp.where(state.discards > 0, action.verb, 0)

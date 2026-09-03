@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 
-from jokers import (C_NONE, C_SUIT, C_RANK_IN, C_IS_FACE, C_HAND_HAS,
+from jokers import (Joker, C_NONE, C_SUIT, C_RANK_IN, C_IS_FACE, C_HAND_HAS,
                     T_PER_SCORED, T_ONCE_MAIN, E_ADD_MULT, E_ADD_CHIPS)
 
 # which candidate mask each hand type uses: 0=all, 1=groups, 2=high
@@ -86,7 +86,7 @@ def scoreHand(rank, suit, valid):
 #               a masked sum. The scan arrives with the first XMULT joker.
 # Rows using either contribute nothing instead of contributing something wrong.
 
-def joker_score(chips, mult, handtype, rank, suit, scoring_mask, rows, active, v):
+def joker_score(chips, mult, handtype, rank, suit, scoring_mask, rows: Joker, active, v):
     """Add the held jokers' contribution. -> (chips, mult) as float32.
 
     chips, mult  : scalars              -- the base values from scoreHand
