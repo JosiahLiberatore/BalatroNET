@@ -9,7 +9,7 @@ from tensorboardX import SummaryWriter
 
 from env import balatroAction, balatroEnvState
 from env import MAX_DECK_SIZE, MAX_HAND_SIZE
-from env import _hand_lanes, _valid_lanes, show, dbg, reset, env_step
+from env import show, dbg, reset, env_step
 from agent import init_params, observe, policy, act
 from debug_agent import save_params
 

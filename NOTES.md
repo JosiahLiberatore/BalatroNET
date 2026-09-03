@@ -326,7 +326,7 @@ values at reset. Zero reshape. (count is DATA, capacity is SHAPE — the same ru
 ### obs layout: a union of DISJOINT blocks (NO lane reuse)
   obs = [ SHARED     money, jokers(id/edition/sell), ante, round, phase_flag ]   -- live in both phases
       + [ BLIND-ONLY hand ranks/suits, hand_valid, hands/discards left, chips-vs-target, undealt mask ]  -- 0 in shop
-      + [ SHOP-ONLY  shop offerings (2 slots), reroll cost, reroll count ]        -- 0 in blind
+      + [ SHOP-ONLY  shop offerings (4 lanes, locked ones 0), reroll cost, reroll count ]  -- 0 in blind
 No lane ever carries two meanings. Reusing card lanes for shop data would make the net score shop items
 with card-PLAYING weights (disambiguated only by a phase flag it must learn to respect) — the exact
 collision to avoid.
@@ -351,7 +351,11 @@ bank on phase isolation for anything; it is a nice property of THIS net, not a d
 ### economy math (base Balatro — for the blind formula + the shop)
 blind reward at cashout: Small $3 / Big $4 / Boss $5.   interest: $1 per $5 held, cap $5 (saturates $25).
 reroll: base $5, +$1 per reroll this visit, resets each shop (Chaos the Clown = 1 free reroll/shop).
-shop card slots: 2 (basic shop = 2 buy slots + reroll; vouchers/booster packs deferred).
+shop card slots: capacity 4, 2 UNLOCKED at run start. Overstock -> 3, Overstock Plus -> 4 (vouchers).
+  capacity is SHAPE, unlocked count is DATA — the same rule as hand/deck/jokers. shop_slots stays (4,)
+  for the whole run; locked lanes hold -1, and mask out of obs and out of the buy action. So buying
+  Overstock does NOT reshape obs or params — which is the whole reason 4 is baked in now.
+  (booster packs deferred.)
 joker price by rarity: use the Cost column in jokers_checklist.xlsx.
 
 ### reward = CASHOUT dollars. Chips are NOT reward (pinned)

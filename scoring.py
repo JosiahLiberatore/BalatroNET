@@ -10,6 +10,9 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 
+from jokers import (C_NONE, C_SUIT, C_RANK_IN, C_IS_FACE, C_HAND_HAS,
+                    T_PER_SCORED, T_ONCE_MAIN, E_ADD_MULT, E_ADD_CHIPS)
+
 # which candidate mask each hand type uses: 0=all, 1=groups, 2=high
 MASK_CHOICE = jnp.array([0, 1, 0, 0, 0, 1, 1, 1, 2])
 
@@ -62,3 +65,67 @@ def scoreHand(rank, suit, valid):
     mult = BASE_MULT[handtype]
 
     return handtype, scoring_mask, chips, mult
+
+
+# ---------------------------------------------------------------------------
+# JOKER PASS — turn resolved joker values into chips and mult
+# ---------------------------------------------------------------------------
+# scoreHand returns the BASE (chips, mult) of the hand. This pass adds what the
+# held jokers contribute. The split is why scoreHand stopped returning a single
+# product: a joker adds mult AFTER the base chips are known, so the multiply
+# must happen last.
+#
+# One generic reader, no per-joker branches. A slot contributes
+#     v * fires
+# where v comes from jokers.resolve() and fires is how many times the row
+# triggers this hand.
+#
+# NOT SUPPORTED YET, by design:
+#   T_PER_HELD  needs the held cards, which this function does not receive.
+#   E_XMULT     needs the ordered scan — (4+4)*3 != (4*3)+4 — so it cannot be
+#               a masked sum. The scan arrives with the first XMULT joker.
+# Rows using either contribute nothing instead of contributing something wrong.
+
+def joker_score(chips, mult, handtype, rank, suit, scoring_mask, rows, active, v):
+    """Add the held jokers' contribution. -> (chips, mult) as float32.
+
+    chips, mult  : scalars              -- the base values from scoreHand
+    handtype     : scalar int32         -- index into HAND_NAMES
+    rank, suit   : (5,) int32           -- the played cards
+    scoring_mask : (5,) bool            -- which played cards score
+    rows         : Joker, (MAX_JOKERS,) -- jokers.rows_for(ids), slot order
+    active       : (MAX_JOKERS,) bool   -- ids != J_EMPTY
+    v            : (MAX_JOKERS,) float32 -- jokers.resolve() output
+    """
+    n_slots = rows.CONDITION.shape[0]
+    shape = (n_slots, rank.shape[0])
+
+    cond  = rows.CONDITION[:, None]     # (J, 1)
+    param = rows.COND_PARAM[:, None]    # (J, 1)
+    r, s  = rank[None, :], suit[None, :]  # (1, 5)
+    bc = lambda x: jnp.broadcast_to(x, shape)
+
+    # PER-CARD conditions: does slot j fire on card c?
+    match = jnp.select(
+        [bc(cond == C_NONE), bc(cond == C_SUIT),
+         bc(cond == C_RANK_IN), bc(cond == C_IS_FACE)],
+        [bc(True), bc(s == param),
+         bc(((param >> r) & 1) != 0), bc((r >= 9) & (r <= 11))],
+        default=bc(False))
+
+    # GATE conditions: is slot j on at all for this hand?
+    gate = jnp.select(
+        [rows.CONDITION == C_NONE, rows.CONDITION == C_HAND_HAS],
+        [jnp.ones(n_slots, bool), handtype == rows.COND_PARAM],
+        default=jnp.zeros(n_slots, bool))
+
+    fires = jnp.select(
+        [rows.TRIGGER == T_PER_SCORED, rows.TRIGGER == T_ONCE_MAIN],
+        [(match & scoring_mask[None, :]).sum(axis=1), gate.astype(jnp.int32)],
+        default=jnp.zeros(n_slots, jnp.int32))
+    fires = jnp.where(active, fires, 0).astype(jnp.float32)
+
+    contrib = v * fires
+    chips = chips + jnp.where(rows.EFFECT == E_ADD_CHIPS, contrib, 0.0).sum()
+    mult  = mult  + jnp.where(rows.EFFECT == E_ADD_MULT,  contrib, 0.0).sum()
+    return chips, mult

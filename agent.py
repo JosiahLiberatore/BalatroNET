@@ -3,7 +3,7 @@ import jax.numpy as jnp
 
 from env import balatroAction, balatroEnvState
 from env import MAX_DECK_SIZE, MAX_HAND_SIZE
-from env import _hand_lanes, _valid_lanes, show, dbg
+from env import show, dbg
 
 def init_params(key):
     key1, key2 = jax.random.split(key)
@@ -105,29 +105,11 @@ if __name__ == "__main__":
     # 8-card hand, two pair of Ks (lanes 1/3) + 7s (lanes 4/6), unselected
     # pair of 9s at lanes 2/5. chips 60/300, 3 hands, 2 discards.
     # Feed it to observe() and eyeball the encoding with dbg().
-    hand_ids = [2, 24, 33, 11, 5, 46, 44, 27]
-    rest = [i for i in range(52) if i not in hand_ids]
-    state = balatroEnvState(
-        hand=_hand_lanes(hand_ids),
-        hand_size=jnp.int32(8),
-        hand_valid=_valid_lanes([1, 1, 1, 1, 1, 1, 1, 1]),
-        deck=jnp.array(hand_ids + rest + list(range(52, MAX_DECK_SIZE)),
-                       dtype=jnp.int32),
-        deck_size=jnp.int32(52),
-        deck_ptr=jnp.int32(8),
-        hands=jnp.int32(3),
-        discards=jnp.int32(2),
-        handcount=jnp.int32(4),
-        discardcount=jnp.int32(3),
-        round=jnp.int32(1),
-        ante=jnp.int32(1),
-        chips_scored=jnp.int32(60),
-        blind_target=jnp.int32(300),
-        key=jax.random.key(0),
-    )
+    from fixtures import state as make_state, select as make_select
+
+    state = make_state(hand="4C KD 9H KC 7C 9S 7S 3H", chips_scored=60)
     # the matching two-pair action, if you want to step it: verb 0 = PLAY
-    action = balatroAction(verb=jnp.int32(0),
-                           select=_valid_lanes([0, 1, 0, 1, 1, 0, 1, 0]))
+    action = balatroAction(verb=jnp.int32(0), select=make_select("01011010"))
 
     # show(state, "agent dev state")
 
