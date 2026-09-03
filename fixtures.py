@@ -160,7 +160,8 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           deck_ptr=None, hands=3, discards=2, handcount=4, discardcount=3,
           round=1, ante=1, chips_scored=0, blind_target=300,
           shop_slots=(EMPTY, EMPTY, EMPTY, EMPTY), jokers=(), consumables=(),
-          joker_value=None, money=0, game_stage=0, key=0):
+          joker_value=None, joker_state=(), joker_slots=5, consumable_slots=2,
+          money=0, game_stage=0, key=0):
     """Author a balatroEnvState from the fields the scenario is actually about.
 
     hand        card-name string, or a list of ids. '.' is an empty lane.
@@ -169,6 +170,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
     deck        defaults to deck_after(hand) — the deck a mid-round state implies
     deck_ptr    defaults to hand_size, i.e. the opening hand has just been dealt
     joker_value defaults to the fresh-buy seed (VALUE per occupied slot, else 0)
+    joker_state defaults to zeros; joker_slots to 5; consumable_slots to 2
     key         an int seed, or a real PRNG key to pass straight through
     """
     ids = cards(hand)
@@ -191,7 +193,10 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
     return balatroEnvState(
         jokers=jids,
         joker_value=joker_value,
+        joker_state=lanes(joker_state, MAX_JOKERS, 0, jnp.int32),
+        joker_slots=jnp.int32(joker_slots),
         consumables=lanes(cards(consumables), MAX_CONSUMABLES),
+        consumable_slots=jnp.int32(consumable_slots),
         hand=lanes(ids),
         hand_size=jnp.int32(hand_size),
         hand_valid=mask_lanes(valid),

@@ -10,7 +10,8 @@ import jax.numpy as jnp
 from jax import jit
 from typing import NamedTuple
 from scoring import scoreHand, joker_score
-from jokers import MAX_JOKERS, J_EMPTY, N_QUERY_KINDS, Q_MONEY_DIV_5
+from jokers import MAX_JOKERS, J_EMPTY
+from jokers import N_QUERY_KINDS, Q_MONEY_DIV_5, Q_EMPTY_JOKER_SLOTS
 from jokers import rows_for, resolve, update
 from arrays import first_n, compact, selected_cards
 
@@ -25,7 +26,11 @@ class balatroEnvState(NamedTuple):
     # jokers
     jokers       : jax.Array   # (32,)  int32   -- joker id per slot, J_EMPTY = vacant
     joker_value  : jax.Array   # (32, ) float   -- the value of the joker in each jokers[i] slot
+    joker_state  : jax.Array   # (32, ) int32   -- holds internal states (ex. Obelisk, Ancient Joker, Castle)
+    joker_slots  : jax.Array   # scalar int32   -- slot count for non-negative jokers
+
     consumables  : jax.Array   # (16,)  int32   -- consumable id per slot, -1 = vacant
+    consumable_slots :jax.Array # scalar int32  -- current max of non-negative consumables
 
     # hand
     hand         : jax.Array   # (32,)  int32   -- card id per lane, -1 = empty
@@ -77,8 +82,7 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     active = state.jokers != J_EMPTY
 
     # calculate queries
-    ctx = jnp.zeros(N_QUERY_KINDS, jnp.float32).at[Q_MONEY_DIV_5].set(state.money // 5)
-
+    ctx = build_ctx(state)
 
     v = resolve(rows, active, joker_value=state.joker_value, ctx=ctx)
 
@@ -104,6 +108,11 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     done = (next_state.chips_scored >= state.blind_target) | (next_state.hands == 0)
     return next_state, score, done
 
+def build_ctx(state) -> jax.Array:
+    return (jnp.zeros(N_QUERY_KINDS, jnp.float32)
+    .at[Q_MONEY_DIV_5].set(state.money // 5)
+    )
+
 @jit
 def reset(key, deckSize, handSize):
     key, subkey = jax.random.split(key)
@@ -119,7 +128,10 @@ def reset(key, deckSize, handSize):
     return balatroEnvState(
         jokers=jnp.full(MAX_JOKERS, J_EMPTY, dtype=jnp.int32),
         joker_value=jnp.full(MAX_JOKERS, 0, dtype=float),
+        joker_state=jnp.full(MAX_JOKERS, 0, dtype=jnp.int32),
+        joker_slots=jnp.int32(5),
         consumables=jnp.full(MAX_CONSUMABLES, -1, dtype=jnp.int32),
+        consumable_slots=jnp.int32(2),
         hand=hand,
         hand_size=jnp.int32(handSize),
         hand_valid=hand_valid,

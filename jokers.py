@@ -202,6 +202,7 @@ TABLE = [
     JokerDef("Joker",                2, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           4.0),
     JokerDef("Greedy Joker",         5, COMMON,    T_PER_SCORED,        E_ADD_MULT,           3.0, cond=C_SUIT, param=DIAMONDS),
     JokerDef("Bootstraps",           7, UNCOMMON,  T_ONCE_MAIN,         E_ADD_MULT,           2.0, source=S_QUERY, query=Q_MONEY_DIV_5),
+    JokerDef("Green Joker",          4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           1.0, source=S_COUNTER, state=ST_SCALE_COUNTER),
 ]
 
 # ---------------------------------------------------------------------------
@@ -267,6 +268,7 @@ MAX_JOKERS = 32
 J_JOKER     = JOKER_ID["Joker"]
 J_GREEDY    = JOKER_ID["Greedy Joker"]
 J_BOOTSTRAP = JOKER_ID["Bootstraps"]
+J_GREEN     = JOKER_ID["Green Joker"]
 
 class RuleMods(NamedTuple):
     """Stage 0: passive jokers change the rules before hand detection runs.
@@ -331,7 +333,7 @@ def resolve(rows: Joker, active, joker_value, ctx):
     [rows.VALUE,
     joker_value,
     query_v],
-    default=0.0,)                    
+    default=0.0,)
 
     return jnp.where(active, v, 0.0)
 
@@ -366,6 +368,8 @@ def update(rows: Joker, joker_value, joker_state, trigger, ctx):
     +1/-1 across two triggers. Ride the Bus and Obelisk reset on a condition.
     """
 
+    
+
     raise NotImplementedError
 
 
@@ -388,4 +392,28 @@ if __name__ == "__main__":
     #   slot 2  vacant    v = 0.0
     v = resolve(rows, active, joker_value, ctx)
     print(v)
+
+    # ---- update() scratch — Green Joker counter --------------------------
+    # Loadout: slot 0 = Joker (CONSTANT, must never move), slot 1 = Green
+    # Joker (COUNTER), slot 2 = vacant (must never move).
+    ids    = jnp.array([J_JOKER, J_GREEN, J_EMPTY], jnp.int32)
+    active = ids != J_EMPTY
+    rows   = rows_for(ids)
+
+    # Green starts at 0 mult: no hands played yet. So the seed here is 0,
+    # not rows.VALUE — for a COUNTER, VALUE is the increment size.
+    joker_value = jnp.zeros(3, jnp.float32)
+    joker_state = jnp.zeros(3, jnp.int32)    # no ROTATE/countdown jokers yet
+
+    # Green's update rule: +VALUE on a played hand, -VALUE on a discard.
+    # want:  play 1   value [0. 1. 0.]
+    #        play 2   value [0. 2. 0.]
+    #        discard  value [0. 1. 0.]
+    # state stays [0 0 0] throughout. Later case to add: a discard at value
+    # 0 must floor at 0, not go negative.
+    for name, trig in [("play 1", T_ONCE_MAIN), ("play 2", T_ONCE_MAIN),
+                       ("discard", T_ON_DISCARD)]:
+        joker_value, joker_state = update(rows, joker_value, joker_state,
+                                          jnp.int32(trig), ctx)
+        print(f"{name:>8s}  value {joker_value}  state {joker_state}")
 
