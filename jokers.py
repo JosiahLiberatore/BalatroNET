@@ -368,9 +368,16 @@ def update(rows: Joker, joker_value, joker_state, trigger, ctx):
     +1/-1 across two triggers. Ride the Bus and Obelisk reset on a condition.
     """
 
+    print("STATE", rows.STATE)
+
+    result = joker_value
+
+    cand_jokers = jnp.where(trigger==rows.TRIGGER, joker_value, 0)
     
 
-    raise NotImplementedError
+
+
+    return
 
 
 if __name__ == "__main__":
@@ -391,9 +398,9 @@ if __name__ == "__main__":
     #   slot 1  QUERY     v = VALUE * ctx[Q]   = 2.0 * 4 = 8.0
     #   slot 2  vacant    v = 0.0
     v = resolve(rows, active, joker_value, ctx)
-    print(v)
+    print("resolve v:", v)   # expect [4. 8. 0.]
 
-    # ---- update() scratch — Green Joker counter --------------------------
+    # ---- update() scratch — Green Joker counter, ONE call ----------------
     # Loadout: slot 0 = Joker (CONSTANT, must never move), slot 1 = Green
     # Joker (COUNTER), slot 2 = vacant (must never move).
     ids    = jnp.array([J_JOKER, J_GREEN, J_EMPTY], jnp.int32)
@@ -405,15 +412,14 @@ if __name__ == "__main__":
     joker_value = jnp.zeros(3, jnp.float32)
     joker_state = jnp.zeros(3, jnp.int32)    # no ROTATE/countdown jokers yet
 
-    # Green's update rule: +VALUE on a played hand, -VALUE on a discard.
-    # want:  play 1   value [0. 1. 0.]
-    #        play 2   value [0. 2. 0.]
-    #        discard  value [0. 1. 0.]
-    # state stays [0 0 0] throughout. Later case to add: a discard at value
-    # 0 must floor at 0, not go negative.
-    for name, trig in [("play 1", T_ONCE_MAIN), ("play 2", T_ONCE_MAIN),
-                       ("discard", T_ON_DISCARD)]:
-        joker_value, joker_state = update(rows, joker_value, joker_state,
-                                          jnp.int32(trig), ctx)
-        print(f"{name:>8s}  value {joker_value}  state {joker_state}")
+    # One played hand. Green grows by its increment rows.VALUE = 1.0.
+    # want:  value [0. 1. 0.]   state [0 0 0]
+    joker_value, joker_state = update(rows, joker_value, joker_state,
+                                      jnp.int32(T_ONCE_MAIN), ctx)
+    print("after play:", joker_value, joker_state)
+
+    # Cases to restore once the single call works:
+    #   play 2   value [0. 2. 0.]
+    #   discard  value [0. 1. 0.]   (T_ON_DISCARD)
+    #   discard at value 0 must floor at 0, not go negative
 
