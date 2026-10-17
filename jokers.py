@@ -10,7 +10,9 @@ Import direction (acyclic):
 
 Static data and live data are different axes:
     JOKERS[joker_id]     the rule. One constant row per joker. JOKERS.VALUE is
-                         the parameter of the update rule.
+                         the magnitude for CONSTANT, the per-unit for QUERY,
+                         and the seed for COUNTER. The update rule lives in
+                         UPD_TRIGGER / UPD_DELTA.
     joker_value[slot]    (EnvState) the live magnitude v, float32. Seeded from
                          JOKERS.VALUE on acquire. Written by the update pass.
     joker_state[slot]    (EnvState) live discrete control memory, int32.
@@ -42,6 +44,8 @@ T_ON_SOLD         = 8    # Campfire, Invisible Joker
 T_ON_PACK_OPEN    = 9    # Hallucination
 T_ON_PACK_SKIP    = 10   # Red Card
 T_ON_BOSS         = 11   # Chicot, Luchador, Matador
+T_NONE            = -1   # padding for an unused update rule. No event is -1,
+                         # so the rule never fires.
 
 TRIGGER_NAMES = ["PER_SCORED", "PER_HELD", "ONCE_MAIN", "END_OF_ROUND",
                  "ON_DISCARD", "ON_SHOP_ENTER", "ON_SHOP_EXIT",
@@ -151,19 +155,35 @@ STATE_NAMES = ["NONE", "SCALE_COUNTER", "ROTATE_GLOBAL", "ROTATE_FROM_DECK"]
 # trigger. The other axes do not give this answer, so each row declares it.
 # The default is True. A row sets copyable=False only for the exceptions.
 
+# ---------------------------------------------------------------------------
+# UPDATE RULES : how a COUNTER evolves. (trigger, delta) pairs per row.
+# ---------------------------------------------------------------------------
+# TRIGGER above is the SCORING trigger: when scoring applies v. A counter also
+# needs to know which events change v, and one counter can listen to several
+# events (Green Joker: +1 on a play, -1 on a discard). One TRIGGER column
+# cannot hold both, so each row carries up to N_UPDATE_RULES pairs. Unused
+# pairs are padded with T_NONE.
+N_UPDATE_RULES = 2
+
 # endregion
 
 class Joker(NamedTuple):
-    """The row schema. Scalars = one row. (MAX_JOKERS,) arrays = one loadout."""
+    """The row schema. Scalars = one row. (MAX_JOKERS,) arrays = one loadout.
+
+    UPD_TRIGGER and UPD_DELTA have one more axis: (N_UPDATE_RULES,) per row,
+    (MAX_JOKERS, N_UPDATE_RULES) per loadout.
+    """
     TRIGGER    : jnp.ndarray   # int32   — T_*
     CONDITION  : jnp.ndarray   # int32   — C_*
     COND_PARAM : jnp.ndarray   # int32   — suit / rank mask / handtype / ordinal
     EFFECT     : jnp.ndarray   # int32   — E_*
     SOURCE     : jnp.ndarray   # int32   — S_*  (read by resolve() only)
     QUERY      : jnp.ndarray   # int32   — Q_*
-    VALUE      : jnp.ndarray   # float32 — seed / per-unit / increment size
+    VALUE      : jnp.ndarray   # float32 — magnitude / per-unit / COUNTER seed
     STATE      : jnp.ndarray   # int32   — ST_*, the kind of memory, not the memory
     COPYABLE   : jnp.ndarray   # bool    — Blueprint / Brainstorm can copy this row
+    UPD_TRIGGER: jnp.ndarray   # int32   — T_* per update rule, T_NONE = unused
+    UPD_DELTA  : jnp.ndarray   # float32 — added to joker_value when that rule fires
 
 # ---------------------------------------------------------------------------
 # AUTHORING RECORD — one joker per line. Compiled to columns below.
@@ -189,6 +209,7 @@ class JokerDef(NamedTuple):
     query   : int = Q_NONE
     state   : int = ST_NONE
     copyable: bool = True
+    updates : tuple = ()     # ((trigger, delta), ...) — COUNTER rows only
 
 # ---------------------------------------------------------------------------
 # THE TABLE — one joker per line. The id is the row index.
@@ -202,7 +223,8 @@ TABLE = [
     JokerDef("Joker",                2, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           4.0),
     JokerDef("Greedy Joker",         5, COMMON,    T_PER_SCORED,        E_ADD_MULT,           3.0, cond=C_SUIT, param=DIAMONDS),
     JokerDef("Bootstraps",           7, UNCOMMON,  T_ONCE_MAIN,         E_ADD_MULT,           2.0, source=S_QUERY, query=Q_MONEY_DIV_5),
-    JokerDef("Green Joker",          4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           1.0, source=S_COUNTER, state=ST_SCALE_COUNTER),
+    JokerDef("Green Joker",          4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           0.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_ONCE_MAIN, +1.0), (T_ON_DISCARD, -1.0))),
 ]
 
 # ---------------------------------------------------------------------------
@@ -227,11 +249,24 @@ def _validate(table):
                 f"query={d.query}. S_QUERY needs a query kind; nothing else may set one.")
         if d.cond == C_NONE and d.param != 0:
             raise ValueError(f"{d.name}: COND_PARAM {d.param} set but condition is C_NONE")
+        # Only a COUNTER reads joker_value, so only a COUNTER may have update
+        # rules. A COUNTER without one never changes from its seed.
+        if (d.source == S_COUNTER) != (len(d.updates) > 0):
+            raise ValueError(
+                f"{d.name}: source={SOURCE_NAMES[d.source]} with {len(d.updates)} "
+                f"update rule(s). S_COUNTER needs at least one; nothing else may have one.")
+        if len(d.updates) > N_UPDATE_RULES:
+            raise ValueError(f"{d.name}: {len(d.updates)} update rules, max {N_UPDATE_RULES}")
+        for t, _ in d.updates:
+            if not (0 <= t < len(TRIGGER_NAMES)):
+                raise ValueError(f"{d.name}: update trigger {t} is not a T_* event")
 
 
 def _compile(table):
     """Convert row-wise JokerDefs to the column-wise Joker."""
     col = lambda f, dt: jnp.array([getattr(d, f) for d in table], dt)
+    # Pad each row's update list to N_UPDATE_RULES with (T_NONE, 0.0).
+    pad = lambda d: list(d.updates) + [(T_NONE, 0.0)] * (N_UPDATE_RULES - len(d.updates))
     return Joker(
         TRIGGER    = col("trigger", jnp.int32),
         CONDITION  = col("cond",    jnp.int32),
@@ -242,6 +277,8 @@ def _compile(table):
         VALUE      = col("value",   jnp.float32),
         STATE      = col("state",   jnp.int32),
         COPYABLE   = col("copyable", jnp.bool_),
+        UPD_TRIGGER= jnp.array([[t for t, _ in pad(d)] for d in table], jnp.int32),
+        UPD_DELTA  = jnp.array([[x for _, x in pad(d)] for d in table], jnp.float32),
     )
 
 
@@ -350,10 +387,12 @@ def rule_mods(rows: Joker, ids, active):
     raise NotImplementedError
 
 
-def update(rows: Joker, joker_value, joker_state, trigger, ctx):
+def update(rows: Joker, active, joker_value, joker_state, trigger, ctx):
     """Update pass — the second rule each row carries. -> (joker_value, joker_state)
 
     rows        : Joker, fields (MAX_JOKERS,)  — gathered static rules, slot order
+    active      : (MAX_JOKERS,) bool           — ids != J_EMPTY; a vacant slot
+                                                 must never update
     joker_value : (MAX_JOKERS,) float32        — live COUNTER memory, read-modify-
                                                  write (this pass owns it)
     joker_state : (MAX_JOKERS,) int32          — live discrete control memory
@@ -364,20 +403,22 @@ def update(rows: Joker, joker_value, joker_state, trigger, ctx):
     ctx         : (N_QUERY_KINDS,) float32     — the same query results resolve()
                                                  gets (conditions can read it)
 
-    The update rule is (trigger, condition, delta, reset). Green Joker is
-    +1/-1 across two triggers. Ride the Bus and Obelisk reset on a condition.
+    Each row carries N_UPDATE_RULES (trigger, delta) pairs. Green Joker is
+    +1 on T_ONCE_MAIN and -1 on T_ON_DISCARD. A slot that fires is floored
+    at 0. A slot that does not fire keeps its value exactly.
+
+    NOT SUPPORTED YET: conditional updates and resets (Ride the Bus, Obelisk)
+    and ROTATE state. joker_state and ctx pass through unchanged.
     """
+    # (MAX_JOKERS, N_UPDATE_RULES): does rule k of slot j listen to this event?
+    hit = (rows.UPD_TRIGGER == trigger) & active[:, None]
 
-    print("STATE", rows.STATE)
+    # Sum the deltas of the rules that fire. Two rules on the same trigger add.
+    delta = jnp.where(hit, rows.UPD_DELTA, 0.0).sum(axis=1)
+    fired = hit.any(axis=1)
 
-    result = joker_value
-
-    cand_jokers = jnp.where(trigger==rows.TRIGGER, joker_value, 0)
-    
-
-
-
-    return
+    new_value = jnp.where(fired, jnp.maximum(joker_value + delta, 0.0), joker_value)
+    return new_value, joker_state
 
 
 if __name__ == "__main__":
@@ -407,19 +448,19 @@ if __name__ == "__main__":
     active = ids != J_EMPTY
     rows   = rows_for(ids)
 
-    # Green starts at 0 mult: no hands played yet. So the seed here is 0,
-    # not rows.VALUE — for a COUNTER, VALUE is the increment size.
-    joker_value = jnp.zeros(3, jnp.float32)
-    joker_state = jnp.zeros(3, jnp.int32)    # no ROTATE/countdown jokers yet
+    # The seed comes from rows.VALUE, like every other joker. For a COUNTER,
+    # VALUE is the seed (Green: 0.0). The increments live in UPD_DELTA.
+    joker_value = jnp.where(active, rows.VALUE, 0.0)   # [4. 0. 0.]
+    joker_state = jnp.zeros(3, jnp.int32)               # no ROTATE/countdown jokers yet
 
-    # One played hand. Green grows by its increment rows.VALUE = 1.0.
-    # want:  value [0. 1. 0.]   state [0 0 0]
-    joker_value, joker_state = update(rows, joker_value, joker_state,
-                                      jnp.int32(T_ONCE_MAIN), ctx)
-    print("after play:", joker_value, joker_state)
-
-    # Cases to restore once the single call works:
-    #   play 2   value [0. 2. 0.]
-    #   discard  value [0. 1. 0.]   (T_ON_DISCARD)
-    #   discard at value 0 must floor at 0, not go negative
+    # Slot 0 holds 4.0 the whole time: Joker has no update rules.
+    for label, t, want in [("play",            T_ONCE_MAIN,  [4., 1., 0.]),
+                           ("play",            T_ONCE_MAIN,  [4., 2., 0.]),
+                           ("discard",         T_ON_DISCARD, [4., 1., 0.]),
+                           ("discard",         T_ON_DISCARD, [4., 0., 0.]),
+                           ("discard at 0",    T_ON_DISCARD, [4., 0., 0.]),
+                           ("end of round",    T_END_OF_ROUND, [4., 0., 0.])]:
+        joker_value, joker_state = update(rows, active, joker_value, joker_state,
+                                          jnp.int32(t), ctx)
+        print(f"{label:13s} {joker_value}   want {want}")
 

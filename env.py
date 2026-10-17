@@ -13,6 +13,7 @@ from scoring import scoreHand, joker_score
 from jokers import MAX_JOKERS, J_EMPTY
 from jokers import N_QUERY_KINDS, Q_MONEY_DIV_5, Q_EMPTY_JOKER_SLOTS
 from jokers import rows_for, resolve, update
+from jokers import T_ONCE_MAIN, T_ON_DISCARD
 from arrays import first_n, compact, selected_cards
 
 MAX_HAND_SIZE = 32
@@ -84,14 +85,19 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     # calculate queries
     ctx = build_ctx(state)
 
-    v = resolve(rows, active, joker_value=state.joker_value, ctx=ctx)
+    # get the verb (a discard with no discards left becomes a play)
+    verb = jnp.where(state.discards > 0, action.verb, 0)
+
+    # update pass BEFORE resolve: Green Joker's +1 counts toward this hand
+    trigger = jnp.where(verb == 0, T_ONCE_MAIN, T_ON_DISCARD)
+    joker_value, joker_state = update(rows, active, state.joker_value,
+                                      state.joker_state, trigger, ctx)
+
+    v = resolve(rows, active, joker_value=joker_value, ctx=ctx)
 
     chips, mult = joker_score(chips, mult, handtype, rank, suit, hand_mask, rows, active, v)
 
     score = jnp.floor(chips * mult).astype(jnp.int32)
-
-    # get the verb
-    verb = jnp.where(state.discards > 0, action.verb, 0)
     score = score * (verb == 0)
 
     # update the state
@@ -99,7 +105,9 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     new_state = state._replace(hands=state.hands-(verb == 0),
                             discards=state.discards-(verb == 1),
                             hand_valid=new_hand_valid,
-                            chips_scored=state.chips_scored+score
+                            chips_scored=state.chips_scored+score,
+                            joker_value=joker_value,
+                            joker_state=joker_state
                             )
 
     # deal new hand

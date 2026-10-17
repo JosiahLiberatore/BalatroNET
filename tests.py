@@ -6,12 +6,14 @@ about; everything else defaults.
 
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 
 from scoring import scoreHand, joker_score, HAND_NAMES
 from env import balatroAction, deal, env_step
+from jokers import update, MAX_JOKERS, T_ONCE_MAIN, T_ON_DISCARD, T_END_OF_ROUND
 from fixtures import (state, select, hand_lanes, mask_lanes, rotated_deck,
-                      loadout, diff_states, report)
+                      loadout, query_ctx, diff_states, report)
 
 
 class Case(NamedTuple):
@@ -196,7 +198,78 @@ def run_env_step_test():
     report("env_step", failures, "env_step: two-pair play test passed")
 
 
+def run_update_test():
+    # Green Joker counter, one event per call, value carried between calls.
+    # Slot 0 = Joker (no update rules: must hold 4.0), slot 1 = Green (seed
+    # 0.0), slot 2 = a hole (must hold 0.0). The jitted copy must agree: the
+    # body has no Python branch on traced values.
+    rows, active, _ = loadout(("Joker", "Green Joker"))
+    value = jnp.where(active, rows.VALUE, 0.0)
+    state0 = jnp.zeros(MAX_JOKERS, jnp.int32)
+    ctx = query_ctx()
+    jitted = jax.jit(update)
+
+    steps = [("play",         T_ONCE_MAIN,    1.0),
+             ("play",         T_ONCE_MAIN,    2.0),
+             ("discard",      T_ON_DISCARD,   1.0),
+             ("discard",      T_ON_DISCARD,   0.0),
+             ("discard at 0", T_ON_DISCARD,   0.0),   # floors at 0, not -1
+             ("end of round", T_END_OF_ROUND, 0.0)]   # Green does not listen
+    failures = []
+    for label, t, green in steps:
+        want = jnp.zeros(MAX_JOKERS, jnp.float32).at[0].set(4.0).at[1].set(green)
+        got, got_state = update(rows, active, value, state0, jnp.int32(t), ctx)
+        got_j, _ = jitted(rows, active, value, state0, jnp.int32(t), ctx)
+        if not (bool(jnp.array_equal(got, want)) and bool(jnp.array_equal(got_j, want))
+                and bool(jnp.array_equal(got_state, state0))):
+            failures.append(f"FAIL  update {label}\n      got:  {got[:3]} (jit {got_j[:3]})"
+                            f"\n      want: {want[:3]}")
+        value = got
+    report("update", failures, f"update: all {len(steps)} Green Joker steps passed")
+
+
+def run_env_step_green_test():
+    # The two-pair PLAY from run_env_step_test, with a Green Joker held.
+    # The update pass runs BEFORE scoring, so this hand already sees +1:
+    # chips 54, mult 2 + 1 = 3 -> 162. chips_scored 60 -> 222.
+    pre = state(hand="4C KD 9H KC 7C 9S 7S 3H", chips_scored=60,
+                jokers=("Green Joker",))
+    action = balatroAction(verb=jnp.int32(0), select=select("01011010"))
+    expected = pre._replace(
+        hand=hand_lanes("4C 2C 9H 3C 5C 9S 6C 3H"),
+        hand_valid=mask_lanes([1] * 8),
+        deck_ptr=jnp.int32(12),
+        hands=jnp.int32(2),
+        chips_scored=jnp.int32(222),
+        joker_value=pre.joker_value.at[0].set(1.0),
+    )
+    got, reward, _ = env_step(pre, action)
+    failures = diff_states(got, expected, "env_step green play")
+    if int(reward) != 162:
+        failures.append(f"FAIL  env_step green play: reward\n      got:  {int(reward)}\n      want: 162")
+
+    # DISCARD lanes 1 and 3 with Green at 2: value -> 1, no score, discards
+    # 2 -> 1, hands unchanged, lanes 1/3 refill from deck[8], deck[9] = 2C 3C.
+    pre = state(hand="4C KD 9H KC 7C 9S 7S 3H", jokers=("Green Joker",),
+                joker_value=(2.0,))
+    action = balatroAction(verb=jnp.int32(1), select=select("01010000"))
+    expected = pre._replace(
+        hand=hand_lanes("4C 2C 9H 3C 7C 9S 7S 3H"),
+        hand_valid=mask_lanes([1] * 8),
+        deck_ptr=jnp.int32(10),
+        discards=jnp.int32(1),
+        joker_value=pre.joker_value.at[0].set(1.0),
+    )
+    got, reward, _ = env_step(pre, action)
+    failures += diff_states(got, expected, "env_step green discard")
+    if int(reward) != 0:
+        failures.append(f"FAIL  env_step green discard: reward\n      got:  {int(reward)}\n      want: 0")
+    report("env_step green", failures, "env_step: Green Joker play + discard tests passed")
+
+
 if __name__ == "__main__":
     run_tests()
     run_deal_test()
     run_env_step_test()
+    run_update_test()
+    run_env_step_green_test()

@@ -77,7 +77,8 @@ ONE generic evaluator reads the axes. Adding a joker = adding a row, NOT a code 
 - CONDITION: (kind, param) — suit | rank_in | is_face | hand_has | count_cmp | rank_suit(FROM_STATE)
             | none | POSITION (NEW, see gaps)
 - EFFECT  : ADD_MULT | ADD_CHIPS | XMULT  (combined adds allowed, e.g. Scholar = chips+mult)
-- VALUE   : float — the update-rule PARAMETER (seed + increment), NOT the number scoring reads
+- VALUE   : float — the SEED of joker_value on acquire (CONSTANT: the amount; QUERY: per-unit;
+            COUNTER: the start value). Increments live in the update rule (UPD_DELTA), not here.
             (see "VALUE + STATE unify" subsection below)
 - STATE   : None | SCALE_COUNTER (Green, Ride the Bus, Seltzer countdown)
             | ROTATE_GLOBAL   (Ancient — uniform 25% over the 4 suits each round, DECK-INDEPENDENT,
@@ -95,8 +96,12 @@ at acquire. Scoring ALWAYS reads v and applies it by EFFECT — no branch.
   Duo:     v = 2.0, never changes
   Obelisk: v starts 1.0, +0.2 on its trigger
   Green:   v = running mult, +1/hand, -1/discard
-VALUE then DEMOTES from "the amount" to the update-rule PARAMETER (seed + increment size), consumed by
-the update step, never by scoring.
+VALUE then DEMOTES from "the amount" to the SEED of v. The increment is NOT in VALUE: one number cannot
+hold both (Obelisk = seed 1.0 + step 0.2; Green = seed 0 with two deltas, +1 and -1). Increments live in
+the update rule.
+BUILT (2026-10-17): update rule = N_UPDATE_RULES=2 (UPD_TRIGGER, UPD_DELTA) pairs per row, padded with
+T_NONE=-1; authored as JokerDef(updates=((T_ONCE_MAIN, +1.0), (T_ON_DISCARD, -1.0))). update() sums the
+deltas of the rules that fire and floors at 0. condition + reset (Ride the Bus, Obelisk) still to add.
 So a memory-joker = TWO rules, not a tuple-with-a-hook:
   scoring rule  (TRIGGER, CONDITION, EFFECT)                    -- READS v
   update rule   (update_trigger, update_condition, delta/reset) -- WRITES v
