@@ -152,8 +152,8 @@ def run_deal_test():
 def run_env_step_test():
     # Scenario: mid-round, full 8-card hand, agent PLAYs a scattered two pair.
     # Conventions this test pins down: verb 0 = PLAY (1 = DISCARD);
-    # rank = id % 13, suit = id // 13; reward = the hand's score (dense, for now);
-    # done = (chips_scored >= blind_target) | (hands == 0).
+    # rank = id % 13, suit = id // 13; reward = cashout $ on a clear, else 0;
+    # done = the run ended (LOST / WON).
     #
     #   lane:  0   1   2   3   4   5   6   7
     #   card: 4C  KD  9H  KC  7C  9S  7S  3H
@@ -165,7 +165,7 @@ def run_env_step_test():
     #
     # Score: ranks [11, 11, 5, 5] is the same two pair as the scoreHand row
     # -> chips 54, mult 2, no jokers held -> 108. chips 60 -> 168 (< 300),
-    # hands 3 -> 2, so done stays False.
+    # hands 3 -> 2: no clear, so reward 0 and done stays False.
     #
     # Deck: the fixture default puts the hand's own ids at positions 0-7 (they
     # WERE dealt — ptr is 8) and the rest ascending, so deck[8..11] = 2C 3C 5C 6C.
@@ -181,7 +181,7 @@ def run_env_step_test():
         hands=jnp.int32(2),
         chips_scored=jnp.int32(168),
     )
-    expected_reward = 108
+    expected_reward = 0
     expected_done = False
 
     try:
@@ -245,8 +245,8 @@ def run_env_step_green_test():
     )
     got, reward, _ = env_step(pre, action)
     failures = diff_states(got, expected, "env_step green play")
-    if int(reward) != 162:
-        failures.append(f"FAIL  env_step green play: reward\n      got:  {int(reward)}\n      want: 162")
+    if int(reward) != 0:
+        failures.append(f"FAIL  env_step green play: reward (no clear)\n      got:  {int(reward)}\n      want: 0")
 
     # DISCARD lanes 1 and 3 with Green at 2: value -> 1, no score, discards
     # 2 -> 1, hands unchanged, lanes 1/3 refill from deck[8], deck[9] = 2C 3C.

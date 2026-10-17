@@ -163,7 +163,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           shop_slots=(EMPTY, EMPTY, EMPTY, EMPTY), jokers=(), consumables=(),
           joker_value=None, joker_state=(), joker_sell_value=None, joker_slots=5,
           consumable_slots=2, money=0, game_stage=0, key=0, blind_index=0,
-          shop_size=2, reroll_cost=5, last_cashout=0):
+          shop_size=2, reroll_cost=5, last_cashout=0, target_scale=1.0):
     """Author a balatroEnvState from the fields the scenario is actually about.
 
     hand        card-name string, or a list of ids. '.' is an empty lane.
@@ -223,6 +223,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         blind_index=jnp.int32(blind_index),
         chips_scored=jnp.int32(chips_scored),
         blind_target=jnp.int32(blind_target),
+        target_scale=jnp.float32(target_scale),
         key=key,
         shop_slots=joker_ids(shop_slots, width=MAX_SHOP_SLOTS),
         shop_size=jnp.int32(shop_size),

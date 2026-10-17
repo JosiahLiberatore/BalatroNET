@@ -1,3 +1,21 @@
+"""A2C + GAE on full Balatro runs, with an adaptive blind-target curriculum.
+
+    python train.py          resume from runs/ckpt_run.pkl if it exists
+    python train.py fresh    start a new run
+
+EPISODE  = one full run (8 antes, the shop included). Envs AUTO-RESET: each
+           update steps every env T more steps and a finished run restarts at
+           once, so no scan step is wasted on a padded tail.
+REWARD   = cashout $ per cleared blind (env_step's contract); x REWARD_SCALE
+           for the value head only.
+ADVANTAGE= GAE(gamma, lambda) on the value head; bootstrap from the value of
+           the carried state at the end of the segment, cut at run ends.
+CURRICULUM: target_scale multiplies every blind target (env.blind_target).
+           The clear rate (blinds cleared / blinds ended) moves it: above
+           CLEAR_HI the scale rises, below CLEAR_LO it falls. New runs read the
+           current scale at reset; 1.0 is the real game.
+"""
+
 import datetime
 import os
 import pickle
@@ -5,98 +23,187 @@ import sys
 
 import jax
 import jax.numpy as jnp
-from tensorboardX import SummaryWriter
 
-from env import balatroAction, balatroEnvState
-from env import MAX_DECK_SIZE, MAX_HAND_SIZE
-from env import show, dbg, reset, env_step
-from agent import init_params, observe, policy, act
-from debug_agent import save_params
+from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP
+from agent import (init_params, act, masked_logits, log_prob_entropy, OBS_DIM,
+                   A_BUY, A_SELL, A_REROLL, N_ACTIONS)
 
-LEARNT_RATE = 1e-3
-B1_RATE = 0.9
-B2_RATE = 0.999
-ENTROPY_BETA = 0.01
+# --- config -----------------------------------------------------------------------
+N_ENVS        = 1024
+T             = 64          # env steps per env per update
+GAMMA         = 0.995
+LAMBDA        = 0.95
+LEARNT_RATE   = 3e-4
+B1_RATE       = 0.9
+B2_RATE       = 0.999
+VF_COEF       = 0.5
+ENTROPY_BETA  = 0.01
+MAX_GRAD_NORM = 0.5
+REWARD_SCALE  = 0.1         # cashout $ -> value-head units
 
-def rollout(params, key):
+SCALE_START   = 0.02        # ante-1 small blind = 6 chips: one card clears it
+SCALE_MAX     = 1.0
+SCALE_UP      = 1.10
+SCALE_DOWN    = 1 / 1.05
+CLEAR_HI      = 0.92        # EMA clear rate above this -> harder
+CLEAR_LO      = 0.80        # below this -> easier
+CLEAR_EMA     = 0.95
+SCALE_COOLDOWN = 25         # updates between two scale changes
 
-    def step_fn(carry: tuple[balatroEnvState, jax.Array, jax.Array], x):
-        state, key, done = carry
-        key, subkey = jax.random.split(key)
-        action, log_prob, (verb_p, entropy) = act(params, state, subkey)
-        log_prob = log_prob * ~done
-        state, chips, temp_done = env_step(state, action)
-        chips = chips * ~done
-        real_done = done | temp_done
-        return (state, key, real_done), (chips, log_prob, action, verb_p * ~done, entropy * ~done)
-    
-    key, subkey = jax.random.split(key)
-    state = reset(subkey, 52, 8)
-    finalstate, output = jax.lax.scan(step_fn, (state, key, jnp.bool_(False)), xs=None, length=7)
+DECK, HAND = 52, 8
 
-    return output
+
+# --- rollout ----------------------------------------------------------------------
+def init_carry(key, scale):
+    """env states + per-env running run stats, all leading axis N_ENVS."""
+    keys = jax.random.split(key, N_ENVS)
+    states = jax.vmap(lambda k: reset(k, DECK, HAND, scale))(keys)
+    zeros = jnp.zeros(N_ENVS)
+    return {"state": states, "ret": zeros, "buys": zeros, "steps": zeros}
+
+
+def env_step_auto(params, state, ret, buys, steps, key, scale):
+    """One policy step on one env; a finished run resets in place."""
+    k_act, k_reset = jax.random.split(key)
+    action, (a, sel, obs, legal, value, logp) = act(params, state, k_act)
+    nxt, reward, done = env_step(state, action)
+    reward = reward.astype(jnp.float32)
+
+    ret, buys, steps = ret + reward, buys + ((a >= A_BUY) & (a < A_SELL)), steps + 1
+    finished = {"done": done, "ret": ret, "ante": nxt.ante.astype(jnp.float32),
+                "won": nxt.game_stage == STAGE_WON, "buys": buys, "steps": steps,
+                "cleared": reward > 0, "failed": done & (nxt.game_stage == STAGE_LOST),
+                "in_shop": state.game_stage == STAGE_SHOP,
+                "sell": (a >= A_SELL) & (a < A_REROLL), "reroll": a == A_REROLL}
+    fresh = reset(k_reset, DECK, HAND, scale)
+    nxt = tree_where(done, fresh, nxt)
+    keep = ~done
+    traj = {"obs": obs, "legal": legal, "hand_valid": state.hand_valid, "a": a, "sel": sel,
+            "reward": reward * REWARD_SCALE, "done": done, "value": value}
+    return nxt, ret * keep, buys * keep, steps * keep, traj, finished
+
+
+def rollout(params, carry, key, scale):
+    """T steps on every env. -> (carry, traj [T, N], finished [T, N], last_value [N])"""
+    def step(c, k):
+        ks = jax.random.split(k, N_ENVS)
+        s, ret, buys, steps, traj, fin = jax.vmap(env_step_auto, in_axes=(None, 0, 0, 0, 0, 0, None))(
+            params, c["state"], c["ret"], c["buys"], c["steps"], ks, scale)
+        return {"state": s, "ret": ret, "buys": buys, "steps": steps}, (traj, fin)
+
+    carry, (traj, fin) = jax.lax.scan(step, carry, jax.random.split(key, T))
+    _, (_, _, _, _, last_value, _) = jax.vmap(act, in_axes=(None, 0, 0))(
+        params, carry["state"], jax.random.split(key, N_ENVS))
+    return carry, traj, fin, last_value
+
+
+def gae(reward, value, done, last_value):
+    """Generalized advantage estimation, scanned backward over T. All [T, N]."""
+    def back(next_adv_value, x):
+        next_adv, next_value = next_adv_value
+        r, v, d = x
+        nonterminal = 1.0 - d
+        delta = r + GAMMA * next_value * nonterminal - v
+        adv = delta + GAMMA * LAMBDA * nonterminal * next_adv
+        return (adv, v), adv
+    _, adv = jax.lax.scan(back, (jnp.zeros_like(last_value), last_value),
+                          (reward, value, done.astype(jnp.float32)), reverse=True)
+    return adv, adv + value
+
+
+# --- update -----------------------------------------------------------------------
+def loss_fn(params, batch):
+    a_logits, s_logits, value = jax.vmap(masked_logits, in_axes=(None, 0, 0, 0))(
+        params, batch["obs"], batch["legal"], batch["hand_valid"])
+    logp, ent = jax.vmap(log_prob_entropy)(a_logits, s_logits, batch["a"], batch["sel"],
+                                           batch["hand_valid"])
+    adv = batch["adv"]
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    pg_loss = -(logp * adv).mean()
+    v_loss = 0.5 * ((value - batch["ret"]) ** 2).mean()
+    entropy = ent.mean()
+    loss = pg_loss + VF_COEF * v_loss - ENTROPY_BETA * entropy
+    return loss, {"pg_loss": pg_loss, "v_loss": v_loss, "entropy": entropy}
+
 
 @jax.jit
-def train_step(params, key, m, v, t):
-    # runs
-    t = t + 1
-    keys = jax.random.split(key, 512)
-    def loss_fn(params):
-        rewards, log_probs, actions, verb_p, entropy = jax.vmap(rollout, in_axes=(None, 0))(params, keys)
-        returns = jax.lax.cumsum(rewards, axis=1, reverse=True)
-        advantage = returns - returns.mean(axis=0)
-        advantage = advantage / (advantage.std() + 1e-9)
-        loss = -(log_probs * advantage).mean() - (ENTROPY_BETA * entropy.mean())
-        mean_return = rewards.sum(axis=1).mean()
-        # probe means are diluted by zeroed post-done steps; trends still read fine
-        return loss, (mean_return, verb_p.mean(), entropy.mean())
+def train_step(params, m, v, t, carry, key, scale):
+    carry, traj, fin, last_value = rollout(params, carry, key, scale)
+    adv, ret = gae(traj["reward"], traj["value"], traj["done"], last_value)
+    flat = lambda x: x.reshape((T * N_ENVS,) + x.shape[2:])
+    batch = {k: flat(traj[k]) for k in ("obs", "legal", "hand_valid", "a", "sel")}
+    batch["adv"], batch["ret"] = flat(adv), flat(ret)
 
-    (loss, (mean_return, mean_verb_p, mean_entropy)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
 
-    b1 = B1_RATE
-    b2 = B2_RATE
-
-    m = jax.tree.map(lambda m, grads: b1 * m + (1-b1) * grads, m, grads)
-    v = jax.tree.map(lambda v, grads: b2 * v + (1-b2) * grads**2, v, grads)
-    m_hat = jax.tree.map(lambda m: m / (1-b1**t), m)
-    v_hat = jax.tree.map(lambda v: v / (1-b2**t), v)
-
-    # Adam GD
-    params = jax.tree.map(lambda p, m_hat, v_hat: p - (LEARNT_RATE * m_hat / (jnp.sqrt(v_hat) + 1e-8)), params, m_hat, v_hat)
-
-    # SGD
-    # params = jax.tree.map(lambda p, g: p - (LEARNT_RATE * g), params, grads)
-
-    # instrumentation only: nothing below feeds the update above
+    # global-norm clip, then hand-rolled Adam (same update as v0.1)
     grad_norm = jnp.sqrt(sum(jnp.sum(g * g) for g in jax.tree.leaves(grads)))
-    metrics = {"return": mean_return, "loss": loss, "grad_norm": grad_norm,
-               "verb_p": mean_verb_p, "entropy": mean_entropy}
-    return params, m, v, t, metrics
+    grads = jax.tree.map(lambda g: g * jnp.minimum(1.0, MAX_GRAD_NORM / (grad_norm + 1e-8)), grads)
+    t = t + 1
+    b1, b2 = B1_RATE, B2_RATE
+    m = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g, m, grads)
+    v = jax.tree.map(lambda v, g: b2 * v + (1 - b2) * g ** 2, v, grads)
+    params = jax.tree.map(lambda p, m, v: p - LEARNT_RATE * (m / (1 - b1 ** t)) /
+                          (jnp.sqrt(v / (1 - b2 ** t)) + 1e-8), params, m, v)
 
-# ---------- checkpointing: full training state, so runs can stop and resume ----------
-# A resumable run needs more than params: Adam's m/v/t (its memory of the gradient
-# landscape), the carried RNG key (so the episode stream continues, not repeats),
-# the step counter, and the tensorboard run_dir (so curves stay continuous).
-CKPT_EVERY = 1000
-RUNS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
-CKPT_PATH = os.path.join(RUNS_ROOT, "ckpt_latest.pkl")
-
-def save_ckpt(params, m, v, t, key, step, run_dir, path=CKPT_PATH):
-    ckpt = {
-        "params": jax.device_get(params),
-        "m": jax.device_get(m),
-        "v": jax.device_get(v),
-        "t": jax.device_get(t),
-        # typed PRNG keys don't pickle; store the raw uint32 words instead
-        "key_data": jax.device_get(jax.random.key_data(key)),
-        "step": step,
-        "run_dir": run_dir,
+    # instrumentation: nothing below feeds the update
+    d = fin["done"]
+    n_done = d.sum()
+    per_run = lambda x: jnp.where(d, x, 0).sum() / jnp.maximum(n_done, 1)
+    n_cleared, n_failed = fin["cleared"].sum(), fin["failed"].sum()
+    var_ret = ret.var()
+    metrics = {
+        "loss": loss, **aux, "grad_norm": grad_norm,
+        "explained_var": 1 - (ret - traj["value"]).var() / (var_ret + 1e-8),
+        "runs_finished": n_done,
+        "run_return": per_run(fin["ret"]),
+        "run_ante": per_run(fin["ante"]),
+        "run_steps": per_run(fin["steps"]),
+        "run_buys": per_run(fin["buys"]),
+        "win_rate": per_run(fin["won"].astype(jnp.float32)),
+        "blinds_cleared": n_cleared,
+        "blinds_failed": n_failed,
+        "clear_rate": n_cleared / jnp.maximum(n_cleared + n_failed, 1),
+        "shop_step_frac": fin["in_shop"].mean(),
+        "sell_frac": fin["sell"].mean(),
+        "reroll_frac": fin["reroll"].mean(),
     }
+    return params, m, v, t, carry, metrics
+
+
+# --- checkpointing ------------------------------------------------------------------
+# A resumable run needs more than params: Adam's m/v/t, the carried RNG key, the
+# step counter, the curriculum scale, and the tensorboard run_dir. The env carry
+# is NOT saved: a resume starts every env on a fresh run.
+CKPT_EVERY = 500
+RUNS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+CKPT_PATH = os.path.join(RUNS_ROOT, "ckpt_run.pkl")
+PARAMS_PATH = os.path.join(RUNS_ROOT, "params_run.pkl")
+
+
+def save_params(params, path=PARAMS_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(jax.device_get(params), f)
+
+
+def load_params(path=PARAMS_PATH):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def save_ckpt(params, m, v, t, key, step, run_dir, scale, clear_ema, path=CKPT_PATH):
+    ckpt = {"params": jax.device_get(params), "m": jax.device_get(m), "v": jax.device_get(v),
+            "t": jax.device_get(t),
+            "key_data": jax.device_get(jax.random.key_data(key)),   # typed keys don't pickle
+            "step": step, "run_dir": run_dir, "scale": scale, "clear_ema": clear_ema,
+            "obs_dim": OBS_DIM, "n_actions": N_ACTIONS}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         pickle.dump(ckpt, f)
     os.replace(tmp, path)   # atomic: a crash mid-save never corrupts the old ckpt
+
 
 def load_ckpt(path=CKPT_PATH):
     with open(path, "rb") as f:
@@ -105,80 +212,78 @@ def load_ckpt(path=CKPT_PATH):
     return ckpt
 
 
+def next_scale(scale, clear_ema, since_change):
+    """The curriculum rule (host side, plain Python). -> (scale, changed)"""
+    if since_change < SCALE_COOLDOWN:
+        return scale, False
+    if clear_ema > CLEAR_HI and scale < SCALE_MAX:
+        return min(scale * SCALE_UP, SCALE_MAX), True
+    if clear_ema < CLEAR_LO and scale > SCALE_START:
+        return max(scale * SCALE_DOWN, SCALE_START), True
+    return scale, False
+
+
 if __name__ == "__main__":
-    # dev scratch: eyeball rollout. Fresh params -> probs ~ 0.5, so every REAL
-    # step's log_prob should sit near 9 * log(0.5) = -6.2383 (8 lanes + verb).
-    # Steps after the episode ends must be EXACTLY 0.0 in both columns.
-    # Episode length varies with the key: 4 plays minimum, +1 per discard taken.
-    expected = 9 * jnp.log(0.5)
+    from tensorboardX import SummaryWriter
 
     key = jax.random.key(42)
     key, init_key = jax.random.split(key)
-    model = init_params(init_key)
-
-    m = jax.tree.map(jnp.zeros_like, model)
-    v = jax.tree.map(jnp.zeros_like, model)
+    params = init_params(init_key)
+    m = jax.tree.map(jnp.zeros_like, params)
+    v = jax.tree.map(jnp.zeros_like, params)
     t = jnp.float32(0.0)
-    start_step = 0
-
-    # absolute path anchored to THIS script, so no matter where python is
-    # launched from (terminal, Code Runner, ...) runs always land in the same
-    # place. Each run gets its own timestamped subfolder so old curves stay
-    # for comparison; a RESUMED run reuses its dir so the curve continues.
+    start_step, scale, clear_ema = 0, SCALE_START, 0.0
     run_dir = os.path.join(RUNS_ROOT, f"{datetime.datetime.now():%Y%m%d-%H%M%S}")
 
-    # `python train.py`       -> resume from runs/ckpt_latest.pkl if it exists
-    # `python train.py fresh` -> ignore any checkpoint, start a new run
     fresh = len(sys.argv) > 1 and sys.argv[1] == "fresh"
     if not fresh and os.path.exists(CKPT_PATH):
         ckpt = load_ckpt()
-        model, m, v, t = ckpt["params"], ckpt["m"], ckpt["v"], ckpt["t"]
+        if ckpt.get("obs_dim") != OBS_DIM or ckpt.get("n_actions") != N_ACTIONS:
+            sys.exit(f"{CKPT_PATH} was saved for a different obs/action layout; "
+                     f"run `python train.py fresh`.")
+        params, m, v, t = ckpt["params"], ckpt["m"], ckpt["v"], ckpt["t"]
         key, start_step, run_dir = ckpt["key"], ckpt["step"], ckpt["run_dir"]
-        print(f"RESUMING from step {start_step}  ({CKPT_PATH})")
-        print( "(run `python train.py fresh` to start over instead)")
+        scale, clear_ema = ckpt["scale"], ckpt["clear_ema"]
+        print(f"RESUMING from step {start_step} at scale {scale:.3f}  ({CKPT_PATH})")
+        print("(run `python train.py fresh` to start over instead)")
 
-    STEPS = 100000
-    if start_step >= STEPS:
-        print(f"checkpoint is already at step {start_step} >= STEPS={STEPS}; "
-              f"raise STEPS to train further, or run `python train.py fresh`.")
-        sys.exit(0)
-
+    STEPS = 20000
     writer = SummaryWriter(run_dir)
-    print(f"logging to {run_dir}")
-    print(f"view with:  tensorboard --logdir {RUNS_ROOT}")
+    print(f"devices {jax.devices()}   envs {N_ENVS} x T {T} = {N_ENVS * T} steps/update")
+    print(f"logging to {run_dir}\nview with:  tensorboard --logdir {RUNS_ROOT}")
 
-    completed = start_step
+    key, ck = jax.random.split(key)
+    carry = init_carry(ck, scale)
+    completed, since_change = start_step, SCALE_COOLDOWN
+    t0 = datetime.datetime.now()
     try:
         for step in range(start_step, STEPS):
             key, subkey = jax.random.split(key)
-            model, m, v, t, metrics = train_step(model, subkey, m, v, t)
+            params, m, v, t, carry, metrics = train_step(params, m, v, t, carry, subkey,
+                                                         jnp.float32(scale))
+            metrics = {k: float(x) for k, x in metrics.items()}
+            if metrics["blinds_cleared"] + metrics["blinds_failed"] > 0:
+                clear_ema = CLEAR_EMA * clear_ema + (1 - CLEAR_EMA) * metrics["clear_rate"]
+            scale, changed = next_scale(scale, clear_ema, since_change)
+            since_change = 0 if changed else since_change + 1
+            metrics["target_scale"], metrics["clear_ema"] = scale, clear_ema
             for name, value in metrics.items():
-                writer.add_scalar(name, float(value), step)
+                writer.add_scalar(name, value, step)
             completed = step + 1
-            if step % 25 == 0:
-                print(f"step {step:4d}   return {float(metrics['return']):7.2f}   "
-                      f"loss {float(metrics['loss']):8.3f}   "
-                      f"grad_norm {float(metrics['grad_norm']):8.3f}")
+            if step % 10 == 0:
+                rate = (step - start_step + 1) * N_ENVS * T / (datetime.datetime.now() - t0).total_seconds()
+                print(f"step {step:5d}  $/run {metrics['run_return']:6.1f}  ante {metrics['run_ante']:4.2f}  "
+                      f"win {metrics['win_rate']:5.1%}  clear {clear_ema:5.1%}  scale {scale:.3f}  "
+                      f"buys {metrics['run_buys']:4.1f}  ent {metrics['entropy']:5.2f}  "
+                      f"ev {metrics['explained_var']:5.2f}  {rate / 1e3:5.0f}k st/s")
             if completed % CKPT_EVERY == 0:
-                save_ckpt(model, m, v, t, key, completed, run_dir)
-                save_params(model)   # params-only, so debug_agent can peek mid-run
+                save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema)
+                save_params(params)
     except KeyboardInterrupt:
         print(f"\ninterrupted -- saving checkpoint at step {completed}")
 
     writer.close()
-    save_ckpt(model, m, v, t, key, completed, run_dir)
-    save_params(model)
+    save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema)
+    save_params(params)
     print(f"stopped at step {completed}/{STEPS}. resume with:  python train.py")
-    print(f"view with:  tensorboard --logdir {RUNS_ROOT}")
     print("inspect with:  python debug_agent.py")
-
-    # print(f"expected real-step log_prob ~ {expected:.4f}\n")
-    # for i, k in enumerate(jax.random.split(key, 3)):
-    #     rewards, log_probs, actions = rollout(model, k)
-    #     print(f"rollout {i}:")
-    #     for step in range(7):
-    #         verb = "discard" if actions.verb[step] else "play   "
-    #         select = "".join(str(int(b)) for b in actions.select[step][:8])
-    #         print(f"  step {step}:  {verb} {select}   log_prob {log_probs[step]:+9.4f}   reward {rewards[step]:8.1f}")
-    #     print(f"  total reward {rewards.sum():.1f}\n")
-

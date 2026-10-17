@@ -90,7 +90,7 @@ def run_repair_test():
     nod = state(hand="4C KD 9H KC 7C 9S 7S 3H", discards=0)
     got, r, _ = env_step(nod, act(V_DISCARD, "01010000"))     # KD KC = pair
     c.eq("0-discard DISCARD spends a hand", got.hands, nod.hands - 1)
-    c.eq("0-discard DISCARD scores the pair", r, (10 + 10 + 10) * 2)
+    c.eq("0-discard DISCARD scores the pair", got.chips_scored - nod.chips_scored, (10 + 10 + 10) * 2)
 
     # more than 5 selected: the first 5 valid lanes play
     got, r, _ = env_step(blind._replace(jokers=jnp.full(MAX_JOKERS, J_EMPTY, jnp.int32),
@@ -134,8 +134,9 @@ def run_blind_end_test():
     pre = state(hand="KD KC 2C 4H 6S 8D TC 3S", chips_scored=290, money=12, hands=3)
     got, r, d = env_step(pre, act(V_PLAY, "11000000"))
     cashout = 3 + 2 + 2        # small blind $3 + 2 hands left + interest 12 // 5
-    c.eq("reward = chips scored", r, 60)
-    c.eq("done on the clear", d, True)
+    c.eq("chips + 60", got.chips_scored, 350)
+    c.eq("reward = the cashout $", r, cashout)
+    c.eq("a clear does not end the run", d, False)
     c.eq("stage -> SHOP", got.game_stage, STAGE_SHOP)
     c.eq("last_cashout", got.last_cashout, cashout)
     c.eq("money += cashout", got.money, 12 + cashout)
@@ -169,8 +170,8 @@ def run_blind_end_test():
     # fail: last hand, not enough chips. 2C high card = 5 + 2 = 7.
     pre = state(hand="2C 4H 6S 8D TC 3S 9D QH", hands=1, money=7)
     got, r, d = env_step(pre, act(V_PLAY, "10000000"))
-    c.eq("fail: reward still the chips", r, 7)
-    c.eq("fail: done", d, True)
+    c.eq("fail: reward $0", r, 0)
+    c.eq("fail: done (the run is over)", d, True)
     c.eq("fail: stage -> LOST", got.game_stage, STAGE_LOST)
     c.eq("fail: no cashout", got.money, 7)
 
@@ -182,8 +183,9 @@ def run_blind_end_test():
 
     # win: the ante-8 boss
     pre = state(hand="KD KC 2C 4H 6S 8D TC 3S", ante=8, blind_index=BLIND_BOSS, blind_target=50)
-    got, _, _ = env_step(pre, act(V_PLAY, "11000000"))
+    got, r, d = env_step(pre, act(V_PLAY, "11000000"))
     c.eq("ante-8 boss clear -> WON", got.game_stage, STAGE_WON)
+    c.eq("win: done, reward = the boss cashout", (int(r), bool(d)), (7, True))
     c.eq("boss cashout $5 + 2 hands left", got.last_cashout, 5 + 2)   # fixture hands=3, one spent
     return c.done()
 
@@ -293,6 +295,13 @@ def run_targets_test():
     for (ante, bi), t in want.items():
         c.eq(f"ante {ante} blind {bi}", blind_target(jnp.int32(ante), bi), t)
     c.eq("reset: ante 1 small = 300", reset(jax.random.key(0), 52, 8).blind_target, 300)
+    # curriculum scale: x every target, floor 1 chip; NEXT keeps using it
+    c.eq("scale 0.1: ante 1 small = 30", reset(jax.random.key(0), 52, 8, 0.1).blind_target, 30)
+    c.eq("scale 0.0: floor of 1 chip", blind_target(jnp.int32(1), 0, 0.0), 1)
+    c.eq("scale 0.5: ante 8 boss = 50000", blind_target(jnp.int32(8), BLIND_BOSS, 0.5), 50000)
+    shop = state(hand="4C KD", game_stage=STAGE_SHOP, target_scale=0.1)
+    got, _, _ = env_step(shop, act(V_NEXT))
+    c.eq("NEXT uses the state's scale: big = 45", got.blind_target, 45)
     return c.done()
 
 
@@ -305,8 +314,8 @@ def run_explain_test():
                 joker_value=(2.0, 4.0))
     sel = select("01011010")
     res = explain_play(pre, sel)
-    _, r, _ = env_step(pre, act(V_PLAY, sel))
-    c.eq("explain score == env_step reward", res.score, r)
+    got, _, _ = env_step(pre, act(V_PLAY, sel))
+    c.eq("explain score == env_step chips", res.score, got.chips_scored - pre.chips_scored)
     c.eq("explain mult = 2 + Green 3 + Joker 4", res.mult, 9.0)
     pv = preview(pre, sel)
     c.eq("preview = base hand only", (int(pv.base_chips), int(pv.base_mult)), (54, 2))
@@ -371,10 +380,13 @@ def run_full_run_test():
                 s, r, d = env_step(s, act(V_PLAY, best_select(s)))
                 if green is not None:
                     green += 1.0
-                c.check(f"round {int(s.round)}: the play clears", bool(d) and int(r) >= 1)
+                c.check(f"round {int(s.round)}: the play clears",
+                        int(s.game_stage) in (STAGE_SHOP, STAGE_WON))
                 clears += 1
                 want = [3, 4, 5][bi] + hands_left + min(money // 5, 5)
                 c.eq(f"round {int(s.round)}: cashout", s.last_cashout, want)
+                c.eq(f"round {int(s.round)}: reward = cashout", r, want)
+                c.eq(f"round {int(s.round)}: done only on the win", d, int(s.game_stage) == STAGE_WON)
         if green is not None:
             c.eq(f"step {steps}: Green value", s.joker_value[0], green)
         errs = invariant_errors(s)
@@ -447,9 +459,59 @@ def run_vmap_determinism_test():
     return c.done()
 
 
+def run_legal_mask_test(n_envs=64, n_steps=60, seed=5):
+    """agent.legal_mask must mirror env_step: a legal choice changes the state,
+    a masked one is a no-op. Checked on every state of a random-play batch.
+    One documented exception: DISCARD with 0 discards left is masked, but the
+    env repairs it to a PLAY (it is a duplicate of PLAY, not a no-op)."""
+    from agent import legal_mask, decode, N_ACTIONS, A_DISCARD, action_name
+    c = Checks("legal mask")
+    states = jax.vmap(lambda k: reset(k, 52, 8, 0.05))(jax.random.split(jax.random.key(seed), n_envs))
+    states = states._replace(money=jnp.full(n_envs, 12, jnp.int32))
+    sel = jnp.zeros(MAX_HAND_SIZE, bool).at[:2].set(True)
+
+    def changed(a, b):
+        return jnp.any(jnp.stack([jnp.any(x != y) for x, y in
+                                  zip(jax.tree.leaves(a._replace(key=jnp.int32(0))),
+                                      jax.tree.leaves(b._replace(key=jnp.int32(0))))]))
+
+    @jax.jit
+    def probe(s):
+        def one(a):
+            nxt, _, _ = env_step(s, decode(a, sel))
+            return changed(nxt, s)
+        return legal_mask(s), jax.vmap(one)(jnp.arange(N_ACTIONS))
+
+    @jax.jit
+    def advance(s, key):
+        legal = legal_mask(s)
+        a = jax.random.categorical(key, jnp.where(legal, 0.0, -1e9))
+        nxt, _, _ = env_step(s, decode(a, sel))
+        over = (nxt.game_stage == STAGE_LOST) | (nxt.game_stage == STAGE_WON)
+        return jax.tree.map(lambda x, y: jnp.where(over, x, y), s, nxt)   # stay live
+
+    key = jax.random.key(seed + 1)
+    bad = 0
+    for t in range(n_steps):
+        legal, moved = jax.device_get(jax.vmap(probe)(states))
+        no_discards = np.asarray(states.discards) <= 0
+        for i in range(n_envs):
+            for a in range(N_ACTIONS):
+                if a == A_DISCARD and no_discards[i]:
+                    continue
+                if bool(legal[i, a]) != bool(moved[i, a]) and bad < 10:
+                    bad += 1
+                    c.check(f"step {t} env {i}: {action_name(a)} legal={bool(legal[i, a])} "
+                            f"but changed={bool(moved[i, a])}", False)
+        key, sub = jax.random.split(key)
+        states = jax.vmap(advance)(states, jax.random.split(sub, n_envs))
+    c.check("no legal/no-op mismatch", bad == 0)
+    return c.done()
+
+
 ALL = [run_repair_test, run_deal_empty_test, run_blind_end_test, run_targets_test,
        run_shop_test, run_explain_test, run_vmap_determinism_test, run_full_run_test,
-       run_fuzz_test]
+       run_fuzz_test, run_legal_mask_test]
 
 
 def run_all():

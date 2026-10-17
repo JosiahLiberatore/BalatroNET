@@ -1,246 +1,158 @@
-"""Behavior inspector for a trained (or untrained) policy.
+"""Behavior inspector for a trained (or untrained) policy, on full runs.
 
-Two views, both run the agent EAGERLY (plain Python loop, no jit/scan) so every
-value is concrete and printable:
+  inspect_run(params, key, scale)     -- one run, step by step: stage, the choice,
+                                         the cards, the hand made, money, reward.
+  behavior_stats(params, key, scale)  -- many runs at once (vmapped): antes reached,
+                                         win rate, $ per run, the action mix, the
+                                         hand types played.
 
-  inspect_episode(params, key)  -- one game, step by step: the state, what the
-                                   agent chose, the hand it made, the reward.
-  behavior_stats(params, key)   -- aggregate over many games: discard rate, cards
-                                   selected, hand score, verb probability, entropy.
-                                   This is the readout that confirms/refutes a
-                                   hypothesis like "it never discards, just grabs
-                                   high cards".
-
-Trained params don't survive a training process, so train.py checkpoints them to
-a .pkl; load with load_params and point either view at them:
-
-    python debug_agent.py                 # inspects runs/params_latest.pkl if present
-    python debug_agent.py fresh           # inspects a random (untrained) policy
+    python debug_agent.py               # runs/params_run.pkl if present
+    python debug_agent.py fresh         # a random (untrained) policy
+    python debug_agent.py 0.25          # at target scale 0.25 (default 1.0 = real game)
 """
 
 import os
 import sys
-import pickle
+from collections import Counter
 
-# the suit pips (♠♥♦♣) are non-cp1252; force utf-8 so the Windows console
-# doesn't choke when printing them
+# the suit pips are non-cp1252; force utf-8 so the Windows console doesn't choke
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
-# on legacy Windows conhost this flips on ANSI escape processing; a no-op in
-# Windows Terminal / VS Code where colors already work
 if sys.platform == "win32":
-    os.system("")
+    os.system("")     # ANSI colors on legacy conhost
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-from env import balatroAction, balatroEnvState, MAX_HAND_SIZE
-from env import reset, env_step, _card_name
-from agent import init_params, observe, policy, act
-from scoring import scoreHand, HAND_NAMES
-from arrays import selected_cards
+from env import reset, env_step, explain_play, _card_name, STAGE_BLIND, STAGE_WON, STAGE_LOST
+from env import BLIND_NAMES
+from agent import (init_params, act, action_name, masked_logits, legal_mask, observe,
+                   A_PLAY, A_DISCARD, N_ACTIONS)
+from jokers import JOKER_NAMES
+from scoring import HAND_NAMES
+from train import load_params, PARAMS_PATH, DECK, HAND
 
-RUNS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
-DEFAULT_CKPT = os.path.join(RUNS_ROOT, "params_latest.pkl")
-
-# env names suits as letters (C D H S); swap in pips for the human-facing readout
-SUIT_EMOJI = {"C": "♣", "D": "♦", "H": "♥", "S": "♠"}
-# 4-color deck: hearts red, diamonds blue, clubs green, spades black
+SUIT_PIP = {"C": "♣", "D": "♦", "H": "♥", "S": "♠"}
 RESET = "\033[0m"
-SUIT_COLOR = {"♥": "\033[91m", "♦": "\033[94m", "♣": "\033[92m", "♠": "\033[30m"}
+SUIT_COLOR = {"♥": "\033[91m", "♦": "\033[94m", "♣": "\033[92m", "♠": ""}
 
-def _emoji_name(cid):
-    """'K♠'-style name: _card_name gives 'KS', we replace the suit letter."""
+
+def _card(cid):
     name = _card_name(int(cid))
-    if len(name) == 2 and name[1] in SUIT_EMOJI:
-        return name[0] + SUIT_EMOJI[name[1]]
+    if len(name) == 2 and name[1] in SUIT_PIP:
+        pip = SUIT_PIP[name[1]]
+        return f"{name[0]}{SUIT_COLOR[pip]}{pip}{RESET}"
     return name
 
-def _color_card(cid):
-    """(colored_str, visible_width) for a card cell: colorize just the suit pip
-    so ANSI escapes never enter the width-measured length."""
-    name = _emoji_name(cid)
-    if len(name) == 2 and name[1] in SUIT_COLOR:
-        col = SUIT_COLOR[name[1]]
-        colored = f"{name[0]}{col}{name[1]}{RESET}" if col else name
-        return colored, 2
-    return name, len(name)
+
+_act = jax.jit(act)
+_step = jax.jit(env_step)
 
 
-# ---------- checkpoint io (params is a dict of jax arrays) ----------
-def save_params(params, path=DEFAULT_CKPT):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(jax.device_get(params), f)   # -> numpy, portable
-
-def load_params(path=DEFAULT_CKPT):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+@jax.jit
+def _probs(params, state):
+    a_logits, s_logits, value = masked_logits(params, observe(state), legal_mask(state),
+                                              state.hand_valid)
+    return jax.nn.softmax(a_logits), value
 
 
-# ---------- probe the policy WITHOUT sampling (deterministic, faithful) ----------
-def _policy_probs(params, state):
-    """The per-decision probabilities the policy assigns in this state, masked
-    exactly the way act() masks them. Returns (verb_prob, select_probs[32])."""
-    logits = policy(params, observe(state))
-    verb_logit = jnp.where(state.discards > 0, logits[0], -jnp.inf)
-    select_logits = jnp.where(state.hand_valid, logits[1:MAX_HAND_SIZE + 1], -jnp.inf)
-    return jax.nn.sigmoid(verb_logit), jax.nn.sigmoid(select_logits)
-
-
-def _binary_entropy(p):
-    """Entropy of independent Bernoullis, summed. Masked lanes have p=0 -> 0 bits,
-    so this is automatically the entropy over the ACTIVE decisions only."""
-    p = jnp.clip(p, 1e-7, 1 - 1e-7)
-    return float((-(p * jnp.log(p) + (1 - p) * jnp.log(1 - p))).sum())
-
-
-def _played_hand(state, action):
-    """Name the hand the agent would make. Shares selected_cards with env_step,
-    so the readout cannot describe a selection the env didn't score."""
-    cards, valid5, _ = selected_cards(state.hand, state.hand_valid,
-                                      action.select.astype(bool), 5)
-    handtype, _, chips, mult = scoreHand(cards % 13, cards // 13, valid5)
-    names = [_card_name(int(c)) for c, v in zip(cards, valid5) if bool(v)]
-    return HAND_NAMES[int(handtype)], names, int(chips * mult)
-
-
-# ---------- one episode, verbose ----------
-def inspect_episode(params, key):
+# ---------- one run, verbose ----------
+def inspect_run(params, key, scale=1.0, max_steps=400):
     key, sk = jax.random.split(key)
-    state = reset(sk, 52, 8)
-    blind = int(state.blind_target)
-    print(f"=== episode  (blind target {blind}) ===")
-    print(" st  action   hand (*=selected)                made          sel    rew   chips  h/d   deck   p_dsc   logp")
-    total, plays, discards = 0, 0, 0
-    for step in range(7):
-        verb_prob, select_probs = _policy_probs(params, state)
+    state = reset(sk, DECK, HAND, scale)
+    print(f"=== one run at target scale {scale} ===")
+    total = 0
+    for step in range(max_steps):
         key, sk = jax.random.split(key)
-        action, log_prob, _ = act(params, state, sk)
-
-        # env forces PLAY when no discards remain; show the EFFECTIVE verb,
-        # and the EFFECTIVE selection (valid lanes, first 5, like env_step)
-        eff_verb = int(action.verb) if int(state.discards) > 0 else 0
-        # the lane-order mask env_step will actually act on -> what gets a '*'
-        _, _, sel = selected_cards(state.hand, state.hand_valid,
-                                   action.select.astype(bool), 5)
-        hand, _, _ = _played_hand(state, action)       # from the PRE-step state
-
-        n = int(state.hand_size)
-        cells, vis = [], 0
-        for i in range(n):
-            if bool(state.hand_valid[i]):
-                card, w = _color_card(int(state.hand[i]))
-            else:
-                card, w = "--", 2
-            cells.append(f"{card}{'*' if bool(sel[i]) else ' '}")
-            vis += w + 1
-        # pad by VISIBLE width (color escapes are zero-width); the old :31s
-        # counted the escapes and would ragged the trailing columns
-        hand_str = " ".join(cells)
-        hand_str += " " * max(0, 31 - (vis + (n - 1)))
-
-        made = hand if eff_verb == 0 else "--"
-        # raw = every lane the policy flipped on; eff = after valid mask + 5-cap
-        n_sel = f"{int(action.select.sum()):2d}/{int(sel.sum())}"
-        pre_chips = int(state.chips_scored)
-        hd = f"{int(state.hands)}/{int(state.discards)}"
-        deck = f"{int(state.deck_ptr):2d}/{int(state.deck_size)}"
-
-        state, reward, done = env_step(state, action)
-        reward = int(reward)
-
-        if eff_verb == 0:
-            plays += 1
-        else:
-            discards += 1
-        total += reward
-        verbname = "PLAY" if eff_verb == 0 else "DISCARD"
-        print(f" {step:2d}  {verbname:7s}  {hand_str}  {made:12s} {n_sel:5s} {reward:4d}  {pre_chips:3d}/{blind}  {hd:4s} {deck}  {float(verb_prob):5.2f}  {float(log_prob):+6.2f}")
+        action, (a, sel, _, _, value, logp) = _act(params, state, sk)
+        p, _ = _probs(params, state)
+        a = int(a)
+        where = (f"A{int(state.ante)} {BLIND_NAMES[int(state.blind_index)][:5]}"
+                 if int(state.game_stage) == STAGE_BLIND else f"A{int(state.ante)} shop ")
+        line = f" {step:3d} {where}  ${int(state.money):3d}  {action_name(a):8s} p={float(p[a]):.2f}"
+        if a in (A_PLAY, A_DISCARD):
+            cards = " ".join(_card(state.hand[i]) + ("*" if bool(sel[i]) else " ")
+                             for i in range(int(state.hand_size)) if bool(state.hand_valid[i]))
+            line += f"  {cards}"
+            if a == A_PLAY:
+                res = explain_play(state, sel)
+                line += f"  {HAND_NAMES[int(res.handtype)]} {int(res.score)}" \
+                        f"  ({int(state.chips_scored) + int(res.score)}/{int(state.blind_target)})"
+        elif a < N_ACTIONS - 2 and a >= 2:
+            shop = [JOKER_NAMES[int(j)] if int(j) >= 0 else "-" for j in state.shop_slots]
+            held = [JOKER_NAMES[int(j)] for j in state.jokers if int(j) >= 0]
+            line += f"  shop {shop}  held {held}"
+        state, reward, done = _step(state, action)
+        total += int(reward)
+        if int(reward):
+            line += f"  -> cashout ${int(reward)}"
+        print(line + f"  V={float(value):.2f}")
         if bool(done):
             break
-    cleared = total >= blind
-    print(f" -> {plays} plays, {discards} discards, total {total}, "
-          f"cleared: {'YES' if cleared else 'no'}\n")
+    end = {STAGE_WON: "WON", STAGE_LOST: "LOST"}.get(int(state.game_stage), "cut off")
+    print(f" -> {end} at ante {int(state.ante)}, ${total} cashed out, "
+          f"jokers {[JOKER_NAMES[int(j)] for j in state.jokers if int(j) >= 0]}\n")
 
 
-# ---------- many episodes, aggregate ----------
-def behavior_stats(params, key, n=256):
-    """Run n episodes eagerly and average the tells. Slow-ish (eager) but this is
-    a diagnostic you run occasionally, not in the training loop."""
-    tot_reward = tot_plays = tot_discards = tot_selected = 0
-    tot_score_when_play = n_plays_scored = 0
-    tot_verb_p = tot_entropy = n_decisions = 0
-    cleared = 0
-    # what hand types does it actually PLAY, and what do they earn? A policy
-    # dumping High Cards when pairs are on the board shows up right here.
-    hand_counts, hand_reward = {}, {}
+# ---------- many runs, aggregate ----------
+def _run_batch(params, keys, scale, max_steps):
+    def one(key):
+        state = reset(key, DECK, HAND, scale)
+        def step(c, k):
+            s, done = c
+            action, (a, sel, *_rest) = act(params, s, k)
+            res = explain_play(s, sel)
+            nxt, r, d = env_step(s, action)
+            live = ~done
+            rec = {"a": jnp.where(live, a, -1), "hand": jnp.where(live & (a == A_PLAY), res.handtype, -1),
+                   "r": r * live}
+            return (jax.tree.map(lambda x, y: jnp.where(done, x, y), s, nxt), done | d), rec
+        (final, done), recs = jax.lax.scan(step, (state, jnp.bool_(False)),
+                                           jax.random.split(key, max_steps))
+        return final, done, recs
+    return jax.jit(jax.vmap(one))(keys)
 
-    for _ in range(n):
-        key, sk = jax.random.split(key)
-        state = reset(sk, 52, 8)
-        ep_reward = 0
-        for step in range(7):
-            verb_prob, select_probs = _policy_probs(params, state)
-            key, sk = jax.random.split(key)
-            action, _, _ = act(params, state, sk)
 
-            eff_verb = int(action.verb) if int(state.discards) > 0 else 0
-            # name the hand from the PRE-step state (env_step reassigns `state`)
-            played = _played_hand(state, action)[0] if eff_verb == 0 else None
-            tot_selected += int((action.select.astype(bool) & state.hand_valid).sum())
-            tot_verb_p += float(verb_prob)
-            tot_entropy += _binary_entropy(jnp.concatenate([verb_prob[None], select_probs]))
-            n_decisions += 1
-
-            state, reward, done = env_step(state, action)
-            reward = int(reward)
-            ep_reward += reward
-            if eff_verb == 0:
-                tot_plays += 1
-                hand_counts[played] = hand_counts.get(played, 0) + 1
-                hand_reward[played] = hand_reward.get(played, 0) + reward
-                if reward > 0:
-                    tot_score_when_play += reward
-                    n_plays_scored += 1
-            else:
-                tot_discards += 1
-            if bool(done):
-                break
-        tot_reward += ep_reward
-        cleared += int(ep_reward >= int(state.blind_target))
-
-    acts = tot_plays + tot_discards
-    print(f"=== behavior over {n} episodes ===")
-    print(f" mean return          {tot_reward / n:8.1f}   (blind target 300)")
-    print(f" blind clear rate     {cleared / n:8.1%}")
-    print(f" discard rate         {tot_discards / max(acts,1):8.1%}   ({tot_discards} discards / {acts} actions)")
-    print(f" mean cards selected  {tot_selected / max(acts,1):8.2f}")
-    print(f" mean score / play    {tot_score_when_play / max(n_plays_scored,1):8.1f}   (two-pair is 108)")
-    print(f" mean verb P(discard) {tot_verb_p / max(n_decisions,1):8.2f}")
-    print(f" mean entropy         {tot_entropy / max(n_decisions,1):8.2f}   (fresh policy ~ ln2 * active decisions)")
-
-    print(f"\n=== hand types played (over {tot_plays} plays) ===")
-    for name in sorted(hand_counts, key=hand_counts.get, reverse=True):
-        c = hand_counts[name]
-        print(f" {name:16s} {c:5d}  {c / max(tot_plays,1):6.1%}   mean reward {hand_reward[name] / c:6.1f}")
+def behavior_stats(params, key, scale=1.0, n=512, max_steps=600):
+    final, done, recs = _run_batch(params, jax.random.split(key, n), scale, max_steps)
+    final, done, recs = jax.device_get((final, done, recs))
+    a = recs["a"][recs["a"] >= 0]
+    hands = recs["hand"][recs["hand"] >= 0]
+    antes = Counter(int(x) for x in final.ante)
+    print(f"=== behavior over {n} runs at target scale {scale} ===")
+    print(f" finished            {done.mean():7.1%}   (cut off at {max_steps} steps)")
+    print(f" win rate            {(final.game_stage == STAGE_WON).mean():7.1%}")
+    print(f" $ cashed out / run  {recs['r'].sum(axis=1).mean():7.1f}")
+    print(f" mean ante reached   {final.ante.mean():7.2f}   " +
+          "  ".join(f"A{k}:{antes[k]}" for k in sorted(antes)))
+    print(f" steps / run         {len(a) / n:7.1f}")
+    print(f" jokers held at end  {(final.jokers >= 0).sum(axis=1).mean():7.2f}")
+    print("\n action mix:")
+    names = Counter(action_name(x).split()[0] for x in a)
+    for k, c in names.most_common():
+        print(f"   {k:8s} {c / len(a):6.1%}")
+    print("\n hand types played:")
+    hc = Counter(int(h) for h in hands)
+    for h, c in hc.most_common():
+        print(f"   {HAND_NAMES[h]:16s} {c / max(len(hands), 1):6.1%}")
 
 
 if __name__ == "__main__":
     key = jax.random.key(0)
     key, ik = jax.random.split(key)
-
-    if len(sys.argv) > 1 and sys.argv[1] == "fresh":
+    args = sys.argv[1:]
+    scale = next((float(x) for x in args if x.replace(".", "", 1).isdigit()), 1.0)
+    if "fresh" in args:
         params = init_params(ik)
         print("inspecting a FRESH (untrained) policy\n")
-    elif os.path.exists(DEFAULT_CKPT):
+    elif os.path.exists(PARAMS_PATH):
         params = load_params()
-        print(f"loaded trained params from {DEFAULT_CKPT}\n")
+        print(f"loaded trained params from {PARAMS_PATH}\n")
     else:
         params = init_params(ik)
-        print(f"no checkpoint at {DEFAULT_CKPT}; inspecting a FRESH policy instead\n")
+        print(f"no params at {PARAMS_PATH}; inspecting a FRESH policy instead\n")
 
-    key, k1 = jax.random.split(key)
-    inspect_episode(params, k1)
-    key, k2 = jax.random.split(key)
-    behavior_stats(params, k2, n=256)
+    key, k1, k2 = jax.random.split(key, 3)
+    inspect_run(params, k1, scale)
+    behavior_stats(params, k2, scale)

@@ -12,10 +12,13 @@ A run is blind -> shop -> blind -> shop ... across 8 antes:
 Boss blinds have no boss effects yet, and there is no blind-select screen:
 NEXT starts the next blind at once.
 
-The return contract is the v0.1 one, so train.py does not change:
-    reward = the chips the step scored
-    done   = this step ended the blind (cleared or failed)
-The run itself ends when game_stage becomes STAGE_LOST or STAGE_WON.
+The return contract (NOTES: "reward = CASHOUT dollars"):
+    reward = the cashout $ on the step that clears a blind, else 0
+             (a failed blind pays $0; chips are never reward)
+    done   = this step ended the RUN (game_stage became STAGE_LOST or STAGE_WON)
+
+target_scale is the curriculum dial: every blind target is multiplied by it
+(floor 1 chip). reset sets it; 1.0 is the real game.
 """
 
 import jax
@@ -119,6 +122,7 @@ class balatroEnvState(NamedTuple):
     blind_index  : jax.Array   # scalar int32   -- BLIND_SMALL / BIG / BOSS
     chips_scored : jax.Array   # scalar int32   -- progress toward blind
     blind_target : jax.Array   # scalar int32   -- chips needed to clear
+    target_scale : jax.Array   # scalar float32 -- curriculum: x every blind target (1.0 = real game)
     key          : jax.Array   # PRNG key (new-style typed key)
 
     # shop
@@ -155,10 +159,11 @@ def tree_where(c, a, b):
     return jax.tree.map(lambda x, y: jnp.where(c, x, y), a, b)
 
 
-def blind_target(ante, blind_index):
-    """Chips needed: ante base x (1 / 1.5 / 2) for small / big / boss."""
+def blind_target(ante, blind_index, scale=1.0):
+    """Chips needed: ante base x (1 / 1.5 / 2) for small / big / boss, x the
+    curriculum scale. Never below 1 chip, so a DISCARD can never clear a blind."""
     base = ANTE_BASE[jnp.clip(ante, 0, ANTE_BASE.shape[0] - 1)]
-    return jnp.floor(base * BLIND_MULT[blind_index]).astype(jnp.int32)
+    return jnp.maximum(jnp.floor(base * BLIND_MULT[blind_index] * scale), 1).astype(jnp.int32)
 
 
 def build_ctx(state) -> jax.Array:
@@ -255,7 +260,9 @@ def _blind_action(state: balatroEnvState, action: balatroAction):
     next_state = tree_where(cleared, _clear_blind(next_state), next_state)
     next_state = next_state._replace(
         game_stage=jnp.where(failed, STAGE_LOST, next_state.game_stage))
-    return next_state, score, cleared | failed
+    reward = jnp.where(cleared, next_state.last_cashout, 0)
+    run_over = (next_state.game_stage == STAGE_LOST) | (next_state.game_stage == STAGE_WON)
+    return next_state, reward, run_over
 
 
 def _clear_blind(state: balatroEnvState) -> balatroEnvState:
@@ -372,7 +379,7 @@ def _next(state: balatroEnvState, action: balatroAction):
         ante=ante,
         blind_index=blind_index,
         chips_scored=jnp.int32(0),
-        blind_target=blind_target(ante, blind_index),
+        blind_target=blind_target(ante, blind_index, state.target_scale),
         key=key,
         shop_slots=jnp.full(MAX_SHOP_SLOTS, J_EMPTY, jnp.int32),
         game_stage=jnp.int32(STAGE_BLIND),
@@ -422,7 +429,7 @@ def _fresh_deal(key, deck_size, hand_size):
 
 
 @jit
-def reset(key, deckSize, handSize):
+def reset(key, deckSize, handSize, target_scale=1.0):
     key, subkey = jax.random.split(key)
     deck, hand, hand_valid = _fresh_deal(subkey, deckSize, handSize)
 
@@ -448,7 +455,8 @@ def reset(key, deckSize, handSize):
         ante=jnp.int32(1),
         blind_index=jnp.int32(BLIND_SMALL),
         chips_scored=jnp.int32(0),
-        blind_target=blind_target(jnp.int32(1), BLIND_SMALL),
+        blind_target=blind_target(jnp.int32(1), BLIND_SMALL, target_scale),
+        target_scale=jnp.float32(target_scale),
         key=key,
         shop_slots=jnp.full(MAX_SHOP_SLOTS, -1, dtype=jnp.int32),
         shop_size=jnp.int32(SHOP_UNLOCKED),

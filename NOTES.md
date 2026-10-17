@@ -34,9 +34,19 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       jokers by rarity (70/25/5), no duplicates, no held jokers. deal() stops at the end of the deck.
       env_step return contract unchanged (reward = chips, done = blind over) so train.py still works.
       gui.py = pygame-ce front end over env_step; tests_run.py = repair/shop/run/fuzz suites.
-      STILL OPEN: reward -> cashout $ (pinned above, not wired); empty PLAY spends a hand (repair rule
-      undecided); no boss effects, no blind select/skip, no tags/packs/vouchers; sort is display-only
-      (lane order = play order).
+      STILL OPEN: empty PLAY spends a hand (repair rule undecided); no boss effects, no blind
+      select/skip, no tags/packs/vouchers; sort is display-only (lane order = play order).
+- [x] training on full runs (2026-10-17) — env_step contract CHANGED: reward = cashout $ on a clear (0 on
+      fail), done = the RUN ended (LOST/WON). state.target_scale = curriculum dial on every blind target
+      (floor 1 chip), set at reset. agent.py: disjoint obs blocks (836), ONE flat masked categorical
+      (PLAY, DISCARD, BUY x4, SELL x32, REROLL, NEXT = 40) + 32 select Bernoullis (count only for
+      PLAY/DISCARD), value head; legal_mask mirrors env repair (tests_run legal-mask suite). Masked
+      logits = -1e9, not -inf (0 * -inf = NaN in the entropy grad). train.py: A2C + GAE, 1024 auto-reset
+      envs x 64 steps, hand-rolled Adam + grad clip, adaptive scale (clear-rate EMA > 0.92 -> x1.10,
+      < 0.80 -> /1.05). Runs on the render node GPU (WSL, ~336k env steps/s while training).
+      gui.py model panel: the model's odds for every legal choice + card select odds, Step/Auto,
+      greedy/sampled (--params, --scale).
+      OPEN: PPO (several epochs per rollout) if A2C is too sample-hungry; eval at scale 1.0.
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
