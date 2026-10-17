@@ -273,3 +273,6 @@ if __name__ == "__main__":
     run_env_step_test()
     run_update_test()
     run_env_step_green_test()
+
+    import tests_run
+    tests_run.run_all()

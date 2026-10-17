@@ -27,7 +27,16 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - [x] EnvState NamedTuple (balatroEnvState) + full reset + deal — deal jitted & passing
       (cumsum queue + gather + fill mask); spec test uses a NON-identity deck
       (deck[i] = i+13 mod 52) so src-vs-deck[src] mixups can't pass green (commit e8c8c43)
-- [ ] play/discard actions + round loop (blind progression)
+- [x] play/discard actions + round loop (2026-10-17) — blind -> cashout -> shop -> NEXT across 8 antes
+      (STAGE_BLIND/SHOP/LOST/WON, ANTE_BASE x 1/1.5/2 targets, cashout = blind $ + hands left +
+      interest). Action fork decided: balatroAction(verb, select, target), verbs PLAY/DISCARD/BUY/SELL/
+      REROLL/NEXT, phase-legal table LEGAL[stage, verb], illegal -> no-op via lax.switch. Shop rolls
+      jokers by rarity (70/25/5), no duplicates, no held jokers. deal() stops at the end of the deck.
+      env_step return contract unchanged (reward = chips, done = blind over) so train.py still works.
+      gui.py = pygame-ce front end over env_step; tests_run.py = repair/shop/run/fuzz suites.
+      STILL OPEN: reward -> cashout $ (pinned above, not wired); empty PLAY spends a hand (repair rule
+      undecided); no boss effects, no blind select/skip, no tags/packs/vouchers; sort is display-only
+      (lane order = play order).
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 

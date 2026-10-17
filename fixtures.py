@@ -23,9 +23,10 @@ tests / agent scratch blocks. Nothing in the env may import it.
 import jax
 import jax.numpy as jnp
 
-from env import balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_CONSUMABLES
+from env import balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_CONSUMABLES, MAX_SHOP_SLOTS
 # the card-name convention has ONE definition, in env (show() prints with it)
 from env import RANK_CHARS, SUIT_CHARS
+from jokers import JOKER_COST
 from jokers import (JOKER_ID, J_EMPTY, MAX_JOKERS, N_QUERY_KINDS,
                     Q_MONEY_DIV_5, rows_for, resolve)
 
@@ -160,8 +161,9 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           deck_ptr=None, hands=3, discards=2, handcount=4, discardcount=3,
           round=1, ante=1, chips_scored=0, blind_target=300,
           shop_slots=(EMPTY, EMPTY, EMPTY, EMPTY), jokers=(), consumables=(),
-          joker_value=None, joker_state=(), joker_slots=5, consumable_slots=2,
-          money=0, game_stage=0, key=0):
+          joker_value=None, joker_state=(), joker_sell_value=None, joker_slots=5,
+          consumable_slots=2, money=0, game_stage=0, key=0, blind_index=0,
+          shop_size=2, reroll_cost=5, last_cashout=0):
     """Author a balatroEnvState from the fields the scenario is actually about.
 
     hand        card-name string, or a list of ids. '.' is an empty lane.
@@ -171,14 +173,22 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
     deck_ptr    defaults to hand_size, i.e. the opening hand has just been dealt
     joker_value defaults to the fresh-buy seed (VALUE per occupied slot, else 0)
     joker_state defaults to zeros; joker_slots to 5; consumable_slots to 2
+    joker_sell_value defaults to what a buy sets: max(1, cost // 2) per held joker
     key         an int seed, or a real PRNG key to pass straight through
+    shop_slots  joker NAMES or ids; '.' is an empty slot
     """
     ids = cards(hand)
     jids = joker_ids(jokers)
+    held = jids != J_EMPTY
     if joker_value is None:
-        joker_value = jnp.where(jids != J_EMPTY, rows_for(jids).VALUE, 0.0)
+        joker_value = jnp.where(held, rows_for(jids).VALUE, 0.0)
     else:
         joker_value = lanes(joker_value, MAX_JOKERS, 0.0, jnp.float32)
+    if joker_sell_value is None:
+        cost = JOKER_COST[jnp.clip(jids, 0, len(JOKER_COST) - 1)]
+        joker_sell_value = jnp.where(held, jnp.maximum(1, cost // 2), 0).astype(jnp.int32)
+    else:
+        joker_sell_value = lanes(joker_sell_value, MAX_JOKERS, 0, jnp.int32)
     if hand_size is None:
         hand_size = len(ids)
     if valid is None:
@@ -194,6 +204,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         jokers=jids,
         joker_value=joker_value,
         joker_state=lanes(joker_state, MAX_JOKERS, 0, jnp.int32),
+        joker_sell_value=joker_sell_value,
         joker_slots=jnp.int32(joker_slots),
         consumables=lanes(cards(consumables), MAX_CONSUMABLES),
         consumable_slots=jnp.int32(consumable_slots),
@@ -209,12 +220,16 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         discardcount=jnp.int32(discardcount),
         round=jnp.int32(round),
         ante=jnp.int32(ante),
+        blind_index=jnp.int32(blind_index),
         chips_scored=jnp.int32(chips_scored),
         blind_target=jnp.int32(blind_target),
         key=key,
-        shop_slots=jnp.asarray(shop_slots, dtype=jnp.int32),
+        shop_slots=joker_ids(shop_slots, width=MAX_SHOP_SLOTS),
+        shop_size=jnp.int32(shop_size),
+        reroll_cost=jnp.int32(reroll_cost),
         game_stage=jnp.int32(game_stage),
         money=jnp.int32(money),
+        last_cashout=jnp.int32(last_cashout),
     )
 
 

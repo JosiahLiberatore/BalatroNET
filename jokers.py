@@ -210,6 +210,7 @@ class JokerDef(NamedTuple):
     state   : int = ST_NONE
     copyable: bool = True
     updates : tuple = ()     # ((trigger, delta), ...) — COUNTER rows only
+    desc    : str = ""       # the in-game text. Display only; the env never reads it.
 
 # ---------------------------------------------------------------------------
 # THE TABLE — one joker per line. The id is the row index.
@@ -220,11 +221,15 @@ class JokerDef(NamedTuple):
 #
 #        name                     cost  rarity     trigger              effect                value    optional axes
 TABLE = [
-    JokerDef("Joker",                2, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           4.0),
-    JokerDef("Greedy Joker",         5, COMMON,    T_PER_SCORED,        E_ADD_MULT,           3.0, cond=C_SUIT, param=DIAMONDS),
-    JokerDef("Bootstraps",           7, UNCOMMON,  T_ONCE_MAIN,         E_ADD_MULT,           2.0, source=S_QUERY, query=Q_MONEY_DIV_5),
+    JokerDef("Joker",                2, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           4.0,
+             desc="+4 Mult"),
+    JokerDef("Greedy Joker",         5, COMMON,    T_PER_SCORED,        E_ADD_MULT,           3.0, cond=C_SUIT, param=DIAMONDS,
+             desc="Played cards with Diamond suit give +3 Mult when scored"),
+    JokerDef("Bootstraps",           7, UNCOMMON,  T_ONCE_MAIN,         E_ADD_MULT,           2.0, source=S_QUERY, query=Q_MONEY_DIV_5,
+             desc="+2 Mult for every $5 you have"),
     JokerDef("Green Joker",          4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           0.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
-             updates=((T_ONCE_MAIN, +1.0), (T_ON_DISCARD, -1.0))),
+             updates=((T_ONCE_MAIN, +1.0), (T_ON_DISCARD, -1.0)),
+             desc="+1 Mult per hand played, -1 Mult per discard"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -247,6 +252,8 @@ def _validate(table):
             raise ValueError(
                 f"{d.name}: SOURCE/QUERY disagree — source={SOURCE_NAMES[d.source]}, "
                 f"query={d.query}. S_QUERY needs a query kind; nothing else may set one.")
+        if not d.desc:
+            raise ValueError(f"{d.name}: no desc (the GUI shows it on the joker card)")
         if d.cond == C_NONE and d.param != 0:
             raise ValueError(f"{d.name}: COND_PARAM {d.param} set but condition is C_NONE")
         # Only a COUNTER reads joker_value, so only a COUNTER may have update
@@ -295,6 +302,7 @@ JOKER_RARITY = jnp.array([d.rarity for d in TABLE], jnp.int32)
 # Joker ids — table position. -1 = empty slot.
 # ---------------------------------------------------------------------------
 JOKER_NAMES = [d.name for d in TABLE]
+JOKER_DESC  = [d.desc for d in TABLE]   # display only (gui.py)
 JOKER_ID    = {name: i for i, name in enumerate(JOKER_NAMES)}
 N_JOKERS    = len(TABLE)
 
