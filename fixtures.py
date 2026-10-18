@@ -27,8 +27,9 @@ from env import balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_CONSUMABLES, 
 # the card-name convention has ONE definition, in env (show() prints with it)
 from env import RANK_CHARS, SUIT_CHARS
 from jokers import JOKER_COST
-from jokers import (JOKER_ID, J_EMPTY, MAX_JOKERS, N_QUERY_KINDS,
-                    Q_MONEY_DIV_5, rows_for, resolve)
+from jokers import (JOKER_ID, J_EMPTY, J_STENCIL, MAX_JOKERS, N_QUERY_KINDS,
+                    Q_MONEY_DIV_5, Q_MONEY, Q_DISCARDS_LEFT, Q_NO_DISCARDS_LEFT, Q_DECK_LEFT,
+                    Q_JOKER_COUNT, Q_EMPTY_JOKER_SLOTS, rows_for, resolve)
 
 EMPTY = -1
 EMPTY_CHARS = {".", "-", "_"}   # any of these authors an empty lane
@@ -123,21 +124,30 @@ def joker_ids(names, width=MAX_JOKERS):
     return lanes(ids, width=width, fill=J_EMPTY)
 
 
-def query_ctx(*, money=0):
+def query_ctx(*, money=0, discards=3, deck_left=0, jokers=0, empty_slots=0):
     """The query results resolve() reads. ctx[k] = the count for query kind k.
 
-    env builds this from live state each hand. Here a test writes only the
-    queries its case is about; every other kind stays 0.
+    env builds this from live state each hand (env.build_ctx). Here a test
+    writes only the inputs its case is about; the rest stay at a neutral value.
     """
     ctx = jnp.zeros(N_QUERY_KINDS, jnp.float32)
-    return ctx.at[Q_MONEY_DIV_5].set(money // 5)
+    return (ctx.at[Q_MONEY_DIV_5].set(money // 5)
+               .at[Q_MONEY].set(money)
+               .at[Q_DISCARDS_LEFT].set(discards)
+               .at[Q_NO_DISCARDS_LEFT].set(discards == 0)
+               .at[Q_DECK_LEFT].set(deck_left)
+               .at[Q_JOKER_COUNT].set(jokers)
+               .at[Q_EMPTY_JOKER_SLOTS].set(empty_slots))
 
 
-def loadout(names=(), *, money=0, joker_value=None):
+def loadout(names=(), *, money=0, discards=3, deck_left=0, joker_slots=5, joker_value=None):
     """Stage held jokers for a scoring call. -> (rows, active, v)
 
     names       joker names in slot order; vacant slots are padded in
-    money       for Q_MONEY_DIV_5 (Bootstraps)
+    money       for Q_MONEY_DIV_5 (Bootstraps) and Q_MONEY (Bull)
+    discards    for Q_DISCARDS_LEFT (Banner) and Q_NO_DISCARDS_LEFT (Mystic Summit)
+    deck_left   for Q_DECK_LEFT (Blue Joker)
+    joker_slots with names, gives Q_JOKER_COUNT and Q_EMPTY_JOKER_SLOTS
     joker_value live COUNTER memory; defaults to the seed a fresh buy gives
                 (VALUE in an occupied slot, 0 in a vacant one)
 
@@ -151,7 +161,11 @@ def loadout(names=(), *, money=0, joker_value=None):
         joker_value = jnp.where(active, rows.VALUE, 0.0)
     else:
         joker_value = lanes(joker_value, MAX_JOKERS, 0.0, jnp.float32)
-    return rows, active, resolve(rows, active, joker_value, query_ctx(money=money))
+    held = int(active.sum())
+    stencils = int((ids == J_STENCIL).sum())
+    ctx = query_ctx(money=money, discards=discards, deck_left=deck_left, jokers=held,
+                    empty_slots=max(joker_slots - held + stencils, 0))
+    return rows, active, resolve(rows, active, joker_value, ctx)
 
 
 # ---------------------------------------------------------------------------

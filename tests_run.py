@@ -11,9 +11,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from env import (balatroAction, env_step, deal, reset, explain_play, preview, acquire,
+from env import (balatroAction, env_step, deal, reset, explain_play, preview, acquire, roll_shop,
                  invariant_errors, blind_target, MAX_HAND_SIZE, MAX_SHOP_SLOTS,
-                 V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL, V_NEXT,
+                 V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD,
                  STAGE_BLIND, STAGE_SHOP, STAGE_LOST, STAGE_WON,
                  BLIND_SMALL, BLIND_BIG, BLIND_BOSS)
 from jokers import JOKER_ID, J_EMPTY, MAX_JOKERS, N_JOKERS
@@ -153,19 +153,28 @@ def run_blind_end_test():
     got, _, _ = env_step(rich, act(V_PLAY, "11000000"))
     c.eq("interest cap: 3 + 2 + 5", got.last_cashout, 10)
 
-    # a held joker never shows up in the shop: hold three of the four, the
-    # only joker left to roll is the fourth, and slot 1 falls back to a Joker
-    held = pre._replace(jokers=jnp.full(MAX_JOKERS, J_EMPTY, jnp.int32).at[:3].set(
-        jnp.array([J_JOKER, J_GREEN, J_BOOT])))
-    got, _, _ = env_step(held, act(V_PLAY, "11000000"))
-    c.eq("pool of one: slot 0", got.shop_slots[0], JOKER_ID["Greedy Joker"])
-    c.eq("pool of one: slot 1 = fallback Joker", got.shop_slots[1], J_JOKER)
+    # a held joker never shows up in the shop: three held, 20 rolls, none of
+    # the three ever appears
+    trio = jnp.array([J_JOKER, J_GREEN, J_BOOT])
+    held = pre._replace(jokers=jnp.full(MAX_JOKERS, J_EMPTY, jnp.int32).at[:3].set(trio))
+    seen = set()
+    for k in range(20):
+        got, _, _ = env_step(held._replace(key=jax.random.key(k)), act(V_PLAY, "11000000"))
+        seen |= {int(s) for s in got.shop_slots[:2]}
+    c.check("held jokers never rolled", not (seen & {int(j) for j in trio}), sorted(seen))
+
+    # the table can hold more jokers than MAX_JOKERS, so the pool tests call
+    # roll_shop with a long `held` list. Pool of one: slot 0 = the last joker,
+    # slot 1 falls back to a Joker.
+    greedy = JOKER_ID["Greedy Joker"]
+    all_but = jnp.array([j for j in range(N_JOKERS) if j != greedy], jnp.int32)
+    got = roll_shop(jax.random.key(0), all_but, jnp.int32(2))
+    c.eq("pool of one: slot 0", got[0], greedy)
+    c.eq("pool of one: slot 1 = fallback Joker", got[1], J_JOKER)
 
     # every joker held: both unlocked slots fall back, the locked ones stay empty
-    held = pre._replace(jokers=jnp.full(MAX_JOKERS, J_EMPTY, jnp.int32).at[:4].set(
-        jnp.array([J_JOKER, J_GREEN, J_BOOT, JOKER_ID["Greedy Joker"]])))
-    got, _, _ = env_step(held, act(V_PLAY, "11000000"))
-    c.eq("empty pool: Joker, Joker, -, -", got.shop_slots, jnp.array([J_JOKER, J_JOKER, -1, -1]))
+    got = roll_shop(jax.random.key(0), jnp.arange(N_JOKERS, dtype=jnp.int32), jnp.int32(2))
+    c.eq("empty pool: Joker, Joker, -, -", got, jnp.array([J_JOKER, J_JOKER, -1, -1]))
 
     # fail: last hand, not enough chips. 2C high card = 5 + 2 = 7.
     pre = state(hand="2C 4H 6S 8D TC 3S 9D QH", hands=1, money=7)
@@ -235,6 +244,50 @@ def run_shop_test():
     in_blind = three._replace(game_stage=jnp.int32(STAGE_BLIND))
     got, _, _ = env_step(in_blind, act(V_SELL, target=0))
     c.eq("sell is legal in a blind", got.jokers[0], J_GREEN)
+
+    # move: swap slots t and t+1; value, state and sell value go with the joker
+    three = three._replace(joker_state=jnp.zeros(MAX_JOKERS, jnp.int32).at[1].set(7))
+    got, r, _ = env_step(three, act(V_MOVE_JOKER, target=0))
+    c.eq("move 0: swapped", got.jokers[:3], jnp.array([J_GREEN, J_JOKER, J_BOOT]))
+    c.eq("move 0: values follow", got.joker_value[:3], jnp.array([3.0, 4.0, 2.0]))
+    c.eq("move 0: joker_state follows", got.joker_state[:3], jnp.array([7, 0, 0]))
+    c.eq("move 0: sell values follow", got.joker_sell_value[:3], three.joker_sell_value[jnp.array([1, 0, 2])])
+    c.eq("move 0: money and reward unchanged", (int(got.money), int(r)), (0, 0))
+    got, _, _ = env_step(three, act(V_MOVE_JOKER, target=1))
+    c.eq("move 1: swapped", got.jokers[:3], jnp.array([J_JOKER, J_BOOT, J_GREEN]))
+    back, _, _ = env_step(got, act(V_MOVE_JOKER, target=1))
+    c.same_state("move 1 twice: back to the start", back, three)
+    for name, t in [("into a vacant slot", 2), ("vacant slot", 3), ("target -1", -1),
+                    ("target 31", MAX_JOKERS - 1), ("target 99", 99)]:
+        got, _, _ = env_step(three, act(V_MOVE_JOKER, target=t))
+        c.same_state(f"move blocked: {name}", got, three)
+    got, _, _ = env_step(three._replace(game_stage=jnp.int32(STAGE_BLIND)), act(V_MOVE_JOKER, target=0))
+    c.eq("move is legal in a blind", got.jokers[0], J_GREEN)
+    lost = three._replace(game_stage=jnp.int32(STAGE_LOST))
+    got, _, _ = env_step(lost, act(V_MOVE_JOKER, target=0))
+    c.same_state("move blocked when LOST", got, lost)
+
+    # move card: swap hand lanes t and t+1; the play order follows the lanes
+    hand = state(hand="4C KD 9H KC 7C 9S 7S 3H")
+    got, r, _ = env_step(hand, act(V_MOVE_CARD, target=0))
+    c.eq("move card 0: swapped", got.hand[:3], hand.hand[jnp.array([1, 0, 2])])
+    c.eq("move card 0: reward 0, deck untouched", (int(r), int(got.deck_ptr)), (0, int(hand.deck_ptr)))
+    back, _, _ = env_step(got, act(V_MOVE_CARD, target=0))
+    c.same_state("move card 0 twice: back to the start", back, hand)
+    got, _, _ = env_step(hand, act(V_MOVE_CARD, target=6))
+    c.eq("move card 6: last two swapped", got.hand[6:8], hand.hand[jnp.array([7, 6])])
+    for name, t in [("past hand_size", 7), ("target -1", -1), ("target 99", 99)]:
+        got, _, _ = env_step(hand, act(V_MOVE_CARD, target=t))
+        c.same_state(f"move card blocked: {name}", got, hand)
+    holed = hand._replace(hand=hand.hand.at[3].set(-1), hand_valid=hand.hand_valid.at[3].set(False))
+    got, _, _ = env_step(holed, act(V_MOVE_CARD, target=2))
+    c.eq("move card into a hole", (int(got.hand[3]), bool(got.hand_valid[2])), (int(hand.hand[2]), False))
+    both = holed._replace(hand=holed.hand.at[4].set(-1), hand_valid=holed.hand_valid.at[4].set(False))
+    got, _, _ = env_step(both, act(V_MOVE_CARD, target=3))
+    c.same_state("move card blocked: two holes", got, both)
+    shop_hand = hand._replace(game_stage=jnp.int32(STAGE_SHOP))
+    got, _, _ = env_step(shop_hand, act(V_MOVE_CARD, target=0))
+    c.same_state("move card blocked in the shop", got, shop_hand)
 
     # acquire: the shared entry point (BUY, and the GUI dev button)
     got, ok = acquire(three, jnp.int32(JOKER_ID["Greedy Joker"]))
@@ -418,7 +471,7 @@ def run_fuzz_test(n_envs=128, n_steps=120, seed=0):
     seen_stage = np.zeros(4, int)
     for t in range(n_steps):
         akey, k1, k2, k3 = jax.random.split(akey, 4)
-        verb = jax.random.randint(k1, (n_envs,), -1, 7)            # includes illegal verbs
+        verb = jax.random.randint(k1, (n_envs,), -1, 9)            # includes illegal verbs
         sel = jax.random.bernoulli(k2, 0.3, (n_envs, MAX_HAND_SIZE))
         target = jax.random.randint(k3, (n_envs,), -2, 34)
         states, r, d = step(states, balatroAction(verb=verb, select=sel, target=target))

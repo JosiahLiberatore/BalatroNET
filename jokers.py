@@ -123,12 +123,18 @@ SOURCE_NAMES = ["CONSTANT", "COUNTER", "QUERY"]
 # To add a query, add a kind here.
 Q_NONE              = 0
 Q_MONEY_DIV_5       = 1    # Bootstraps
-Q_EMPTY_JOKER_SLOTS = 2    # Joker Stencil, Abstract Joker(?)
+Q_EMPTY_JOKER_SLOTS = 2    # Joker Stencil. A held Stencil counts as empty
+                           # ("Joker Stencil included"), so the count is >= 1.
 Q_DECK_STEEL_COUNT  = 3    # Steel Joker
 Q_DECK_STONE_COUNT  = 4    # Stone Joker
-Q_DECK_NINE_COUNT   = 5    # Cloud 9
+Q_DECK_NINE_COUNT   = 5    # Cloud 9 - 9s in the FULL deck, not the undealt part
 Q_UNCOMMON_JOKERS   = 6    # Baseball Card
-N_QUERY_KINDS       = 7    # length of ctx
+Q_DISCARDS_LEFT     = 7    # Banner
+Q_NO_DISCARDS_LEFT  = 8    # Mystic Summit - 1 when discards == 0, else 0
+Q_DECK_LEFT         = 9    # Blue Joker - undealt cards in the deck
+Q_JOKER_COUNT       = 10   # Abstract Joker - held jokers, itself included
+Q_MONEY             = 11   # Bull
+N_QUERY_KINDS       = 12   # length of ctx
 
 # A buy or sell during a blind changes a query result. resolve() runs on each
 # hand and its result is never cached.
@@ -195,6 +201,18 @@ COMMON, UNCOMMON, RARE, LEGENDARY = 1, 2, 3, 4
 # Suits, for COND_PARAM (scoring.py: 0=clubs 1=diamonds 2=hearts 3=spades).
 CLUBS, DIAMONDS, HEARTS, SPADES = 0, 1, 2, 3
 
+# Hand types, for C_HAND_HAS. Index-aligned with scoring.HAND_NAMES (jokers.py
+# imports nothing from the project, so the indices are written here).
+H_STRAIGHT_FLUSH, H_FOUR, H_FULL_HOUSE, H_FLUSH, H_STRAIGHT = 0, 1, 2, 3, 4
+H_THREE, H_TWO_PAIR, H_PAIR, H_HIGH = 5, 6, 7, 8
+
+
+def _ranks(names):
+    """'2 4 6 8 T' -> the 13-bit rank mask for C_RANK_IN (bit r = rank r, 0 = two)."""
+    order = "23456789TJQKA"
+    return sum(1 << order.index(n) for n in names.split())
+
+
 class JokerDef(NamedTuple):
     """One authored joker. Plain Python. Never traced, never in a pytree."""
     name    : str
@@ -217,7 +235,9 @@ class JokerDef(NamedTuple):
 # ---------------------------------------------------------------------------
 # Rows can be reordered. Ids are valid within one training run only. Nothing
 # hardcodes an id: J_* constants resolve by name through JOKER_ID.
-# These three rows give one example per SOURCE kind.
+# Not authored yet, by design: jokers with a random roll (Misprint, Business
+# Card, Gros Michel), with two effects in one row (Scholar, Walkie Talkie), and
+# with a mechanic the engine does not have (held cards, retriggers, packs).
 #
 #        name                     cost  rarity     trigger              effect                value    optional axes
 TABLE = [
@@ -230,6 +250,90 @@ TABLE = [
     JokerDef("Green Joker",          4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           0.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
              updates=((T_ONCE_MAIN, +1.0), (T_ON_DISCARD, -1.0)),
              desc="+1 Mult per hand played, -1 Mult per discard"),
+
+    # --- hand-type jokers. HAND_HAS means CONTAINS: a Full House fires Jolly.
+    JokerDef("Jolly Joker",          3, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           8.0, cond=C_HAND_HAS, param=H_PAIR,
+             desc="+8 Mult if played hand contains a Pair"),
+    JokerDef("Zany Joker",           4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,          12.0, cond=C_HAND_HAS, param=H_THREE,
+             desc="+12 Mult if played hand contains a Three of a Kind"),
+    JokerDef("Mad Joker",            4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,          10.0, cond=C_HAND_HAS, param=H_TWO_PAIR,
+             desc="+10 Mult if played hand contains a Two Pair"),
+    JokerDef("Crazy Joker",          4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,          12.0, cond=C_HAND_HAS, param=H_STRAIGHT,
+             desc="+12 Mult if played hand contains a Straight"),
+    JokerDef("Droll Joker",          4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,          10.0, cond=C_HAND_HAS, param=H_FLUSH,
+             desc="+10 Mult if played hand contains a Flush"),
+    JokerDef("Sly Joker",            3, COMMON,    T_ONCE_MAIN,         E_ADD_CHIPS,         50.0, cond=C_HAND_HAS, param=H_PAIR,
+             desc="+50 Chips if played hand contains a Pair"),
+    JokerDef("Wily Joker",           4, COMMON,    T_ONCE_MAIN,         E_ADD_CHIPS,        100.0, cond=C_HAND_HAS, param=H_THREE,
+             desc="+100 Chips if played hand contains a Three of a Kind"),
+    JokerDef("Clever Joker",         4, COMMON,    T_ONCE_MAIN,         E_ADD_CHIPS,         80.0, cond=C_HAND_HAS, param=H_TWO_PAIR,
+             desc="+80 Chips if played hand contains a Two Pair"),
+    JokerDef("Devious Joker",        4, COMMON,    T_ONCE_MAIN,         E_ADD_CHIPS,        100.0, cond=C_HAND_HAS, param=H_STRAIGHT,
+             desc="+100 Chips if played hand contains a Straight"),
+    JokerDef("Crafty Joker",         4, COMMON,    T_ONCE_MAIN,         E_ADD_CHIPS,         80.0, cond=C_HAND_HAS, param=H_FLUSH,
+             desc="+80 Chips if played hand contains a Flush"),
+    JokerDef("Half Joker",           5, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,          20.0, cond=C_COUNT_CMP, param=3,
+             desc="+20 Mult if played hand contains 3 or fewer cards"),
+
+    # --- per-card jokers
+    JokerDef("Lusty Joker",          5, COMMON,    T_PER_SCORED,        E_ADD_MULT,           3.0, cond=C_SUIT, param=HEARTS,
+             desc="Played cards with Heart suit give +3 Mult when scored"),
+    JokerDef("Wrathful Joker",       5, COMMON,    T_PER_SCORED,        E_ADD_MULT,           3.0, cond=C_SUIT, param=SPADES,
+             desc="Played cards with Spade suit give +3 Mult when scored"),
+    JokerDef("Gluttonous Joker",     5, COMMON,    T_PER_SCORED,        E_ADD_MULT,           3.0, cond=C_SUIT, param=CLUBS,
+             desc="Played cards with Club suit give +3 Mult when scored"),
+    JokerDef("Even Steven",          4, COMMON,    T_PER_SCORED,        E_ADD_MULT,           4.0, cond=C_RANK_IN, param=_ranks("2 4 6 8 T"),
+             desc="Played cards with even rank give +4 Mult when scored (10, 8, 6, 4, 2)"),
+    JokerDef("Odd Todd",             4, COMMON,    T_PER_SCORED,        E_ADD_CHIPS,         31.0, cond=C_RANK_IN, param=_ranks("A 3 5 7 9"),
+             desc="Played cards with odd rank give +31 Chips when scored (A, 9, 7, 5, 3)"),
+    JokerDef("Scary Face",           4, COMMON,    T_PER_SCORED,        E_ADD_CHIPS,         30.0, cond=C_IS_FACE,
+             desc="Played face cards give +30 Chips when scored"),
+    JokerDef("Smiley Face",          4, COMMON,    T_PER_SCORED,        E_ADD_MULT,           5.0, cond=C_IS_FACE,
+             desc="Played face cards give +5 Mult when scored"),
+    JokerDef("Fibonacci",            8, UNCOMMON,  T_PER_SCORED,        E_ADD_MULT,           8.0, cond=C_RANK_IN, param=_ranks("A 2 3 5 8"),
+             desc="Each played Ace, 2, 3, 5, or 8 gives +8 Mult when scored"),
+    JokerDef("Arrowhead",            7, UNCOMMON,  T_PER_SCORED,        E_ADD_CHIPS,         50.0, cond=C_SUIT, param=SPADES,
+             desc="Played cards with Spade suit give +50 Chips when scored"),
+    JokerDef("Onyx Agate",           7, UNCOMMON,  T_PER_SCORED,        E_ADD_MULT,           7.0, cond=C_SUIT, param=CLUBS,
+             desc="Played cards with Club suit give +7 Mult when scored"),
+
+    # --- query jokers: v = VALUE * a count from live state
+    JokerDef("Banner",               5, COMMON,    T_ONCE_MAIN,         E_ADD_CHIPS,         30.0, source=S_QUERY, query=Q_DISCARDS_LEFT,
+             desc="+30 Chips for each remaining discard"),
+    JokerDef("Mystic Summit",        5, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,          15.0, source=S_QUERY, query=Q_NO_DISCARDS_LEFT,
+             desc="+15 Mult when 0 discards remaining"),
+    JokerDef("Blue Joker",           5, COMMON,    T_ONCE_MAIN,         E_ADD_CHIPS,          2.0, source=S_QUERY, query=Q_DECK_LEFT,
+             desc="+2 Chips for each remaining card in deck"),
+    JokerDef("Abstract Joker",       4, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           3.0, source=S_QUERY, query=Q_JOKER_COUNT,
+             desc="+3 Mult for each Joker card"),
+    JokerDef("Bull",                 6, UNCOMMON,  T_ONCE_MAIN,         E_ADD_CHIPS,          2.0, source=S_QUERY, query=Q_MONEY,
+             desc="+2 Chips for each $1 you have"),
+    JokerDef("Joker Stencil",        8, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              1.0, source=S_QUERY, query=Q_EMPTY_JOKER_SLOTS,
+             desc="X1 Mult for each empty Joker slot. Joker Stencil included"),
+
+    # --- counter: +20 Mult, -4 at each end of round. The game destroys it at
+    # 0; here it stays at 0 and only takes a slot.
+    JokerDef("Popcorn",              5, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,          20.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_END_OF_ROUND, -4.0),),
+             desc="+20 Mult, -4 Mult per round played"),
+
+    # --- economy: money at the end of the round, paid in the cashout
+    JokerDef("Golden Joker",         6, COMMON,    T_END_OF_ROUND,      E_ADD_MONEY,          4.0,
+             desc="Earn $4 at end of round"),
+    JokerDef("Cloud 9",              7, UNCOMMON,  T_END_OF_ROUND,      E_ADD_MONEY,          1.0, source=S_QUERY, query=Q_DECK_NINE_COUNT,
+             desc="Earn $1 for each 9 in your full deck at end of round"),
+
+    # --- XMULT on a hand type: applied in slot order (stage 6)
+    JokerDef("The Duo",              8, RARE,      T_ONCE_MAIN,         E_XMULT,              2.0, cond=C_HAND_HAS, param=H_PAIR,
+             desc="X2 Mult if played hand contains a Pair"),
+    JokerDef("The Trio",             8, RARE,      T_ONCE_MAIN,         E_XMULT,              3.0, cond=C_HAND_HAS, param=H_THREE,
+             desc="X3 Mult if played hand contains a Three of a Kind"),
+    JokerDef("The Family",           8, RARE,      T_ONCE_MAIN,         E_XMULT,              4.0, cond=C_HAND_HAS, param=H_FOUR,
+             desc="X4 Mult if played hand contains a Four of a Kind"),
+    JokerDef("The Order",            8, RARE,      T_ONCE_MAIN,         E_XMULT,              3.0, cond=C_HAND_HAS, param=H_STRAIGHT,
+             desc="X3 Mult if played hand contains a Straight"),
+    JokerDef("The Tribe",            8, RARE,      T_ONCE_MAIN,         E_XMULT,              2.0, cond=C_HAND_HAS, param=H_FLUSH,
+             desc="X2 Mult if played hand contains a Flush"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -314,6 +418,7 @@ J_JOKER     = JOKER_ID["Joker"]
 J_GREEDY    = JOKER_ID["Greedy Joker"]
 J_BOOTSTRAP = JOKER_ID["Bootstraps"]
 J_GREEN     = JOKER_ID["Green Joker"]
+J_STENCIL   = JOKER_ID["Joker Stencil"]
 
 class RuleMods(NamedTuple):
     """Stage 0: passive jokers change the rules before hand detection runs.

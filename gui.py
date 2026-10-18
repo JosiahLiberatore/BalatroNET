@@ -9,17 +9,24 @@ fixtures.py does in the tests.
     uv run --project D:/Claude/jax-learn python gui.py [--seed N]
 
 Mouse: click cards to select, click a joker to select it (then SELL), click a
-shop joker to buy it.
+shop joker to buy it. Drag a joker or a hand card to a new place (MOVE_JOKER /
+MOVE_CARD steps through env_step).
 Keys:  1-8 toggle a card   Enter play   D discard   R / S sort by rank / suit
-       V deck view   N new run   Esc close a popup / quit
-Model: M take the model's pick   A auto-play on/off   G greedy / sampled pick
+       V deck view   N new run   Left / Right move the selected joker   Esc close a popup / quit
+Model: P model view on/off (hides the panel, the odds and the pick outline)
+       M take the model's pick   A auto-play on/off   G greedy / sampled pick
        O card odds on/off.  The panel on the right always shows the model's
        odds for the current state, at every stage.
        --params runs/params_run.pkl (default)   --scale 0.2 (the training curriculum scale)
 Dev:   +$10, and the Add Joker dropdown (scroll wheel when the list is long)
+Seed:  the seed box: click it, type a number, Enter starts that seed (Esc cancels)
+       Restart = the same seed again   Random = a random seed   N = seed + 1
+       One seed fixes the shuffle and the shops. The same seed with the same
+       actions gives the same run. MOVE steps do not use the RNG.
 
-Sorting changes the DISPLAY order only. The env plays the selected cards in
-lane order; no joker in the table reads the play order yet.
+The hand shows the env's lane order, which is the play order (and the order
+Death reads). Sort Rank / Sort Suit reorder the hand once, with MOVE_CARD steps;
+new cards land in the lanes the played cards left.
 """
 
 import argparse
@@ -33,7 +40,7 @@ import pygame
 
 from env import (balatroAction, env_step, reset, explain_play, preview, build_ctx, acquire,
                  invariant_errors, MAX_HAND_SIZE, STAGE_BLIND, STAGE_SHOP, STAGE_LOST,
-                 STAGE_WON, BLIND_NAMES, BLIND_REWARD, V_PLAY, V_DISCARD, V_BUY, V_SELL,
+                 STAGE_WON, BLIND_NAMES, BLIND_REWARD, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_MOVE_JOKER, V_MOVE_CARD,
                  V_REROLL, V_NEXT, WIN_ANTE, INTEREST_PER, INTEREST_CAP, RANK_CHARS)
 from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J_EMPTY,
                     MAX_JOKERS, rows_for, resolve, COMMON, UNCOMMON, RARE,
@@ -41,7 +48,7 @@ from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J
 from scoring import HAND_NAMES
 from agent import (observe, legal_mask, masked_logits, init_params, action_name, OBS_DIM,
                    N_ACTIONS, ACTION_VERB, ACTION_TARGET, A_PLAY, A_DISCARD, A_BUY, A_SELL,
-                   A_REROLL)
+                   A_MOVE_JOKER, A_MOVE_CARD, A_REROLL)
 from train import load_params, PARAMS_PATH, REWARD_SCALE
 
 GW = 1280                  # the game area; the model panel sits to its right
@@ -145,6 +152,12 @@ def hand_label(i):
     return HAND_LABEL.get(HAND_NAMES[int(i)], HAND_NAMES[int(i)])
 
 
+def card_name(cid):
+    """Short card name for the log and the model panel: 10♥, K♠."""
+    r = "10" if RANK_CHARS[cid % 13] == "T" else RANK_CHARS[cid % 13]
+    return r + SUIT_GLYPH[cid // 13]
+
+
 # ---------------------------------------------------------------------------
 # drawing primitives
 # ---------------------------------------------------------------------------
@@ -166,6 +179,11 @@ def text(surf, font, s, color, pos, anchor="topleft"):
     r = img.get_rect(**{anchor: pos})
     surf.blit(img, r)
     return r
+
+
+def fit(fonts, s, width):
+    """The bold font, or the body font when the bold one is wider than width."""
+    return fonts.bold if fonts.bold.size(s)[0] <= width else fonts.body
 
 
 def wrap(font, s, width):
@@ -279,17 +297,19 @@ class App:
         self.ai_greedy = False         # False: show a sampled pick (what training does)
         self.ai_auto = False
         self.ai_odds = True            # select odds above the cards
+        self.show_model = True         # the whole model view: panel, odds, pick outline
         self.ai_n = 0                  # bumps the sampling key after every step
         self.ai_last = 0               # ms of the last auto step
         pygame.init()
         pygame.display.set_caption("BalatroNET")
-        self.screen = pygame.display.set_mode((W, H))
+        self.screen = pygame.display.set_mode((W, H))   # show_model starts on
         self.fonts = Fonts()
         self.clock = pygame.time.Clock()
         self.seed = seed
-        self.sort_by = "rank"
         self.log = []
         self.show_deck = False
+        self.seed_edit = None          # the typed digits while the seed box is open
+        self.drag = None               # [kind "joker"/"card", slot or lane, press pos, mouse pos]
         self.joker_menu = Dropdown((84, 710, 170, 30), "Add Joker   ", self.joker_menu_rows,
                                    lambda jid: self.give_joker(jid))
         self.splash("Compiling the jitted env ...")
@@ -374,6 +394,12 @@ class App:
         elif verb == V_SELL:
             self.say(f"Sold {JOKER_NAMES[int(pre.jokers[target])]} for ${int(h.money) - int(pre.money)}.")
             self.joker_sel = None
+        elif verb == V_MOVE_CARD:
+            self.say(f"Moved {card_name(int(pre.hand[target]))} right of {card_name(int(pre.hand[target + 1]))}."
+                     if bool(pre.hand_valid[target]) and bool(pre.hand_valid[target + 1]) else "Moved a card.")
+        elif verb == V_MOVE_JOKER:
+            self.say(f"Moved {JOKER_NAMES[int(pre.jokers[target])]} right of "
+                     f"{JOKER_NAMES[int(pre.jokers[target + 1])]}.")
         elif verb == V_REROLL:
             self.say(f"Rerolled for ${int(pre.money) - int(h.money)}." if int(h.money) != int(pre.money)
                      else "Not enough money to reroll.")
@@ -388,13 +414,104 @@ class App:
             blind = int(BLIND_REWARD[int(pre.blind_index)])
             self.cashout = (f"Cash out ${int(h.last_cashout)}:  blind ${blind}  +  "
                             f"{int(h.hands)} hand(s) left ${int(h.hands)}  +  interest ${interest}")
+            jm = int(h.last_cashout) - blind - int(h.hands) - interest
+            if jm:
+                self.cashout += f"  +  jokers ${jm}"
             self.say(f"Blind defeated! {self.cashout}")
         if int(h.game_stage) == STAGE_LOST and int(pre.game_stage) != STAGE_LOST:
             self.say("Out of hands. Game over.")
         if int(h.game_stage) == STAGE_WON and int(pre.game_stage) != STAGE_WON:
             self.say("You won the run!")
 
+    def move_joker(self, i, k):
+        """Bring the joker in slot i to slot k with MOVE steps (adjacent swaps)."""
+        if i == k or int(self.h.game_stage) not in (STAGE_BLIND, STAGE_SHOP):
+            return
+        name = JOKER_NAMES[int(self.h.jokers[i])]
+        for t in (range(i, k) if k > i else range(i - 1, k - 1, -1)):
+            self.state, _, _ = env_step(self.state, self.action(V_MOVE_JOKER, t))
+            self.ai_n += 1
+        if self.joker_sel == i:
+            self.joker_sel = k
+        self.refresh()
+        self.say(f"Moved {name} to slot {k + 1}.")
+
+    def card_swaps(self, swaps):
+        """Run MOVE_CARD steps (lane t <-> t+1). The selection follows its cards."""
+        if not swaps or int(self.h.game_stage) != STAGE_BLIND:
+            return
+        ids = {int(self.h.hand[l]) for l in self.selected}
+        for t in swaps:
+            self.state, _, _ = env_step(self.state, self.action(V_MOVE_CARD, t))
+            self.ai_n += 1
+        hand, valid = np.asarray(self.state.hand), np.asarray(self.state.hand_valid)
+        self.selected = {l for l in range(MAX_HAND_SIZE) if valid[l] and int(hand[l]) in ids}
+        self.refresh()
+
+    def move_card(self, lane, k):
+        """Bring the card in `lane` to place k of the visible hand."""
+        order = self.hand_order()
+        dest = order[k]
+        self.card_swaps(list(range(lane, dest)) if dest > lane else list(range(lane - 1, dest - 1, -1)))
+
+    def sort_hand(self, by):
+        """Bubble sort the lanes with MOVE_CARD steps. Holes drift to the right."""
+        h = self.h
+        n = int(h.hand_size)
+        cards = [int(h.hand[l]) if bool(h.hand_valid[l]) else None for l in range(n)]
+        key = ((lambda c: (-(c % 13), c // 13)) if by == "rank"
+               else (lambda c: (-(c // 13), -(c % 13))))
+        k = lambda c: (1,) if c is None else (0,) + key(c)
+        swaps = []
+        for end in range(n - 1, 0, -1):
+            for t in range(end):
+                if k(cards[t]) > k(cards[t + 1]):
+                    cards[t], cards[t + 1] = cards[t + 1], cards[t]
+                    swaps.append(t)
+        self.card_swaps(swaps)
+        self.say(f"Sorted by {by} ({len(swaps)} MOVE_CARD steps).")
+
+    def drag_moved(self, kind):
+        """The slot / lane held in a real drag of this kind, else None."""
+        d = self.drag
+        return d[1] if d and d[0] == kind and abs(d[3][0] - d[2][0]) > 6 else None
+
+    def drop_slot(self, x):
+        """The lineup slot under screen x, clamped to the held jokers."""
+        n = len(self.joker_rects())
+        return min(max(int((x - 330 + 6) // 150), 0), n - 1)
+
+    def drop_place(self, x):
+        """The visible hand place whose card center is nearest screen x."""
+        rects = self.card_rects()
+        return min(range(len(rects)), key=lambda k: abs(rects[k][1].centerx - x))
+
+    def drag_order(self):
+        """Joker slots in drawing order: the held one goes to the drop slot."""
+        order = [i for i, _ in self.joker_rects()]
+        i = self.drag_moved("joker")
+        if i is not None:
+            order.remove(i)
+            order.insert(self.drop_slot(self.drag[3][0]), i)
+        return order
+
+    def card_drag_order(self):
+        """Hand lanes in drawing order: the held card goes to the drop place."""
+        order = self.hand_order()
+        lane = self.drag_moved("card")
+        if lane is not None:
+            order.remove(lane)
+            order.insert(self.drop_place(self.drag[3][0]), lane)
+        return order
+
     # --- dev staging (bypasses env_step on purpose, like fixtures.py) -------
+    def toggle_model(self):
+        """Show or hide the model view. Hidden: no panel, no odds, no auto-play,
+        and the window narrows to the game area."""
+        self.show_model = not self.show_model
+        self.ai_auto = self.ai_auto and self.show_model
+        self.screen = pygame.display.set_mode((W if self.show_model else GW, H))
+
     def give_money(self, n):
         self.state = self.state._replace(money=self.state.money + n)
         self.refresh()
@@ -422,7 +539,17 @@ class App:
         if A_BUY <= a < A_SELL:
             jid = int(h.shop_slots[a - A_BUY])
             return f"BUY {JOKER_NAMES[jid]} (${int(JOKER_COST[jid])})" if jid >= 0 else action_name(a)
-        if A_SELL <= a < A_REROLL:
+        if A_MOVE_CARD <= a < A_REROLL:
+            t = a - A_MOVE_CARD
+            if bool(h.hand_valid[t]) and bool(h.hand_valid[t + 1]):
+                return f"MOVE {card_name(int(h.hand[t]))} <> {card_name(int(h.hand[t + 1]))}"
+            return action_name(a)
+        if A_MOVE_JOKER <= a < A_MOVE_CARD:
+            i = a - A_MOVE_JOKER
+            if int(h.jokers[i]) >= 0 and int(h.jokers[i + 1]) >= 0:
+                return f"MOVE {JOKER_NAMES[int(h.jokers[i])]} <> {JOKER_NAMES[int(h.jokers[i + 1])]}"
+            return action_name(a)
+        if A_SELL <= a < A_MOVE_JOKER:
             i = a - A_SELL
             jid = int(h.jokers[i])
             return f"SELL {JOKER_NAMES[jid]} (+${int(h.joker_sell_value[i])})" if jid >= 0 else action_name(a)
@@ -455,15 +582,10 @@ class App:
     # --- layout ---------------------------------------------------------------
     def hand_order(self):
         h = self.h
-        lanes = [i for i in range(int(h.hand_size)) if bool(h.hand_valid[i])]
-        if self.sort_by == "rank":
-            key = lambda i: (-(int(h.hand[i]) % 13), int(h.hand[i]) // 13)
-        else:
-            key = lambda i: (-(int(h.hand[i]) // 13), -(int(h.hand[i]) % 13))
-        return sorted(lanes, key=key)
+        return [i for i in range(int(h.hand_size)) if bool(h.hand_valid[i])]   # lane order = play order
 
-    def card_rects(self):
-        order = self.hand_order()
+    def card_rects(self, order=None):
+        order = self.hand_order() if order is None else order
         n = max(len(order), 1)
         cw, ch = 96, 134
         area_x, area_w = 330, 900
@@ -506,7 +628,15 @@ class App:
             b["new"] = Button((GW // 2 - 110, 420, 220, 60), "New Run", BTN_PLAY)
         # dev strip
         b["dev_money"] = Button((14, 710, 64, 30), "+$10", PANEL_HI)
+        editing = self.seed_edit is not None
+        b["seed"] = Button((262, 710, 110, 30), f"#{self.seed_edit}_" if editing else f"Seed {self.seed}",
+                           AI_C if editing else PANEL_HI)
+        b["restart"] = Button((378, 710, 84, 30), "Restart", PANEL_HI)
+        b["random"] = Button((468, 710, 84, 30), "Random", PANEL_HI)
         b["deck"] = Button((1150, 710, 116, 36), "Deck (V)", PANEL_HI)
+        b["model"] = Button((1020, 710, 120, 36), "Model (P)", AI_C if self.show_model else PANEL_HI)
+        if not self.show_model:
+            return b
         # model panel
         x = GW + 14
         live = stage in (STAGE_BLIND, STAGE_SHOP)
@@ -526,6 +656,8 @@ class App:
         if self.show_deck:
             self.show_deck = False         # any click closes the deck view
             return
+        if self.seed_edit is not None and not self.buttons()["seed"].hit(pos):
+            self.seed_edit = None          # a click outside the seed box cancels it
         if self.joker_menu.click(pos):
             return
         for name, btn in self.buttons().items():
@@ -534,7 +666,7 @@ class App:
         if stage == STAGE_BLIND:
             for lane, r in reversed(self.card_rects()):     # topmost card first
                 if r.collidepoint(pos):
-                    self.toggle(lane)
+                    self.drag = ["card", lane, pos, pos]   # release() selects or moves it
                     return
         if stage == STAGE_SHOP:
             for i, r in self.shop_rects():
@@ -542,9 +674,25 @@ class App:
                     return self.step(V_BUY, i)
         for i, r in self.joker_rects():
             if r.collidepoint(pos):
-                self.joker_sel = None if self.joker_sel == i else i
+                self.drag = ["joker", i, pos, pos]   # release() selects or moves it
                 return
         self.joker_sel = None
+
+    def release(self, pos):
+        if self.drag is None:
+            return
+        kind, i, start, _ = self.drag
+        self.drag = None
+        click = abs(pos[0] - start[0]) <= 6    # no real drag
+        if kind == "card":
+            if click:
+                self.toggle(i)
+            else:
+                self.move_card(i, self.drop_place(pos[0]))
+        elif click:
+            self.joker_sel = None if self.joker_sel == i else i
+        else:
+            self.move_joker(i, self.drop_slot(pos[0]))
 
     def press(self, name):
         if name == "play":
@@ -552,9 +700,9 @@ class App:
         elif name == "discard":
             self.step(V_DISCARD)
         elif name == "sort_rank":
-            self.sort_by = "rank"
+            self.sort_hand("rank")
         elif name == "sort_suit":
-            self.sort_by = "suit"
+            self.sort_hand("suit")
         elif name == "next":
             self.step(V_NEXT)
         elif name == "reroll":
@@ -563,10 +711,18 @@ class App:
             self.step(V_SELL, self.joker_sel)
         elif name == "new":
             self.new_run(self.seed + 1)
+        elif name == "seed":
+            self.seed_edit = None if self.seed_edit is not None else ""
+        elif name == "restart":
+            self.new_run(self.seed)
+        elif name == "random":
+            self.new_run(int.from_bytes(os.urandom(4), "little") >> 1)
         elif name == "dev_money":
             self.give_money(10)
         elif name == "deck":
             self.show_deck = True
+        elif name == "model":
+            self.toggle_model()
         elif name == "ai_step":
             self.model_step()
         elif name == "ai_auto":
@@ -586,11 +742,27 @@ class App:
 
     def key(self, k):
         stage = int(self.h.game_stage)
+        if self.seed_edit is not None:     # the seed box takes every key while open
+            digit = {getattr(pygame, f"K_{d}"): str(d) for d in range(10)}
+            digit.update({getattr(pygame, f"K_KP{d}"): str(d) for d in range(10)})
+            if k in digit and len(self.seed_edit) < 10:
+                self.seed_edit += digit[k]
+            elif k == pygame.K_BACKSPACE:
+                self.seed_edit = self.seed_edit[:-1]
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                typed, self.seed_edit = self.seed_edit, None
+                if typed:
+                    self.new_run(int(typed))
+            return
         if k == pygame.K_v:
             self.show_deck = not self.show_deck
             return
         if self.show_deck:
             return                         # the deck view eats game keys
+        if k == pygame.K_p:
+            return self.toggle_model()
+        if k in (pygame.K_m, pygame.K_a, pygame.K_g, pygame.K_o) and not self.show_model:
+            return                         # the model keys need the model view
         if k == pygame.K_m:
             return self.model_step()
         if k == pygame.K_a:
@@ -601,6 +773,12 @@ class App:
             return self.refresh()
         if k == pygame.K_o:
             self.ai_odds = not self.ai_odds
+            return
+        if k in (pygame.K_LEFT, pygame.K_RIGHT) and self.joker_sel is not None:
+            n = len(self.joker_rects())
+            k2 = self.joker_sel + (1 if k == pygame.K_RIGHT else -1)
+            if 0 <= k2 < n:
+                self.move_joker(self.joker_sel, k2)
             return
         if k == pygame.K_n:
             self.new_run(self.seed + 1)
@@ -615,9 +793,9 @@ class App:
             elif k == pygame.K_d and 1 <= len(self.selected) <= 5 and int(self.h.discards) > 0:
                 self.step(V_DISCARD)
             elif k == pygame.K_r:
-                self.sort_by = "rank"
+                self.sort_hand("rank")
             elif k == pygame.K_s:
-                self.sort_by = "suit"
+                self.sort_hand("suit")
 
     # --- drawing --------------------------------------------------------------
     def draw_card(self, rect, cid, selected=False, scored=None):
@@ -695,11 +873,19 @@ class App:
         s, f, h = self.screen, self.fonts, self.h
         held = int((h.jokers != J_EMPTY).sum())
         text(s, f.small, f"Jokers {held}/{int(h.joker_slots)}", DIM, (330, 8))
-        for i, r in self.joker_rects():
+        held_slot = self.drag_moved("joker")
+        cards = [(i, pygame.Rect(330 + k * 150, 28, 138, 150)) for k, i in enumerate(self.drag_order())]
+        if held_slot is not None:          # draw the held card last, under the mouse
+            box(s, next(r for i, r in cards if i == held_slot), PANEL_HI, 10)   # its drop gap
+            cards = [c for c in cards if c[0] != held_slot]
+            dx = self.drag[3][0] - self.drag[2][0]
+            home = dict(self.joker_rects())[held_slot]
+            cards.append((held_slot, home.move(dx, 8)))
+        for i, r in cards:
             jid = int(h.jokers[i])
             name = JOKER_NAMES[jid]
-            box(s, r, PANEL, 10, SEL_EDGE if i == self.joker_sel else RARITY_C[int(JOKER_RARITY[jid])], 3)
-            text(s, f.bold, name, TEXT, (r.centerx, r.y + 8), "midtop")
+            box(s, r, PANEL, 10, SEL_EDGE if i in (self.joker_sel, held_slot) else RARITY_C[int(JOKER_RARITY[jid])], 3)
+            text(s, fit(f, name, r.w - 10), name, TEXT, (r.centerx, r.y + 8), "midtop")
             yy = r.y + 36
             for line in wrap(f.small, JOKER_DESC[jid], r.w - 14)[:4]:
                 text(s, f.small, line, DIM, (r.centerx, yy), "midtop")
@@ -721,7 +907,7 @@ class App:
             cost = int(JOKER_COST[jid])
             ok = int(h.money) >= cost
             box(s, r, PANEL_HI, 10, RARITY_C[int(JOKER_RARITY[jid])], 3)
-            text(s, f.bold, name, TEXT, (r.centerx, r.y + 8), "midtop")
+            text(s, fit(f, name, r.w - 10), name, TEXT, (r.centerx, r.y + 8), "midtop")
             yy = r.y + 36
             for line in wrap(f.small, JOKER_DESC[jid], r.w - 14)[:4]:
                 text(s, f.small, line, DIM, (r.centerx, yy), "midtop")
@@ -749,9 +935,16 @@ class App:
     def draw_hand(self):
         a, sel = self.ai_choice()
         picked = set(self.ai_played_lanes(sel)) if a in (A_PLAY, A_DISCARD) else set()
-        for lane, r in self.card_rects():
+        held = self.drag_moved("card")
+        cards = self.card_rects(self.card_drag_order())
+        if held is not None:               # a gap at the drop place; the held card follows the mouse
+            box(self.screen, dict(cards)[held], PANEL_HI, 9)
+            cards = [c for c in cards if c[0] != held]
+            home = dict(self.card_rects())[held]
+            cards.append((held, home.move(self.drag[3][0] - self.drag[2][0], -40)))
+        for lane, r in cards:
             self.draw_card(r, int(self.h.hand[lane]), selected=lane in self.selected)
-            if not self.ai_odds:
+            if not (self.ai_odds and self.show_model):
                 continue
             if lane in picked:
                 pygame.draw.rect(self.screen, AI_C, r.inflate(10, 10), 3, border_radius=12)
@@ -837,15 +1030,16 @@ class App:
         for c in deck[ptr:size]:
             left[(c // 13) % 4, c % 13] += 1
 
-        veil = pygame.Surface((W, H), pygame.SRCALPHA)
+        sw = s.get_width()                          # 1600 with the model view, 1280 without
+        veil = pygame.Surface((sw, H), pygame.SRCALPHA)
         veil.fill((0, 0, 0, 170))
         s.blit(veil, (0, 0))
         cw, ch = 70, 74
-        gx, gy = (W - (13 * cw + 2 * 70)) // 2 + 70, 190
+        gx, gy = (sw - (13 * cw + 2 * 70)) // 2 + 70, 190
         box(s, (gx - 90, gy - 110, 13 * cw + 200, 4 * ch + 150), PANEL, 14, PANEL_HI, 2)
-        text(s, f.big, "Full deck", TEXT, (W // 2, gy - 96), "midtop")
+        text(s, f.big, "Full deck", TEXT, (sw // 2, gy - 96), "midtop")
         text(s, f.small, f"{size - ptr} left to draw of {size}.  Big number: left to draw.  "
-                         f"Small: in the deck.  Click or V to close.", DIM, (W // 2, gy - 56), "midtop")
+                         f"Small: in the deck.  Click or V to close.", DIM, (sw // 2, gy - 56), "midtop")
         ranks = list(range(12, -1, -1))             # A K Q ... 2, as Balatro shows them
         for k, r in enumerate(ranks):
             lbl = "10" if RANK_CHARS[r] == "T" else RANK_CHARS[r]
@@ -897,7 +1091,8 @@ class App:
         for btn in buttons.values():
             btn.draw(s, self.fonts)
         text(s, self.fonts.small, "dev", DIM, (14, 694))
-        self.draw_model_panel()
+        if self.show_model:
+            self.draw_model_panel()
         self.joker_menu.draw(s, self.fonts)        # last, so the open list sits on top
         if self.show_deck:
             self.draw_deck_view()
@@ -907,14 +1102,19 @@ class App:
         while True:
             for e in pygame.event.get():
                 if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE and (
-                        self.joker_menu.open or self.show_deck):
+                        self.joker_menu.open or self.show_deck or self.seed_edit is not None):
                     self.joker_menu.open = self.show_deck = False   # Esc closes popups first
+                    self.seed_edit = None
                     continue
                 if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
                     pygame.quit()
                     return
                 if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                     self.click(e.pos)
+                if e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+                    self.release(e.pos)
+                if e.type == pygame.MOUSEMOTION and self.drag:
+                    self.drag[3] = e.pos
                 if e.type == pygame.MOUSEWHEEL and self.joker_menu.open:
                     self.joker_menu.wheel(e.y)
                 if e.type == pygame.KEYDOWN:

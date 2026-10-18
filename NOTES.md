@@ -47,6 +47,23 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       gui.py model panel: the model's odds for every legal choice + card select odds, Step/Auto,
       greedy/sampled (--params, --scale).
       OPEN: PPO (several epochs per rollout) if A2C is too sample-hungry; eval at scale 1.0.
+- [x] joker table 4 -> 39 (2026-10-17) — all pure rows: hand-type +Mult/+Chips (Jolly..Crafty), Half,
+      suit/rank/face per-card (Lusty..Onyx Agate, Fibonacci), queries (Banner, Mystic Summit, Blue,
+      Abstract, Bull, Stencil), Popcorn counter, Golden/Cloud 9 money, The Duo..Tribe XMULT.
+      Engine: C_HAND_HAS = CONTAINS (scoring.CONTAINS table; 4oak has Pair + 3oak, not Two Pair),
+      C_COUNT_CMP gate (joker_score takes `valid`), ONCE_MAIN XMULT in slot order (closed form, no
+      scan), END_OF_ROUND E_ADD_MONEY paid in the cashout (env.joker_money), 5 new query kinds.
+      OBS_DIM 836 -> 2096 (32 x 39 loadout one-hot): old params do not load; retrain fresh.
+      NOT YET: random rolls (Misprint, Business Card, Gros Michel), two-effect rows (Scholar, Walkie
+      Talkie), held cards, retriggers, PER_SCORED XMULT, Baseball Card (power, not product).
+- [x] MOVE_JOKER + MOVE_CARD verbs (2026-10-17) — target t swaps joker slots / hand lanes t and t+1.
+      MOVE_JOKER: value, state, sell value move with the joker; BLIND + SHOP. MOVE_CARD: BLIND only;
+      one of the two lanes may be a hole (empty deck), so a card can step across it. Both free.
+      Lane order is the play order (XMULT order for jokers; Death / play-order jokers later).
+      N_ACTIONS 40 -> 102 (A_MOVE_JOKER + 31, A_MOVE_CARD + 31): old params do not load.
+      train logs move_frac (joker + card moves; watch for free-swap step waste).
+      GUI: the hand shows lane order; drag a card or a joker; Sort Rank / Suit = MOVE_CARD steps
+      (once per press, not sticky: new cards land in the lanes the played cards left).
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 

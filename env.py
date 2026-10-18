@@ -27,7 +27,9 @@ from jax import jit
 from typing import NamedTuple
 from scoring import scoreHand, joker_score
 from jokers import MAX_JOKERS, J_EMPTY, N_JOKERS, JOKERS, JOKER_COST, JOKER_RARITY, JOKER_ID
-from jokers import N_QUERY_KINDS, Q_MONEY_DIV_5, Q_EMPTY_JOKER_SLOTS
+from jokers import (N_QUERY_KINDS, Q_MONEY_DIV_5, Q_EMPTY_JOKER_SLOTS, Q_DECK_NINE_COUNT,
+                    Q_DISCARDS_LEFT, Q_NO_DISCARDS_LEFT, Q_DECK_LEFT, Q_JOKER_COUNT, Q_MONEY,
+                    J_STENCIL, E_ADD_MONEY)
 from jokers import COMMON, UNCOMMON, RARE, LEGENDARY
 from jokers import rows_for, resolve, update
 from jokers import T_ONCE_MAIN, T_ON_DISCARD, T_END_OF_ROUND, T_ON_BLIND_SELECT, T_ON_SOLD
@@ -46,9 +48,11 @@ V_BUY     = 2   # target = shop slot
 V_SELL    = 3   # target = joker slot; legal in the blind AND the shop
 V_REROLL  = 4
 V_NEXT    = 5   # leave the shop, start the next blind
-N_VERBS   = 6
-V_NOOP    = 6   # internal: the repair target of every illegal action
-VERB_NAMES = ["PLAY", "DISCARD", "BUY", "SELL", "REROLL", "NEXT"]
+V_MOVE_JOKER = 6  # target = joker slot t: swap slots t and t+1 (joker order sets XMULT order)
+V_MOVE_CARD  = 7  # target = hand lane t: swap lanes t and t+1 (lane order = play order, Death)
+N_VERBS   = 8
+V_NOOP    = 8   # internal: the repair target of every illegal action
+VERB_NAMES = ["PLAY", "DISCARD", "BUY", "SELL", "REROLL", "NEXT", "MOVE_JOKER", "MOVE_CARD"]
 
 # --- stages ------------------------------------------------------------------
 STAGE_BLIND = 0
@@ -59,11 +63,11 @@ STAGE_NAMES = ["BLIND", "SHOP", "LOST", "WON"]
 
 # LEGAL[stage, verb]: which verbs each stage accepts. Everything else is a no-op.
 LEGAL = jnp.array([
-    #  PLAY   DISC   BUY    SELL   REROLL NEXT
-    [True,  True,  False, True,  False, False],   # BLIND
-    [False, False, True,  True,  True,  True ],   # SHOP
-    [False, False, False, False, False, False],   # LOST
-    [False, False, False, False, False, False],   # WON
+    #  PLAY   DISC   BUY    SELL   REROLL NEXT   MOVE_J MOVE_C
+    [True,  True,  False, True,  False, False, True,  True ],   # BLIND
+    [False, False, True,  True,  True,  True,  True,  False],   # SHOP
+    [False, False, False, False, False, False, False, False],   # LOST
+    [False, False, False, False, False, False, False, False],   # WON
 ])
 
 # --- blinds (white stake) ----------------------------------------------------
@@ -168,9 +172,19 @@ def blind_target(ante, blind_index, scale=1.0):
 
 def build_ctx(state) -> jax.Array:
     held = (state.jokers != J_EMPTY).sum()
+    stencils = (state.jokers == J_STENCIL).sum()
+    pos = jnp.arange(MAX_DECK_SIZE)
+    in_deck = (pos < state.deck_size) & (state.deck >= 0) & (state.deck < 52)
     return (jnp.zeros(N_QUERY_KINDS, jnp.float32)
     .at[Q_MONEY_DIV_5].set(state.money // 5)
-    .at[Q_EMPTY_JOKER_SLOTS].set(jnp.maximum(state.joker_slots - held, 0))
+    # a held Stencil counts as an empty slot ("Joker Stencil included")
+    .at[Q_EMPTY_JOKER_SLOTS].set(jnp.maximum(state.joker_slots - held + stencils, 0))
+    .at[Q_DECK_NINE_COUNT].set((in_deck & (state.deck % 13 == 7)).sum())
+    .at[Q_DISCARDS_LEFT].set(jnp.maximum(state.discards, 0))
+    .at[Q_NO_DISCARDS_LEFT].set(state.discards <= 0)
+    .at[Q_DECK_LEFT].set(jnp.maximum(state.deck_size - state.deck_ptr, 0))
+    .at[Q_JOKER_COUNT].set(held)
+    .at[Q_MONEY].set(jnp.maximum(state.money, 0))
     )
 
 
@@ -187,7 +201,7 @@ def score_play(state: balatroEnvState, select, joker_value) -> PlayResult:
     handtype, mask, base_chips, base_mult = scoreHand(rank, suit, valid)
     rows, active, ctx = _jokers(state)
     v = resolve(rows, active, joker_value=joker_value, ctx=ctx)
-    chips, mult = joker_score(base_chips, base_mult, handtype, rank, suit, mask, rows, active, v)
+    chips, mult = joker_score(base_chips, base_mult, handtype, rank, suit, valid, mask, rows, active, v)
     score = jnp.floor(chips * mult).astype(jnp.int32)
     return PlayResult(handtype, sel, cards, valid, mask, base_chips, base_mult, chips, mult, score)
 
@@ -218,6 +232,8 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
       - a verb the current stage does not accept    -> no-op
       - DISCARD with 0 discards left                -> PLAY
       - BUY / SELL with a bad target, too little $, or no free slot -> no-op
+      - MOVE_JOKER unless slots t and t+1 both hold a joker -> no-op
+      - MOVE_CARD unless t+1 < hand_size and lane t or t+1 holds a card -> no-op
       - more than 5 cards selected                  -> the first 5 valid lanes
     """
     verb = action.verb.astype(jnp.int32)
@@ -273,7 +289,8 @@ def _clear_blind(state: balatroEnvState) -> balatroEnvState:
 
     # interest is paid on the money held BEFORE this cashout
     interest = jnp.minimum(state.money // INTEREST_PER, INTEREST_CAP)
-    cashout = BLIND_REWARD[state.blind_index] + state.hands + interest
+    cashout = (BLIND_REWARD[state.blind_index] + state.hands + interest
+               + joker_money(state, joker_value))
 
     won = (state.blind_index == BLIND_BOSS) & (state.ante >= WIN_ANTE)
     key, sub = jax.random.split(state.key)
@@ -287,6 +304,14 @@ def _clear_blind(state: balatroEnvState) -> balatroEnvState:
         reroll_cost=jnp.int32(REROLL_BASE),
         key=key,
     )
+
+
+def joker_money(state: balatroEnvState, joker_value) -> jax.Array:
+    """$ the held END_OF_ROUND money jokers pay into the cashout (Golden Joker, Cloud 9)."""
+    rows, active, ctx = _jokers(state)
+    v = resolve(rows, active, joker_value, ctx)
+    pays = active & (rows.TRIGGER == T_END_OF_ROUND) & (rows.EFFECT == E_ADD_MONEY)
+    return jnp.floor(jnp.where(pays, v, 0.0).sum()).astype(jnp.int32)
 
 
 def acquire(state: balatroEnvState, jid) -> tuple[balatroEnvState, jax.Array]:
@@ -387,12 +412,42 @@ def _next(state: balatroEnvState, action: balatroAction):
     return nxt, jnp.int32(0), jnp.bool_(False)
 
 
+def _move_joker(state: balatroEnvState, action: balatroAction):
+    """Swap joker slots t and t+1. Every per-slot array moves with its joker."""
+    t = action.target
+    slot = jnp.clip(t, 0, MAX_JOKERS - 2)
+    ok = ((t >= 0) & (t < MAX_JOKERS - 1)
+          & (state.jokers[slot] != J_EMPTY) & (state.jokers[slot + 1] != J_EMPTY))
+    i = jnp.arange(MAX_JOKERS)
+    perm = jnp.where(i == slot, slot + 1, jnp.where(i == slot + 1, slot, i))
+    moved = state._replace(
+        jokers=state.jokers[perm],
+        joker_value=state.joker_value[perm],
+        joker_state=state.joker_state[perm],
+        joker_sell_value=state.joker_sell_value[perm],
+    )
+    return tree_where(ok, moved, state), jnp.int32(0), jnp.bool_(False)
+
+
+def _move_card(state: balatroEnvState, action: balatroAction):
+    """Swap hand lanes t and t+1. One lane may be a hole (an empty deck leaves
+    holes), so a card can step across it."""
+    t = action.target
+    lane = jnp.clip(t, 0, MAX_HAND_SIZE - 2)
+    ok = ((t >= 0) & (t + 1 < state.hand_size)
+          & (state.hand_valid[lane] | state.hand_valid[lane + 1]))
+    i = jnp.arange(MAX_HAND_SIZE)
+    perm = jnp.where(i == lane, lane + 1, jnp.where(i == lane + 1, lane, i))
+    moved = state._replace(hand=state.hand[perm], hand_valid=state.hand_valid[perm])
+    return tree_where(ok, moved, state), jnp.int32(0), jnp.bool_(False)
+
+
 def _noop(state: balatroEnvState, action: balatroAction):
     return _no_change(state)
 
 
 # index = verb; the last entry is V_NOOP
-_HANDLERS = [_blind_action, _blind_action, _buy, _sell, _reroll, _next, _noop]
+_HANDLERS = [_blind_action, _blind_action, _buy, _sell, _reroll, _next, _move_joker, _move_card, _noop]
 
 
 def roll_shop(key, held, shop_size):

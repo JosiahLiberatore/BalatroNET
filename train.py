@@ -26,7 +26,7 @@ import jax.numpy as jnp
 
 from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP
 from agent import (init_params, act, masked_logits, log_prob_entropy, OBS_DIM,
-                   A_BUY, A_SELL, A_REROLL, N_ACTIONS)
+                   A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, N_ACTIONS)
 
 # --- config -----------------------------------------------------------------------
 N_ENVS        = 1024
@@ -74,7 +74,8 @@ def env_step_auto(params, state, ret, buys, steps, key, scale):
                 "won": nxt.game_stage == STAGE_WON, "buys": buys, "steps": steps,
                 "cleared": reward > 0, "failed": done & (nxt.game_stage == STAGE_LOST),
                 "in_shop": state.game_stage == STAGE_SHOP,
-                "sell": (a >= A_SELL) & (a < A_REROLL), "reroll": a == A_REROLL}
+                "sell": (a >= A_SELL) & (a < A_MOVE_JOKER), "move": (a >= A_MOVE_JOKER) & (a < A_REROLL),   # joker + card moves
+                "reroll": a == A_REROLL}
     fresh = reset(k_reset, DECK, HAND, scale)
     nxt = tree_where(done, fresh, nxt)
     keep = ~done
@@ -166,6 +167,7 @@ def train_step(params, m, v, t, carry, key, scale):
         "clear_rate": n_cleared / jnp.maximum(n_cleared + n_failed, 1),
         "shop_step_frac": fin["in_shop"].mean(),
         "sell_frac": fin["sell"].mean(),
+        "move_frac": fin["move"].mean(),
         "reroll_frac": fin["reroll"].mean(),
     }
     return params, m, v, t, carry, metrics

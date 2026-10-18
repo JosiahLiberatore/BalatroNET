@@ -10,8 +10,8 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 
-from jokers import (Joker, C_NONE, C_SUIT, C_RANK_IN, C_IS_FACE, C_HAND_HAS,
-                    T_PER_SCORED, T_ONCE_MAIN, E_ADD_MULT, E_ADD_CHIPS)
+from jokers import (Joker, C_NONE, C_SUIT, C_RANK_IN, C_IS_FACE, C_HAND_HAS, C_COUNT_CMP,
+                    T_PER_SCORED, T_ONCE_MAIN, E_ADD_MULT, E_ADD_CHIPS, E_XMULT)
 
 # which candidate mask each hand type uses: 0=all, 1=groups, 2=high
 MASK_CHOICE = jnp.array([0, 1, 0, 0, 0, 1, 1, 1, 2])
@@ -26,6 +26,22 @@ BASE_CARD_CHIPS = jnp.array([2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11])
 # index i = position i in the argmax flag array above — keep the two in sync
 HAND_NAMES = ["straight_flush", "four_kind", "full_house", "flush", "straight",
               "three_kind", "two_pair", "pair", "high_card"]
+
+# CONTAINS[played, wanted]: does a played hand of type `played` contain a
+# `wanted`? C_HAND_HAS reads this, not ==, so a Full House fires Jolly Joker
+# (Pair), Zany Joker (Three of a Kind) and Mad Joker (Two Pair).
+# Four of a Kind contains a Pair and a Three of a Kind, but not a Two Pair.
+#                        SF 4oak full flush strt 3oak 2pair pair high
+CONTAINS = jnp.array([[1,  0,   0,   1,   1,   0,   0,   0,   1],    # straight_flush
+                      [0,  1,   0,   0,   0,   1,   0,   1,   1],    # four_kind
+                      [0,  0,   1,   0,   0,   1,   1,   1,   1],    # full_house
+                      [0,  0,   0,   1,   0,   0,   0,   0,   1],    # flush
+                      [0,  0,   0,   0,   1,   0,   0,   0,   1],    # straight
+                      [0,  0,   0,   0,   0,   1,   0,   1,   1],    # three_kind
+                      [0,  0,   0,   0,   0,   0,   1,   1,   1],    # two_pair
+                      [0,  0,   0,   0,   0,   0,   0,   1,   1],    # pair
+                      [0,  0,   0,   0,   0,   0,   0,   0,   1]],   # high_card
+                     bool)
 
 
 @jit
@@ -80,18 +96,25 @@ def scoreHand(rank, suit, valid):
 # where v comes from jokers.resolve() and fires is how many times the row
 # triggers this hand.
 #
+# Order: every PER_SCORED add first (stage 4), then the ONCE_MAIN rows in SLOT
+# order (stage 6). In stage 6 an add and an XMULT do not commute —
+# (4+4)*3 != (4*3)+4 — so slot j's add is multiplied by every XMULT in a
+# later slot:
+#     mult = m0 * prod(x) + sum_j add_j * prod_{k>j} x_k
+# x_k is 1 for every slot that is not a firing XMULT row.
+#
 # NOT SUPPORTED YET, by design:
-#   T_PER_HELD  needs the held cards, which this function does not receive.
-#   E_XMULT     needs the ordered scan — (4+4)*3 != (4*3)+4 — so it cannot be
-#               a masked sum. The scan arrives with the first XMULT joker.
+#   T_PER_HELD          needs the held cards, which this function does not receive.
+#   PER_SCORED E_XMULT  needs a (card x joker) scan in trigger order.
 # Rows using either contribute nothing instead of contributing something wrong.
 
-def joker_score(chips, mult, handtype, rank, suit, scoring_mask, rows: Joker, active, v):
+def joker_score(chips, mult, handtype, rank, suit, valid, scoring_mask, rows: Joker, active, v):
     """Add the held jokers' contribution. -> (chips, mult) as float32.
 
     chips, mult  : scalars              -- the base values from scoreHand
     handtype     : scalar int32         -- index into HAND_NAMES
     rank, suit   : (5,) int32           -- the played cards
+    valid        : (5,) bool            -- which lanes hold a played card
     scoring_mask : (5,) bool            -- which played cards score
     rows         : Joker, (MAX_JOKERS,) -- jokers.rows_for(ids), slot order
     active       : (MAX_JOKERS,) bool   -- ids != J_EMPTY
@@ -114,18 +137,34 @@ def joker_score(chips, mult, handtype, rank, suit, scoring_mask, rows: Joker, ac
         default=bc(False))
 
     # GATE conditions: is slot j on at all for this hand?
+    n_played = valid.astype(jnp.int32).sum()
     gate = jnp.select(
-        [rows.CONDITION == C_NONE, rows.CONDITION == C_HAND_HAS],
-        [jnp.ones(n_slots, bool), handtype == rows.COND_PARAM],
+        [rows.CONDITION == C_NONE, rows.CONDITION == C_HAND_HAS,
+         rows.CONDITION == C_COUNT_CMP],
+        [jnp.ones(n_slots, bool),
+         CONTAINS[handtype, jnp.clip(rows.COND_PARAM, 0, len(HAND_NAMES) - 1)],
+         n_played <= rows.COND_PARAM],
         default=jnp.zeros(n_slots, bool))
 
+    per_scored = rows.TRIGGER == T_PER_SCORED
+    once_main = rows.TRIGGER == T_ONCE_MAIN
     fires = jnp.select(
-        [rows.TRIGGER == T_PER_SCORED, rows.TRIGGER == T_ONCE_MAIN],
+        [per_scored, once_main],
         [(match & scoring_mask[None, :]).sum(axis=1), gate.astype(jnp.int32)],
         default=jnp.zeros(n_slots, jnp.int32))
     fires = jnp.where(active, fires, 0).astype(jnp.float32)
 
     contrib = v * fires
-    chips = chips + jnp.where(rows.EFFECT == E_ADD_CHIPS, contrib, 0.0).sum()
-    mult  = mult  + jnp.where(rows.EFFECT == E_ADD_MULT,  contrib, 0.0).sum()
+    add_chips = jnp.where(rows.EFFECT == E_ADD_CHIPS, contrib, 0.0)
+    add_mult = jnp.where(rows.EFFECT == E_ADD_MULT, contrib, 0.0)
+
+    # stage 4: the PER_SCORED adds
+    chips = chips + jnp.where(per_scored, add_chips, 0.0).sum()
+    mult = mult + jnp.where(per_scored, add_mult, 0.0).sum()
+
+    # stage 6: the ONCE_MAIN rows in slot order. Chips only add.
+    chips = chips + jnp.where(once_main, add_chips, 0.0).sum()
+    x = jnp.where(once_main & (rows.EFFECT == E_XMULT) & (fires > 0), v, 1.0)
+    after = jnp.concatenate([jnp.cumprod(x[::-1])[::-1][1:], jnp.ones(1)])   # prod_{k>j} x_k
+    mult = mult * jnp.prod(x) + (jnp.where(once_main, add_mult, 0.0) * after).sum()
     return chips, mult

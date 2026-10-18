@@ -25,24 +25,28 @@ import jax.numpy as jnp
 
 from env import (balatroAction, balatroEnvState, build_ctx, MAX_HAND_SIZE, MAX_DECK_SIZE,
                  MAX_SHOP_SLOTS, STAGE_BLIND, STAGE_SHOP, V_PLAY, V_DISCARD, V_BUY, V_SELL,
-                 V_REROLL, V_NEXT, WIN_ANTE)
+                 V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, WIN_ANTE)
 from jokers import MAX_JOKERS, N_JOKERS, J_EMPTY, JOKER_COST, rows_for, resolve
 
 # --- action layout ------------------------------------------------------------
 A_PLAY, A_DISCARD = 0, 1
 A_BUY = 2                                   # + shop slot
 A_SELL = A_BUY + MAX_SHOP_SLOTS             # + joker slot
-A_REROLL = A_SELL + MAX_JOKERS
+A_MOVE_JOKER = A_SELL + MAX_JOKERS          # + joker slot t: swap t and t+1
+A_MOVE_CARD = A_MOVE_JOKER + MAX_JOKERS - 1  # + hand lane t: swap t and t+1
+A_REROLL = A_MOVE_CARD + MAX_HAND_SIZE - 1
 A_NEXT = A_REROLL + 1
-N_ACTIONS = A_NEXT + 1                      # 40
+N_ACTIONS = A_NEXT + 1                      # 102
 
 _idx = jnp.arange(N_ACTIONS)
 ACTION_VERB = jnp.select(
-    [_idx == A_PLAY, _idx == A_DISCARD, _idx < A_SELL, _idx < A_REROLL, _idx == A_REROLL],
-    [V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL], V_NEXT).astype(jnp.int32)
+    [_idx == A_PLAY, _idx == A_DISCARD, _idx < A_SELL, _idx < A_MOVE_JOKER, _idx < A_MOVE_CARD,
+     _idx < A_REROLL, _idx == A_REROLL],
+    [V_PLAY, V_DISCARD, V_BUY, V_SELL, V_MOVE_JOKER, V_MOVE_CARD, V_REROLL], V_NEXT).astype(jnp.int32)
 ACTION_TARGET = jnp.select(
-    [(_idx >= A_BUY) & (_idx < A_SELL), (_idx >= A_SELL) & (_idx < A_REROLL)],
-    [_idx - A_BUY, _idx - A_SELL], 0).astype(jnp.int32)
+    [(_idx >= A_BUY) & (_idx < A_SELL), (_idx >= A_SELL) & (_idx < A_MOVE_JOKER),
+     (_idx >= A_MOVE_JOKER) & (_idx < A_MOVE_CARD), (_idx >= A_MOVE_CARD) & (_idx < A_REROLL)],
+    [_idx - A_BUY, _idx - A_SELL, _idx - A_MOVE_JOKER, _idx - A_MOVE_CARD], 0).astype(jnp.int32)
 
 
 def action_name(a):
@@ -50,7 +54,9 @@ def action_name(a):
     if a == A_PLAY:    return "PLAY"
     if a == A_DISCARD: return "DISCARD"
     if a < A_SELL:     return f"BUY {a - A_BUY}"
-    if a < A_REROLL:   return f"SELL {a - A_SELL}"
+    if a < A_MOVE_JOKER: return f"SELL {a - A_SELL}"
+    if a < A_MOVE_CARD:  return f"MOVE J{a - A_MOVE_JOKER}<>J{a - A_MOVE_JOKER + 1}"
+    if a < A_REROLL:     return f"MOVE C{a - A_MOVE_CARD}<>C{a - A_MOVE_CARD + 1}"
     return "REROLL" if a == A_REROLL else "NEXT"
 
 
@@ -72,11 +78,17 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
     cost = JOKER_COST[jnp.clip(offer, 0, N_JOKERS - 1)]
     buy = shop & (slots < state.shop_size) & (offer >= 0) & (state.money >= cost) & room
     sell = (blind | shop) & held
+    move = (blind | shop) & held[:-1] & held[1:]
+    lane = jnp.arange(MAX_HAND_SIZE - 1)
+    v = state.hand_valid
+    move_card = blind & (lane + 1 < state.hand_size) & (v[:-1] | v[1:])
 
     legal = jnp.concatenate([
         jnp.stack([blind, blind & (state.discards > 0)]),
         buy,
         sell,
+        move,
+        move_card,
         jnp.stack([shop & (state.money >= state.reroll_cost), shop]),
     ])
     return legal.at[A_NEXT].set(legal[A_NEXT] | ~legal.any())
