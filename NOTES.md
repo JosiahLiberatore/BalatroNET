@@ -64,6 +64,17 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       train logs move_frac (joker + card moves; watch for free-swap step waste).
       GUI: the hand shows lane order; drag a card or a joker; Sort Rank / Suit = MOVE_CARD steps
       (once per press, not sticky: new cards land in the lanes the played cards left).
+- [x] joker test suite tests_jokers.py (2026-10-17) — REF = a second, plain-Python model of every
+      joker (hand detection, card-then-slot scoring order, counters, cashout $); never reads the
+      jokers.py columns. Layers: table (every joker needs a REF row + a spec case), spec (~130
+      hand-computed cases), order (all 120 slot orders of a mix), fuzz (6000 random cases, each
+      scoring joker must change >= 25 scores), life (scripted env_step runs), soak (64 envs x 400
+      steps, every step through the reference transition model; finished runs swap for fresh ones).
+      Mutation check: 5 planted bugs (XMULT order, a suit, Blue off-by-one, counter floor,
+      Popcorn round update) each fail several suites. ~30 s. A new joker = a REF row + spec cases.
+- [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
+      hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
+      fires Green -1. Real Balatro does not allow either. The agent can sample an empty select.
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 

@@ -375,3 +375,6 @@ if __name__ == "__main__":
 
     import tests_run
     tests_run.run_all()
+
+    import tests_jokers
+    tests_jokers.run_all()
