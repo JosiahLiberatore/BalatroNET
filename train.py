@@ -68,7 +68,7 @@ def init_carry(key, scale):
 def env_step_auto(params, state, ret, buys, steps, key, scale):
     """One policy step on one env; a finished run resets in place."""
     k_act, k_reset = jax.random.split(key)
-    action, (a, sel, obs, legal, value, logp) = act(params, state, k_act)
+    action, (a, sel, src, dst, obs, legal, mmask, value, logp) = act(params, state, k_act)
     nxt, reward, done = env_step(state, action)
     reward = reward.astype(jnp.float32)
 
@@ -82,7 +82,8 @@ def env_step_auto(params, state, ret, buys, steps, key, scale):
     fresh = reset(k_reset, DECK, HAND, scale)
     nxt = tree_where(done, fresh, nxt)
     keep = ~done
-    traj = {"obs": obs, "legal": legal, "hand_valid": state.hand_valid, "a": a, "sel": sel,
+    traj = {"obs": obs, "legal": legal, "hand_valid": state.hand_valid, "mmask": mmask,
+            "a": a, "sel": sel, "src": src, "dst": dst,
             "reward": reward * REWARD_SCALE, "done": done, "value": value}
     return nxt, ret * keep, buys * keep, steps * keep, traj, finished
 
@@ -96,7 +97,7 @@ def rollout(params, carry, key, scale):
         return {"state": s, "ret": ret, "buys": buys, "steps": steps}, (traj, fin)
 
     carry, (traj, fin) = jax.lax.scan(step, carry, jax.random.split(key, T))
-    _, (_, _, _, _, last_value, _) = jax.vmap(act, in_axes=(None, 0, 0))(
+    _, (*_, last_value, _) = jax.vmap(act, in_axes=(None, 0, 0))(
         params, carry["state"], jax.random.split(key, N_ENVS))
     return carry, traj, fin, last_value
 
@@ -117,10 +118,11 @@ def gae(reward, value, done, last_value):
 
 # --- update -----------------------------------------------------------------------
 def loss_fn(params, batch):
-    a_logits, s_logits, value = jax.vmap(masked_logits, in_axes=(None, 0, 0, 0))(
-        params, batch["obs"], batch["legal"], batch["hand_valid"])
-    logp, ent = jax.vmap(log_prob_entropy)(a_logits, s_logits, batch["a"], batch["sel"],
-                                           batch["hand_valid"])
+    hd = jax.vmap(masked_logits, in_axes=(None, 0, 0, 0, 0, 0))(
+        params, batch["obs"], batch["legal"], batch["hand_valid"], batch["mmask"], batch["src"])
+    logp, ent = jax.vmap(log_prob_entropy)(hd, batch["a"], batch["sel"], batch["src"],
+                                           batch["dst"], batch["hand_valid"])
+    value = hd.value
     adv = batch["adv"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     pg_loss = -(logp * adv).mean()
@@ -135,7 +137,7 @@ def train_step(params, m, v, t, carry, key, scale):
     carry, traj, fin, last_value = rollout(params, carry, key, scale)
     adv, ret = gae(traj["reward"], traj["value"], traj["done"], last_value)
     flat = lambda x: x.reshape((T * N_ENVS,) + x.shape[2:])
-    batch = {k: flat(traj[k]) for k in ("obs", "legal", "hand_valid", "a", "sel")}
+    batch = {k: flat(traj[k]) for k in ("obs", "legal", "hand_valid", "mmask", "a", "sel", "src", "dst")}
     batch["adv"], batch["ret"] = flat(adv), flat(ret)
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
@@ -295,7 +297,7 @@ if __name__ == "__main__":
                 print(f"step {step:5d}  $/run {metrics['run_return']:6.1f}  ante {metrics['run_ante']:4.2f}  "
                       f"win {metrics['win_rate']:5.1%}  clear {clear_ema:5.1%}  scale {scale:.3f}  "
                       f"buys {metrics['run_buys']:4.1f}  ent {metrics['entropy']:5.2f}  "
-                      f"ev {metrics['explained_var']:5.2f}  {rate / 1e3:5.0f}k st/s")
+                      f"ev {metrics['explained_var']:5.2f}  move {metrics['move_frac']:4.0%}  {rate / 1e3:5.0f}k st/s")
             if completed % CKPT_EVERY == 0:
                 save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum)
                 save_params(params)

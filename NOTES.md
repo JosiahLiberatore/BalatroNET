@@ -56,7 +56,7 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       OBS_DIM 836 -> 2096 (32 x 39 loadout one-hot): old params do not load; retrain fresh.
       NOT YET: random rolls (Misprint, Business Card, Gros Michel), two-effect rows (Scholar, Walkie
       Talkie), held cards, retriggers, PER_SCORED XMULT, Baseball Card (power, not product).
-- [x] MOVE_JOKER + MOVE_CARD verbs (2026-10-17) — target t swaps joker slots / hand lanes t and t+1.
+- [x] MOVE_JOKER + MOVE_CARD verbs (2026-10-17; REPLACED 2026-10-18 by INSERT moves, below) — target t swaps joker slots / hand lanes t and t+1.
       MOVE_JOKER: value, state, sell value move with the joker; BLIND + SHOP. MOVE_CARD: BLIND only;
       one of the two lanes may be a hole (empty deck), so a card can step across it. Both free.
       Lane order is the play order (XMULT order for jokers; Death / play-order jokers later).
@@ -79,6 +79,16 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       That policy spent 60% of its steps on free MOVEs -> the two changes below.
       Node: C:\Users\Josiah\.wslconfig vmIdleTimeout=-1 + instanceIdleTimeout=-1, else WSL stops
       the VM (and tmux) minutes after the last SSH client exits.
+- [x] MOVE = INSERT with pointer heads (2026-10-18) — balatroAction.dest added. MOVE_JOKER /
+      MOVE_CARD take the item at target and insert it at dest (env.insert_perm; the items between
+      shift; Balatro's drag). Legal: target != dest; jokers both < held; cards both < hand_size and
+      a card at target (holes shift like cards). Any order needs <= n - 1 moves (was n(n-1)/2
+      neighbour swaps). agent: N_ACTIONS 102 -> 42 (one verb each); pointer heads Wm (src + dst
+      for jokers and cards, 4 x 32) + Pm (dst bias given src, [kind, src, dst]); act samples src,
+      then dst given src; move_masks / dst_mask mask empty slots and src. Old params do not load.
+      GUI: one drag = one MOVE step; Sort = inserts (<= hand_size - 1 steps).
+      tests: tests_run move tests, move-reach (random orders in <= n - 1), legal-mask checks every
+      (src, dst) pair; tests_jokers reference model inserts.
 - [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
       hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
       fires Green -1. Real Balatro does not allow either. The agent can sample an empty select.

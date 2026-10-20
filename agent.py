@@ -3,22 +3,29 @@
 ACTION LAYOUT — one flat categorical over every atomic choice (NOTES: "KEEP the
 flat masked action vector ... one head, one policy, phase-masked"):
 
-    index   0                PLAY      (+ the 32 select lanes)
-            1                DISCARD   (+ the 32 select lanes)
+    index   0                PLAY        (+ the 32 select lanes)
+            1                DISCARD     (+ the 32 select lanes)
             2 .. 5           BUY shop slot 0..3
             6 .. 37          SELL joker slot 0..31
-            38               REROLL
-            39               NEXT
+            38               MOVE_JOKER  (+ the joker src / dst pointer heads)
+            39               MOVE_CARD   (+ the card src / dst pointer heads)
+            40               REROLL
+            41               NEXT
 
-plus 32 independent Bernoulli select lanes, read only by PLAY / DISCARD (their
-log-prob counts only on those steps). legal_mask() masks every choice the env
-would turn into a no-op, so the policy never spends a step on one.
+plus 32 independent Bernoulli select lanes, read only by PLAY / DISCARD, and
+two pointer pairs (src over 32 slots, then dst over 32 slots given src), read
+only by the MOVE verbs (their log-probs count only on those steps). A MOVE
+INSERTS the item at src at position dst. legal_mask() and move_masks() mask
+every choice the env would turn into a no-op, so the policy never spends a
+step on one; dst also masks src itself.
 
 OBS LAYOUT — a union of DISJOINT blocks (NOTES: "obs layout"):
     SHARED      money, ante, blind, stage, curriculum scale, joker loadout
     BLIND-ONLY  hand ranks/suits, hands/discards left, chips vs target, undealt mask  (0 in the shop)
     SHOP-ONLY   shop offers, costs, affordability, reroll cost                        (0 in a blind)
 """
+
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -32,31 +39,37 @@ from jokers import MAX_JOKERS, N_JOKERS, J_EMPTY, JOKER_COST, rows_for, resolve
 A_PLAY, A_DISCARD = 0, 1
 A_BUY = 2                                   # + shop slot
 A_SELL = A_BUY + MAX_SHOP_SLOTS             # + joker slot
-A_MOVE_JOKER = A_SELL + MAX_JOKERS          # + joker slot t: swap t and t+1
-A_MOVE_CARD = A_MOVE_JOKER + MAX_JOKERS - 1  # + hand lane t: swap t and t+1
-A_REROLL = A_MOVE_CARD + MAX_HAND_SIZE - 1
+A_MOVE_JOKER = A_SELL + MAX_JOKERS          # src / dst from the joker pointer heads
+A_MOVE_CARD = A_MOVE_JOKER + 1              # src / dst from the card pointer heads
+A_REROLL = A_MOVE_CARD + 1
 A_NEXT = A_REROLL + 1
-N_ACTIONS = A_NEXT + 1                      # 102
+N_ACTIONS = A_NEXT + 1                      # 42
+N_PTR = MAX_JOKERS                          # pointer width; MAX_JOKERS == MAX_HAND_SIZE == 32
+assert MAX_HAND_SIZE == N_PTR
 
 _idx = jnp.arange(N_ACTIONS)
 ACTION_VERB = jnp.select(
-    [_idx == A_PLAY, _idx == A_DISCARD, _idx < A_SELL, _idx < A_MOVE_JOKER, _idx < A_MOVE_CARD,
-     _idx < A_REROLL, _idx == A_REROLL],
+    [_idx == A_PLAY, _idx == A_DISCARD, _idx < A_SELL, _idx < A_MOVE_JOKER, _idx == A_MOVE_JOKER,
+     _idx == A_MOVE_CARD, _idx == A_REROLL],
     [V_PLAY, V_DISCARD, V_BUY, V_SELL, V_MOVE_JOKER, V_MOVE_CARD, V_REROLL], V_NEXT).astype(jnp.int32)
 ACTION_TARGET = jnp.select(
-    [(_idx >= A_BUY) & (_idx < A_SELL), (_idx >= A_SELL) & (_idx < A_MOVE_JOKER),
-     (_idx >= A_MOVE_JOKER) & (_idx < A_MOVE_CARD), (_idx >= A_MOVE_CARD) & (_idx < A_REROLL)],
-    [_idx - A_BUY, _idx - A_SELL, _idx - A_MOVE_JOKER, _idx - A_MOVE_CARD], 0).astype(jnp.int32)
+    [(_idx >= A_BUY) & (_idx < A_SELL), (_idx >= A_SELL) & (_idx < A_MOVE_JOKER)],
+    [_idx - A_BUY, _idx - A_SELL], 0).astype(jnp.int32)
 
 
-def action_name(a):
+def is_move(a):
+    return (a == A_MOVE_JOKER) | (a == A_MOVE_CARD)
+
+
+def action_name(a, src=None, dst=None):
     a = int(a)
     if a == A_PLAY:    return "PLAY"
     if a == A_DISCARD: return "DISCARD"
     if a < A_SELL:     return f"BUY {a - A_BUY}"
     if a < A_MOVE_JOKER: return f"SELL {a - A_SELL}"
-    if a < A_MOVE_CARD:  return f"MOVE J{a - A_MOVE_JOKER}<>J{a - A_MOVE_JOKER + 1}"
-    if a < A_REROLL:     return f"MOVE C{a - A_MOVE_CARD}<>C{a - A_MOVE_CARD + 1}"
+    if a in (A_MOVE_JOKER, A_MOVE_CARD):
+        k = "J" if a == A_MOVE_JOKER else "C"
+        return f"MOVE {k}" if src is None else f"MOVE {k}{int(src)}->{k}{int(dst)}"
     return "REROLL" if a == A_REROLL else "NEXT"
 
 
@@ -78,20 +91,33 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
     cost = JOKER_COST[jnp.clip(offer, 0, N_JOKERS - 1)]
     buy = shop & (slots < state.shop_size) & (offer >= 0) & (state.money >= cost) & room
     sell = (blind | shop) & held
-    move = (blind | shop) & held[:-1] & held[1:]
-    lane = jnp.arange(MAX_HAND_SIZE - 1)
-    v = state.hand_valid
-    move_card = blind & (lane + 1 < state.hand_size) & (v[:-1] | v[1:])
+    move = (blind | shop) & (held.sum() >= 2)
+    move_card = blind & (state.hand_size >= 2) & state.hand_valid.any()
 
     legal = jnp.concatenate([
         jnp.stack([blind, blind & (state.discards > 0)]),
         buy,
         sell,
-        move,
-        move_card,
+        jnp.stack([move, move_card]),
         jnp.stack([shop & (state.money >= state.reroll_cost), shop]),
     ])
     return legal.at[A_NEXT].set(legal[A_NEXT] | ~legal.any())
+
+
+def move_masks(state: balatroEnvState) -> jax.Array:
+    """(4, N_PTR) bool — rows: joker src, joker dst, card src, card dst.
+
+    The dst rows are the slots a move may END at; dst_mask() also removes src.
+    Joker: any held slot (held jokers are packed). Card: src must hold a card,
+    dst is any lane < hand_size (holes shift like cards).
+    """
+    held = state.jokers != J_EMPTY
+    lanes = jnp.arange(N_PTR) < state.hand_size
+    return jnp.stack([held, held, state.hand_valid & lanes, lanes])
+
+
+def dst_mask(base, src):
+    return base & (jnp.arange(N_PTR) != src)
 
 
 # --- observation ----------------------------------------------------------------
@@ -155,24 +181,42 @@ HIDDEN = 256
 
 def init_params(key, obs_dim=None):
     obs_dim = obs_dim or OBS_DIM
-    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+    k1, k2, k3, k4, k5, k6, k7 = jax.random.split(key, 7)
     def dense(k, n_in, n_out, scale):
         return jax.random.normal(k, (n_in, n_out)) * scale / jnp.sqrt(n_in), jnp.zeros(n_out)
     W1, b1 = dense(k1, obs_dim, HIDDEN, 1.0)
     W2, b2 = dense(k2, HIDDEN, HIDDEN, 1.0)
     Wa, ba = dense(k3, HIDDEN, N_ACTIONS, 0.01)      # small: start near-uniform
     Ws, bs = dense(k4, HIDDEN, MAX_HAND_SIZE, 0.01)
+    Wm, bm = dense(k6, HIDDEN, 4 * N_PTR, 0.01)      # joker src, joker dst, card src, card dst
+    Pm = jax.random.normal(k7, (2, N_PTR, N_PTR)) * 0.01   # dst bias given src: [kind, src, dst]
     Wv, bv = dense(k5, HIDDEN, 1, 1.0)
     return {"W1": W1, "b1": b1, "W2": W2, "b2": b2,
-            "Wa": Wa, "ba": ba, "Ws": Ws, "bs": bs, "Wv": Wv, "bv": bv}
+            "Wa": Wa, "ba": ba, "Ws": Ws, "bs": bs, "Wm": Wm, "bm": bm, "Pm": Pm,
+            "Wv": Wv, "bv": bv}
 
 
-def policy(params, obs):
-    """obs -> (action_logits (40,), select_logits (32,), value ())"""
+class Heads(NamedTuple):
+    """Masked logits of one state. ptr rows: joker src, joker dst | src, card src, card dst | src."""
+    a     : jax.Array   # (N_ACTIONS,)
+    s     : jax.Array   # (MAX_HAND_SIZE,)
+    ptr   : jax.Array   # (4, N_PTR)
+    value : jax.Array   # ()
+
+
+def policy(params, obs, src):
+    """obs -> raw (action (42,), select (32,), pointer (4, 32), value ()).
+    The two dst rows are conditioned on src (the joker src for row 1, the card
+    src for row 3; one src serves both, only the verb's own pair is read)."""
     h = jnp.tanh(obs @ params["W1"] + params["b1"])
     h = jnp.tanh(h @ params["W2"] + params["b2"])
+    ptr = (h @ params["Wm"] + params["bm"]).reshape(4, N_PTR)
+    s = jnp.clip(src, 0, N_PTR - 1)
+    Pm = jnp.asarray(params["Pm"])   # loaded params are numpy; a traced index needs a jax array
+    ptr = ptr.at[1].add(Pm[0, s]).at[3].add(Pm[1, s])
     return (h @ params["Wa"] + params["ba"],
             h @ params["Ws"] + params["bs"],
+            ptr,
             (h @ params["Wv"] + params["bv"])[0])
 
 
@@ -181,41 +225,82 @@ def policy(params, obs):
 MASKED = -1e9
 
 
-def masked_logits(params, obs, legal, hand_valid):
-    a_logits, s_logits, value = policy(params, obs)
-    return jnp.where(legal, a_logits, MASKED), jnp.where(hand_valid, s_logits, MASKED), value
+def masked_logits(params, obs, legal, hand_valid, mmask, src=0) -> Heads:
+    """mmask = move_masks(state); src = the move source the dst rows condition on."""
+    a_logits, s_logits, ptr, value = policy(params, obs, src)
+    m = mmask.at[1].set(dst_mask(mmask[1], src)).at[3].set(dst_mask(mmask[3], src))
+    return Heads(jnp.where(legal, a_logits, MASKED), jnp.where(hand_valid, s_logits, MASKED),
+                 jnp.where(m, ptr, MASKED), value)
 
 
-def log_prob_entropy(a_logits, s_logits, a, sel, hand_valid):
-    """log pi(a, sel) and the entropy. The select lanes count only for PLAY/DISCARD."""
-    logp_a = jax.nn.log_softmax(a_logits)
+def _cat_entropy(logits):
+    lp = jax.nn.log_softmax(logits)
+    return -(jnp.exp(lp) * lp).sum()
+
+
+def log_prob_entropy(hd: Heads, a, sel, src, dst, hand_valid):
+    """log pi(a, sel | src, dst) and the entropy. The select lanes count only for
+    PLAY/DISCARD; the pointer pair only for its own MOVE verb. The dst entropy is
+    the one given the taken src."""
+    logp_a = jax.nn.log_softmax(hd.a)
     lp_a = logp_a[a]
     uses_sel = (a == A_PLAY) | (a == A_DISCARD)
     lp_sel = jnp.where(hand_valid,
-                       jnp.where(sel, jax.nn.log_sigmoid(s_logits), jax.nn.log_sigmoid(-s_logits)),
+                       jnp.where(sel, jax.nn.log_sigmoid(hd.s), jax.nn.log_sigmoid(-hd.s)),
                        0.0).sum()
+    lp_ptr = jax.nn.log_softmax(hd.ptr, axis=-1)
+    lp_j = lp_ptr[0, src] + lp_ptr[1, dst]
+    lp_c = lp_ptr[2, src] + lp_ptr[3, dst]
+    lp = (lp_a + uses_sel * lp_sel + (a == A_MOVE_JOKER) * lp_j + (a == A_MOVE_CARD) * lp_c)
+
     p_a = jnp.exp(logp_a)
     ent_a = -(p_a * logp_a).sum()
-    p = jnp.clip(jax.nn.sigmoid(s_logits), 1e-7, 1 - 1e-7)
+    p = jnp.clip(jax.nn.sigmoid(hd.s), 1e-7, 1 - 1e-7)
     ent_s = jnp.where(hand_valid, -(p * jnp.log(p) + (1 - p) * jnp.log(1 - p)), 0.0).sum()
-    p_sel_verb = p_a[A_PLAY] + p_a[A_DISCARD]
-    return lp_a + uses_sel * lp_sel, ent_a + p_sel_verb * ent_s
+    ent_ptr = jax.vmap(_cat_entropy)(hd.ptr)
+    ent = (ent_a + (p_a[A_PLAY] + p_a[A_DISCARD]) * ent_s
+           + p_a[A_MOVE_JOKER] * (ent_ptr[0] + ent_ptr[1])
+           + p_a[A_MOVE_CARD] * (ent_ptr[2] + ent_ptr[3]))
+    return lp, ent
 
 
-def decode(a, sel) -> balatroAction:
-    return balatroAction(verb=ACTION_VERB[a], select=sel.astype(jnp.int32), target=ACTION_TARGET[a])
+def decode(a, sel, src=0, dst=0) -> balatroAction:
+    mv = is_move(a)
+    return balatroAction(verb=ACTION_VERB[a], select=sel.astype(jnp.int32),
+                         target=jnp.where(mv, src, ACTION_TARGET[a]).astype(jnp.int32),
+                         dest=jnp.where(mv, dst, 0).astype(jnp.int32))
+
+
+def sample_src(hd: Heads, a, key):
+    """The move source for verb a (the joker row for MOVE_JOKER, else the card row)."""
+    kj, kc = jax.random.split(key)
+    sj = jax.random.categorical(kj, hd.ptr[0])
+    sc = jax.random.categorical(kc, hd.ptr[2])
+    return jnp.where(a == A_MOVE_JOKER, sj, sc).astype(jnp.int32)
+
+
+def sample_dst(hd: Heads, a, key):
+    kj, kc = jax.random.split(key)
+    dj = jax.random.categorical(kj, hd.ptr[1])
+    dc = jax.random.categorical(kc, hd.ptr[3])
+    return jnp.where(a == A_MOVE_JOKER, dj, dc).astype(jnp.int32)
 
 
 def act(params, state: balatroEnvState, key):
-    """Sample one action. -> (balatroAction, (a, sel, obs, legal, value, logp))"""
-    k1, k2 = jax.random.split(key)
+    """Sample one action: verb (+ select), then src, then dst given src.
+    -> (balatroAction, (a, sel, src, dst, obs, legal, mmask, value, logp))"""
+    k1, k2, k3, k4 = jax.random.split(key, 4)
     obs = observe(state)
     legal = legal_mask(state)
-    a_logits, s_logits, value = masked_logits(params, obs, legal, state.hand_valid)
-    a = jax.random.categorical(k1, a_logits).astype(jnp.int32)
-    sel = (jax.random.uniform(k2, (MAX_HAND_SIZE,)) < jax.nn.sigmoid(s_logits)) & state.hand_valid
-    logp, _ = log_prob_entropy(a_logits, s_logits, a, sel, state.hand_valid)
-    return decode(a, sel), (a, sel, obs, legal, value, logp)
+    mmask = move_masks(state)
+    hd = masked_logits(params, obs, legal, state.hand_valid, mmask)
+    a = jax.random.categorical(k1, hd.a).astype(jnp.int32)
+    sel = (jax.random.uniform(k2, (MAX_HAND_SIZE,)) < jax.nn.sigmoid(hd.s)) & state.hand_valid
+    src = sample_src(hd, a, k3)
+    hd = masked_logits(params, obs, legal, state.hand_valid, mmask, src)
+    dst = sample_dst(hd, a, k4)
+    logp, _ = log_prob_entropy(hd, a, sel, src, dst, state.hand_valid)
+    return decode(a, sel, src, dst), (a, sel, src, dst, obs, legal, mmask, hd.value, logp)
 
 
 OBS_DIM = _obs_dim()
@@ -231,5 +316,6 @@ if __name__ == "__main__":
                       shop_slots=jnp.array([0, 3, -1, -1], jnp.int32))
     print("legal (shop): ", [action_name(i) for i in range(N_ACTIONS) if bool(legal_mask(shop)[i])])
     params = init_params(jax.random.key(0))
-    a, (ai, sel, obs, legal, v, lp) = act(params, s, jax.random.key(1))
-    print("sampled", action_name(ai), "select", sel[:8].astype(int), "value", float(v), "logp", float(lp))
+    a, (ai, sel, src, dst, obs, legal, mm, v, lp) = act(params, s, jax.random.key(1))
+    print("sampled", action_name(ai, src, dst), "select", sel[:8].astype(int),
+          "value", float(v), "logp", float(lp))

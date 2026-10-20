@@ -27,8 +27,8 @@ import numpy as np
 
 from env import reset, env_step, explain_play, _card_name, STAGE_BLIND, STAGE_WON, STAGE_LOST
 from env import BLIND_NAMES
-from agent import (init_params, act, action_name, masked_logits, legal_mask, observe,
-                   A_PLAY, A_DISCARD, N_ACTIONS)
+from agent import (init_params, act, action_name, masked_logits, legal_mask, move_masks, observe,
+                   is_move, A_PLAY, A_DISCARD, A_MOVE_CARD, N_ACTIONS)
 from jokers import JOKER_NAMES
 from scoring import HAND_NAMES
 from train import load_params, PARAMS_PATH, DECK, HAND
@@ -52,9 +52,9 @@ _step = jax.jit(env_step)
 
 @jax.jit
 def _probs(params, state):
-    a_logits, s_logits, value = masked_logits(params, observe(state), legal_mask(state),
-                                              state.hand_valid)
-    return jax.nn.softmax(a_logits), value
+    hd = masked_logits(params, observe(state), legal_mask(state), state.hand_valid,
+                       move_masks(state))
+    return jax.nn.softmax(hd.a), hd.value
 
 
 # ---------- one run, verbose ----------
@@ -65,12 +65,13 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
     total = 0
     for step in range(max_steps):
         key, sk = jax.random.split(key)
-        action, (a, sel, _, _, value, logp) = _act(params, state, sk)
+        action, (a, sel, src, dst, *_r, value, logp) = _act(params, state, sk)
         p, _ = _probs(params, state)
         a = int(a)
         where = (f"A{int(state.ante)} {BLIND_NAMES[int(state.blind_index)][:5]}"
                  if int(state.game_stage) == STAGE_BLIND else f"A{int(state.ante)} shop ")
-        line = f" {step:3d} {where}  ${int(state.money):3d}  {action_name(a):8s} p={float(p[a]):.2f}"
+        name = action_name(a, src, dst) if is_move(a) else action_name(a)
+        line = f" {step:3d} {where}  ${int(state.money):3d}  {name:12s} p={float(p[a]):.2f}"
         if a in (A_PLAY, A_DISCARD):
             cards = " ".join(_card(state.hand[i]) + ("*" if bool(sel[i]) else " ")
                              for i in range(int(state.hand_size)) if bool(state.hand_valid[i]))
@@ -79,6 +80,8 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
                 res = explain_play(state, sel)
                 line += f"  {HAND_NAMES[int(res.handtype)]} {int(res.score)}" \
                         f"  ({int(state.chips_scored) + int(res.score)}/{int(state.blind_target)})"
+        elif a == A_MOVE_CARD:
+            line += f"  moves {_card(state.hand[int(src)])}"
         elif a < N_ACTIONS - 2 and a >= 2:
             shop = [JOKER_NAMES[int(j)] if int(j) >= 0 else "-" for j in state.shop_slots]
             held = [JOKER_NAMES[int(j)] for j in state.jokers if int(j) >= 0]

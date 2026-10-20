@@ -9,8 +9,8 @@ fixtures.py does in the tests.
     uv run --project D:/Claude/jax-learn python gui.py [--seed N]
 
 Mouse: click cards to select, click a joker to select it (then SELL), click a
-shop joker to buy it. Drag a joker or a hand card to a new place (MOVE_JOKER /
-MOVE_CARD steps through env_step).
+shop joker to buy it. Drag a joker or a hand card to a new place (one MOVE_JOKER /
+MOVE_CARD insert step through env_step).
 Keys:  1-8 toggle a card   Enter play   D discard   R / S sort by rank / suit
        V deck view   N new run   Left / Right move the selected joker   Esc close a popup / quit
 Model: P model view on/off (hides the panel, the odds and the pick outline)
@@ -25,7 +25,8 @@ Seed:  the seed box: click it, type a number, Enter starts that seed (Esc cancel
        actions gives the same run. MOVE steps do not use the RNG.
 
 The hand shows the env's lane order, which is the play order (and the order
-Death reads). Sort Rank / Sort Suit reorder the hand once, with MOVE_CARD steps;
+Death reads). Sort Rank / Sort Suit reorder the hand once, with MOVE_CARD inserts
+(at most hand size - 1 steps);
 new cards land in the lanes the played cards left.
 """
 
@@ -46,9 +47,10 @@ from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J
                     MAX_JOKERS, rows_for, resolve, COMMON, UNCOMMON, RARE,
                     E_ADD_MULT, E_ADD_CHIPS, E_XMULT, E_ADD_MONEY, EFFECT_NAMES)
 from scoring import HAND_NAMES
-from agent import (observe, legal_mask, masked_logits, init_params, action_name, OBS_DIM,
-                   N_ACTIONS, ACTION_VERB, ACTION_TARGET, A_PLAY, A_DISCARD, A_BUY, A_SELL,
-                   A_MOVE_JOKER, A_MOVE_CARD, A_REROLL)
+from agent import (observe, legal_mask, move_masks, masked_logits, sample_src, sample_dst,
+                   init_params, action_name, is_move, OBS_DIM, N_ACTIONS, ACTION_VERB,
+                   ACTION_TARGET, A_PLAY, A_DISCARD, A_BUY, A_SELL, A_MOVE_JOKER, A_MOVE_CARD,
+                   A_REROLL)
 from train import load_params, PARAMS_PATH, REWARD_SCALE
 
 GW = 1280                  # the game area; the model panel sits to its right
@@ -120,23 +122,33 @@ _acquire = jax.jit(acquire)
 def model_view(params, state, key):
     """Everything the model panel shows for one state: the probability of every
     choice, every select lane, the value, and a sampled and a greedy pick."""
-    legal = legal_mask(state)
-    a_logits, s_logits, value = masked_logits(params, observe(state), legal, state.hand_valid)
-    pa = jax.nn.softmax(a_logits)
-    ps = jax.nn.sigmoid(s_logits) * state.hand_valid
-    k1, k2 = jax.random.split(key)
-    return {"pa": pa, "ps": ps, "value": value, "legal": legal,
-            "a_sample": jax.random.categorical(k1, a_logits),
+    obs, legal, mmask = observe(state), legal_mask(state), move_masks(state)
+    hd = masked_logits(params, obs, legal, state.hand_valid, mmask)
+    pa = jax.nn.softmax(hd.a)
+    ps = jax.nn.sigmoid(hd.s) * state.hand_valid
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    a_s, a_g = jax.random.categorical(k1, hd.a), jnp.argmax(pa)
+    # the move pointers: src first, then dst given that src (as act() samples them)
+    src_s = sample_src(hd, a_s, k3)
+    src_g = jnp.where(a_g == A_MOVE_JOKER, jnp.argmax(hd.ptr[0]), jnp.argmax(hd.ptr[2]))
+    hd_s = masked_logits(params, obs, legal, state.hand_valid, mmask, src_s)
+    hd_g = masked_logits(params, obs, legal, state.hand_valid, mmask, src_g)
+    dst_g = jnp.where(a_g == A_MOVE_JOKER, jnp.argmax(hd_g.ptr[1]), jnp.argmax(hd_g.ptr[3]))
+    return {"pa": pa, "ps": ps, "value": hd.value, "legal": legal,
+            "a_sample": a_s,
             "sel_sample": (jax.random.uniform(k2, ps.shape) < ps) & state.hand_valid,
-            "a_greedy": jnp.argmax(pa),
-            "sel_greedy": (ps > 0.5) & state.hand_valid}
+            "src_sample": src_s, "dst_sample": sample_dst(hd_s, a_s, k4),
+            "a_greedy": a_g,
+            "sel_greedy": (ps > 0.5) & state.hand_valid,
+            "src_greedy": src_g, "dst_greedy": dst_g}
 
 
 def load_model(path):
     """-> (params, label). A missing file gives a random policy, labelled as such."""
     if path and os.path.exists(path):
         params = load_params(path)
-        if params["W1"].shape[0] != OBS_DIM or params["Wa"].shape[1] != N_ACTIONS:
+        if (params["W1"].shape[0] != OBS_DIM or params["Wa"].shape[1] != N_ACTIONS
+                or "Wm" not in params):
             print(f"{path}: saved for a different obs/action layout; using a random policy")
         else:
             return jax.tree.map(jnp.asarray, params), os.path.basename(path)
@@ -344,7 +356,7 @@ class App:
         key = jax.random.fold_in(jax.random.key(self.seed), self.ai_n)
         self.ai = jax.device_get(model_view(self.params, self.state, key))
         self.ai_hand = None            # the hand the model's pick would make (PLAY / DISCARD)
-        a, sel = self.ai_choice()
+        a, sel, _, _ = self.ai_choice()
         if a in (A_PLAY, A_DISCARD) and sel.any():
             self.ai_hand = jax.device_get(explain_play(self.state, jnp.asarray(sel)))
         self.preview = None
@@ -365,18 +377,26 @@ class App:
         m[list(self.selected)] = True
         return jnp.asarray(m)
 
-    def action(self, verb, target=0):
-        return balatroAction(verb=jnp.int32(verb), select=self.sel_mask(), target=jnp.int32(target))
+    def action(self, verb, target=0, dest=0):
+        return balatroAction(verb=jnp.int32(verb), select=self.sel_mask(), target=jnp.int32(target),
+                             dest=jnp.int32(dest))
 
-    def step(self, verb, target=0):
+    def step(self, verb, target=0, dest=0, quiet=False):
         pre = self.h
-        a = self.action(verb, target)
+        if verb == V_MOVE_CARD:                # the selection follows its cards
+            ids = {int(pre.hand[l]) for l in self.selected}
+        a = self.action(verb, target, dest)
         if verb == V_PLAY:
             res = jax.device_get(explain_play(self.state, a.select))
             cards = [int(c) for c, ok in zip(res.cards, res.valid) if ok]
             self.last_play = (res, cards)
         self.state, reward, done = env_step(self.state, a)
         self.selected.clear()
+        if verb == V_MOVE_CARD:
+            hand, valid = np.asarray(self.state.hand), np.asarray(self.state.hand_valid)
+            self.selected = {l for l in range(MAX_HAND_SIZE) if valid[l] and int(hand[l]) in ids}
+        if verb == V_MOVE_JOKER and self.joker_sel == target:
+            self.joker_sel = dest
         self.ai_n += 1
         self.refresh()
         h = self.h
@@ -394,12 +414,14 @@ class App:
         elif verb == V_SELL:
             self.say(f"Sold {JOKER_NAMES[int(pre.jokers[target])]} for ${int(h.money) - int(pre.money)}.")
             self.joker_sel = None
-        elif verb == V_MOVE_CARD:
-            self.say(f"Moved {card_name(int(pre.hand[target]))} right of {card_name(int(pre.hand[target + 1]))}."
-                     if bool(pre.hand_valid[target]) and bool(pre.hand_valid[target + 1]) else "Moved a card.")
+        elif verb == V_MOVE_CARD and not quiet:
+            moved = not np.array_equal(np.asarray(pre.hand), np.asarray(h.hand))
+            self.say(f"Moved {card_name(int(pre.hand[target]))} to lane {dest + 1}." if moved
+                     else "Can't move that card.")
         elif verb == V_MOVE_JOKER:
-            self.say(f"Moved {JOKER_NAMES[int(pre.jokers[target])]} right of "
-                     f"{JOKER_NAMES[int(pre.jokers[target + 1])]}.")
+            moved = not np.array_equal(np.asarray(pre.jokers), np.asarray(h.jokers))
+            self.say(f"Moved {JOKER_NAMES[int(pre.jokers[target])]} to slot {dest + 1}." if moved
+                     else "Can't move that joker.")
         elif verb == V_REROLL:
             self.say(f"Rerolled for ${int(pre.money) - int(h.money)}." if int(h.money) != int(pre.money)
                      else "Not enough money to reroll.")
@@ -424,52 +446,40 @@ class App:
             self.say("You won the run!")
 
     def move_joker(self, i, k):
-        """Bring the joker in slot i to slot k with MOVE steps (adjacent swaps)."""
+        """Insert the joker in slot i at slot k: one MOVE_JOKER step."""
         if i == k or int(self.h.game_stage) not in (STAGE_BLIND, STAGE_SHOP):
             return
-        name = JOKER_NAMES[int(self.h.jokers[i])]
-        for t in (range(i, k) if k > i else range(i - 1, k - 1, -1)):
-            self.state, _, _ = env_step(self.state, self.action(V_MOVE_JOKER, t))
-            self.ai_n += 1
-        if self.joker_sel == i:
-            self.joker_sel = k
-        self.refresh()
-        self.say(f"Moved {name} to slot {k + 1}.")
-
-    def card_swaps(self, swaps):
-        """Run MOVE_CARD steps (lane t <-> t+1). The selection follows its cards."""
-        if not swaps or int(self.h.game_stage) != STAGE_BLIND:
-            return
-        ids = {int(self.h.hand[l]) for l in self.selected}
-        for t in swaps:
-            self.state, _, _ = env_step(self.state, self.action(V_MOVE_CARD, t))
-            self.ai_n += 1
-        hand, valid = np.asarray(self.state.hand), np.asarray(self.state.hand_valid)
-        self.selected = {l for l in range(MAX_HAND_SIZE) if valid[l] and int(hand[l]) in ids}
-        self.refresh()
+        self.step(V_MOVE_JOKER, i, k)
 
     def move_card(self, lane, k):
-        """Bring the card in `lane` to place k of the visible hand."""
-        order = self.hand_order()
-        dest = order[k]
-        self.card_swaps(list(range(lane, dest)) if dest > lane else list(range(lane - 1, dest - 1, -1)))
+        """Insert the card in `lane` at place k of the visible hand: one MOVE_CARD step."""
+        dest = self.hand_order()[k]
+        if dest != lane and int(self.h.game_stage) == STAGE_BLIND:
+            self.step(V_MOVE_CARD, lane, dest)
 
     def sort_hand(self, by):
-        """Bubble sort the lanes with MOVE_CARD steps. Holes drift to the right."""
+        """Sort the lanes with MOVE_CARD inserts: place p gets its card, p = 0, 1, ...
+        At most hand_size - 1 steps. Holes go to the right."""
         h = self.h
+        if int(h.game_stage) != STAGE_BLIND:
+            return
         n = int(h.hand_size)
         cards = [int(h.hand[l]) if bool(h.hand_valid[l]) else None for l in range(n)]
         key = ((lambda c: (-(c % 13), c // 13)) if by == "rank"
                else (lambda c: (-(c // 13), -(c % 13))))
         k = lambda c: (1,) if c is None else (0,) + key(c)
-        swaps = []
-        for end in range(n - 1, 0, -1):
-            for t in range(end):
-                if k(cards[t]) > k(cards[t + 1]):
-                    cards[t], cards[t + 1] = cards[t + 1], cards[t]
-                    swaps.append(t)
-        self.card_swaps(swaps)
-        self.say(f"Sorted by {by} ({len(swaps)} MOVE_CARD steps).")
+        want = sorted(cards, key=k)
+        moves = []
+        for p in range(n):
+            if want[p] is None:
+                break                          # only holes are left
+            src = cards.index(want[p], p)
+            if src != p:
+                cards.insert(p, cards.pop(src))
+                moves.append((src, p))
+        for src, p in moves:
+            self.step(V_MOVE_CARD, src, p, quiet=True)
+        self.say(f"Sorted by {by} ({len(moves)} MOVE_CARD steps).")
 
     def drag_moved(self, kind):
         """The slot / lane held in a real drag of this kind, else None."""
@@ -525,30 +535,33 @@ class App:
 
     # --- the model ------------------------------------------------------------------
     def ai_choice(self):
-        """-> (flat action index, select lanes (32,) bool) for the current mode."""
-        if self.ai_greedy:
-            return int(self.ai["a_greedy"]), np.asarray(self.ai["sel_greedy"])
-        return int(self.ai["a_sample"]), np.asarray(self.ai["sel_sample"])
+        """-> (flat action index, select lanes (32,) bool, move src, move dst) for the current mode."""
+        m = "greedy" if self.ai_greedy else "sample"
+        return (int(self.ai[f"a_{m}"]), np.asarray(self.ai[f"sel_{m}"]),
+                int(self.ai[f"src_{m}"]), int(self.ai[f"dst_{m}"]))
 
     def ai_played_lanes(self, sel):
         """The lanes env_step really acts on: the first 5 selected valid lanes."""
         return [i for i in range(MAX_HAND_SIZE) if sel[i] and bool(self.h.hand_valid[i])][:5]
 
-    def choice_label(self, a):
+    def choice_label(self, a, src=None, dst=None):
+        """src / dst = the move pointers; without them a MOVE is named by its verb only."""
         h = self.h
         if A_BUY <= a < A_SELL:
             jid = int(h.shop_slots[a - A_BUY])
             return f"BUY {JOKER_NAMES[jid]} (${int(JOKER_COST[jid])})" if jid >= 0 else action_name(a)
-        if A_MOVE_CARD <= a < A_REROLL:
-            t = a - A_MOVE_CARD
-            if bool(h.hand_valid[t]) and bool(h.hand_valid[t + 1]):
-                return f"MOVE {card_name(int(h.hand[t]))} <> {card_name(int(h.hand[t + 1]))}"
-            return action_name(a)
-        if A_MOVE_JOKER <= a < A_MOVE_CARD:
-            i = a - A_MOVE_JOKER
-            if int(h.jokers[i]) >= 0 and int(h.jokers[i + 1]) >= 0:
-                return f"MOVE {JOKER_NAMES[int(h.jokers[i])]} <> {JOKER_NAMES[int(h.jokers[i + 1])]}"
-            return action_name(a)
+        if a == A_MOVE_CARD:
+            if src is None:
+                return "MOVE a card"
+            if bool(h.hand_valid[src]):
+                return f"MOVE {card_name(int(h.hand[src]))} to lane {dst + 1}"
+            return action_name(a, src, dst)
+        if a == A_MOVE_JOKER:
+            if src is None:
+                return "MOVE a joker"
+            if int(h.jokers[src]) >= 0:
+                return f"MOVE {JOKER_NAMES[int(h.jokers[src])]} to slot {dst + 1}"
+            return action_name(a, src, dst)
         if A_SELL <= a < A_MOVE_JOKER:
             i = a - A_SELL
             jid = int(h.jokers[i])
@@ -562,13 +575,17 @@ class App:
         if int(self.h.game_stage) not in (STAGE_BLIND, STAGE_SHOP):
             self.ai_auto = False
             return
-        a, sel = self.ai_choice()
+        a, sel, src, dst = self.ai_choice()
         p = float(self.ai["pa"][a])
         verb, target = int(ACTION_VERB[a]), int(ACTION_TARGET[a])
-        self.say(f"[model] {self.choice_label(a)}  p={p:.0%}")
+        if is_move(a):
+            target, dest = src, dst
+        else:
+            dest = 0
+        self.say(f"[model] {self.choice_label(a, src, dst)}  p={p:.0%}")
         self.selected = set(self.ai_played_lanes(sel)) if a in (A_PLAY, A_DISCARD) else set()
         self.joker_sel = None
-        self.step(verb, target)
+        self.step(verb, target, dest, quiet=is_move(a))
 
     def joker_menu_rows(self):
         h = self.h
@@ -933,7 +950,7 @@ class App:
         text(s, f.small, f"Deck {deck_left}/{int(h.deck_size)}", DIM, (1240, 640), "topright")
 
     def draw_hand(self):
-        a, sel = self.ai_choice()
+        a, sel, _, _ = self.ai_choice()
         picked = set(self.ai_played_lanes(sel)) if a in (A_PLAY, A_DISCARD) else set()
         held = self.drag_moved("card")
         cards = self.card_rects(self.card_drag_order())
@@ -966,12 +983,12 @@ class App:
                          f"V = ${float(self.ai['value']) / REWARD_SCALE:.1f} expected from here",
              DIM, (x, 46))
 
-        a, sel = self.ai_choice()
+        a, sel, src, dst = self.ai_choice()
         live = int(h.game_stage) in (STAGE_BLIND, STAGE_SHOP)
         box(s, (x, 70, PANEL_W - 38, 74), PANEL_HI, 10)
         if live:
             text(s, f.small, "would choose", DIM, (x + 10, 76))
-            text(s, f.bold, self.choice_label(a), TEXT, (x + 10, 94))
+            text(s, f.bold, self.choice_label(a, src, dst), TEXT, (x + 10, 94))
             text(s, f.bold, f"{float(self.ai['pa'][a]):.0%}", AI_C, (x + PANEL_W - 50, 94), "topright")
             if a in (A_PLAY, A_DISCARD):
                 lanes = self.ai_played_lanes(sel)

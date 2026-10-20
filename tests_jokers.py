@@ -245,7 +245,7 @@ def npeq(c, name, got, want):
 def check_step(c, tag, p, a, q, reward):
     """Compare post-state q against the reference model of (p, a).
     p, q are host states; a is a host balatroAction. -> the effective verb."""
-    verb, t = int(a.verb), int(a.target)
+    verb, t, d = int(a.verb), int(a.target), int(a.dest)
     sel = np.asarray(a.select).astype(bool)
     stage = int(p.game_stage)
     if verb == V_DISCARD and int(p.discards) <= 0:
@@ -312,15 +312,18 @@ def check_step(c, tag, p, a, q, reward):
     elif verb == V_NEXT:
         want.update(chips_scored=0, hands=int(p.handcount), discards=int(p.discardcount),
                     game_stage=STAGE_BLIND)
-    elif verb == V_MOVE_JOKER:
-        if 0 <= t < MAX_JOKERS - 1 and int(p.jokers[t]) >= 0 and int(p.jokers[t + 1]) >= 0:
-            for arr in (J, V, S):
-                arr[t], arr[t + 1] = arr[t + 1], arr[t]
-    elif verb == V_MOVE_CARD:
+    elif verb == V_MOVE_JOKER:                              # INSERT slot t at slot d
+        K = list(p.joker_state)
+        if 0 <= t < n and 0 <= d < n and t != d:
+            for arr in (J, V, S, K):
+                arr.insert(d, arr.pop(t))
+        npeq(c, f"{tag}: MOVE_JOKER joker_state", q.joker_state, np.array(K, np.int32))
+    elif verb == V_MOVE_CARD:                               # INSERT lane t at lane d
         hand, valid = list(p.hand), list(p.hand_valid)
-        if 0 <= t and t + 1 < int(p.hand_size) and (valid[t] or valid[t + 1]):
+        size = int(p.hand_size)
+        if 0 <= t < size and 0 <= d < size and t != d and valid[t]:
             for arr in (hand, valid):
-                arr[t], arr[t + 1] = arr[t + 1], arr[t]
+                arr.insert(d, arr.pop(t))
         npeq(c, f"{tag}: MOVE_CARD hand", q.hand, np.array(hand))
         npeq(c, f"{tag}: MOVE_CARD valid", q.hand_valid, np.array(valid))
 
@@ -643,7 +646,7 @@ def run_order_test():
     lanes, sel = HANDS["pair"]
     s = state(lanes, jokers=("The Duo", "Joker"), blind_target=10 ** 6)
     a = drive(c, "no move", s, [act(V_PLAY, sel)])
-    b = drive(c, "move", s, [act(V_MOVE_JOKER, target=0), act(V_PLAY, sel)])
+    b = drive(c, "move", s, [act(V_MOVE_JOKER, target=0, dest=1), act(V_PLAY, sel)])
     c.eq("no move: 30 x 8", a.chips_scored, 240)
     c.eq("after the move: 30 x 12", b.chips_scored, 360)
     return c.done()
@@ -790,7 +793,7 @@ def run_life_test():
     s = state(hand, jokers=("Abstract Joker", "Joker", "Bull", "Bootstraps", "Joker Stencil"),
               money=9, hands=4, discards=3, blind_target=BIG)
     drive(c, "queries", s, [act(V_PLAY, "11"), act(V_SELL, target=1), act(V_PLAY, "11"),
-                            act(V_MOVE_JOKER, target=2), act(V_DISCARD, "1"), act(V_PLAY, "111")])
+                            act(V_MOVE_JOKER, target=3, dest=0), act(V_DISCARD, "1"), act(V_PLAY, "111")])
     s = state(hand, jokers=("Banner", "Blue Joker", "Mystic Summit"), hands=4, discards=1,
               blind_target=BIG)
     drive(c, "discard queries", s, [act(V_PLAY, "11"), act(V_DISCARD, "11111"), act(V_PLAY, "11"),
@@ -799,7 +802,8 @@ def run_life_test():
     # Counters follow MOVE / SELL; a bought counter starts at its seed.
     s = state(hand, jokers=("Joker", "Green Joker", "Popcorn"), joker_value=(4.0, 3.0, 12.0),
               game_stage=STAGE_SHOP, money=20, shop_slots=("Green Joker", "Joker"))
-    s = drive(c, "follow", s, [act(V_MOVE_JOKER, target=0), act(V_MOVE_JOKER, target=1),
+    # [Joker, Green, Popcorn] -> 1->0 [Green, Joker, Popcorn] -> 1->2 [Green, Popcorn, Joker]
+    s = drive(c, "follow", s, [act(V_MOVE_JOKER, target=1, dest=0), act(V_MOVE_JOKER, target=1, dest=2),
                                act(V_SELL, target=0), act(V_BUY, target=0)])
     c.eq("follow: jokers", s.jokers[:3],
          jnp.array([JOKER_ID["Popcorn"], JOKER_ID["Joker"], JOKER_ID["Green Joker"]]))
@@ -821,7 +825,8 @@ def _policy(p, rng):
     valid = np.flatnonzero(p.hand_valid)
     u = rng.random()
     if u < 0.02:                                             # any verb, any target
-        return int(rng.integers(-1, 10)), rng.random(MAX_HAND_SIZE) < 0.3, int(rng.integers(-2, 34))
+        return (int(rng.integers(-1, 10)), rng.random(MAX_HAND_SIZE) < 0.3, int(rng.integers(-2, 34)),
+                int(rng.integers(-2, 34)))
     if stage == STAGE_BLIND and len(valid):
         k = int(rng.integers(1, min(5, len(valid)) + 1))
         if rng.random() < 0.05:
@@ -834,8 +839,9 @@ def _policy(p, rng):
         if u < 0.82:
             return V_SELL, sel, int(rng.integers(-1, held + 1))
         if u < 0.91:
-            return V_MOVE_JOKER, sel, int(rng.integers(-1, max(held, 1)))
-        return V_MOVE_CARD, sel, int(rng.integers(-1, int(p.hand_size)))
+            return V_MOVE_JOKER, sel, int(rng.integers(-1, held + 1)), int(rng.integers(-1, held + 1))
+        size = int(p.hand_size)
+        return V_MOVE_CARD, sel, int(rng.integers(-1, size + 1)), int(rng.integers(-1, size + 1))
     if stage == STAGE_SHOP:
         if u < 0.4:
             return V_BUY, sel, int(rng.integers(-1, MAX_SHOP_SLOTS))
@@ -844,7 +850,7 @@ def _policy(p, rng):
         if u < 0.6:
             return V_REROLL, sel, 0
         if u < 0.7:
-            return V_MOVE_JOKER, sel, int(rng.integers(-1, max(held, 1)))
+            return V_MOVE_JOKER, sel, int(rng.integers(-1, held + 1)), int(rng.integers(-1, held + 1))
         return V_NEXT, sel, 0
     return int(rng.integers(0, 8)), sel, 0                  # LOST / WON: all no-ops
 
@@ -895,7 +901,8 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
         acts = [_policy(jax.tree.map(lambda x: x[i], pre), rng) for i in range(n_envs)]
         action = balatroAction(verb=jnp.asarray([a[0] for a in acts], jnp.int32),
                                select=jnp.asarray(np.stack([a[1] for a in acts])),
-                               target=jnp.asarray([a[2] for a in acts], jnp.int32))
+                               target=jnp.asarray([a[2] for a in acts], jnp.int32),
+                               dest=jnp.asarray([a[3] if len(a) > 3 else 0 for a in acts], jnp.int32))
         batch, r, _ = step(batch, action)
         post, r, a_host = host(batch), np.asarray(r), jax.device_get(action)
         for i in range(n_envs):

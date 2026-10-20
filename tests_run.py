@@ -26,10 +26,11 @@ J_BOOT = JOKER_ID["Bootstraps"]
 NO_CARDS = mask_lanes([])
 
 
-def act(verb, sel=NO_CARDS, target=0):
+def act(verb, sel=NO_CARDS, target=0, dest=0):
     if isinstance(sel, str):
         sel = select(sel)
-    return balatroAction(verb=jnp.int32(verb), select=sel, target=jnp.int32(target))
+    return balatroAction(verb=jnp.int32(verb), select=sel, target=jnp.int32(target),
+                         dest=jnp.int32(dest))
 
 
 class Checks:
@@ -245,48 +246,54 @@ def run_shop_test():
     got, _, _ = env_step(in_blind, act(V_SELL, target=0))
     c.eq("sell is legal in a blind", got.jokers[0], J_GREEN)
 
-    # move: swap slots t and t+1; value, state and sell value go with the joker
+    # move: INSERT the joker in slot i at slot j; value, state and sell value go with it
     three = three._replace(joker_state=jnp.zeros(MAX_JOKERS, jnp.int32).at[1].set(7))
-    got, r, _ = env_step(three, act(V_MOVE_JOKER, target=0))
-    c.eq("move 0: swapped", got.jokers[:3], jnp.array([J_GREEN, J_JOKER, J_BOOT]))
-    c.eq("move 0: values follow", got.joker_value[:3], jnp.array([3.0, 4.0, 2.0]))
-    c.eq("move 0: joker_state follows", got.joker_state[:3], jnp.array([7, 0, 0]))
-    c.eq("move 0: sell values follow", got.joker_sell_value[:3], three.joker_sell_value[jnp.array([1, 0, 2])])
-    c.eq("move 0: money and reward unchanged", (int(got.money), int(r)), (0, 0))
-    got, _, _ = env_step(three, act(V_MOVE_JOKER, target=1))
-    c.eq("move 1: swapped", got.jokers[:3], jnp.array([J_JOKER, J_BOOT, J_GREEN]))
-    back, _, _ = env_step(got, act(V_MOVE_JOKER, target=1))
-    c.same_state("move 1 twice: back to the start", back, three)
-    for name, t in [("into a vacant slot", 2), ("vacant slot", 3), ("target -1", -1),
-                    ("target 31", MAX_JOKERS - 1), ("target 99", 99)]:
-        got, _, _ = env_step(three, act(V_MOVE_JOKER, target=t))
+    got, r, _ = env_step(three, act(V_MOVE_JOKER, target=0, dest=2))
+    c.eq("move 0->2: inserted", got.jokers[:3], jnp.array([J_GREEN, J_BOOT, J_JOKER]))
+    c.eq("move 0->2: values follow", got.joker_value[:3], jnp.array([3.0, 2.0, 4.0]))
+    c.eq("move 0->2: joker_state follows", got.joker_state[:3], jnp.array([7, 0, 0]))
+    c.eq("move 0->2: sell values follow", got.joker_sell_value[:3], three.joker_sell_value[jnp.array([1, 2, 0])])
+    c.eq("move 0->2: money and reward unchanged", (int(got.money), int(r)), (0, 0))
+    back, _, _ = env_step(got, act(V_MOVE_JOKER, target=2, dest=0))
+    c.same_state("move 2->0 undoes 0->2", back, three)
+    got, _, _ = env_step(three, act(V_MOVE_JOKER, target=2, dest=0))
+    c.eq("move 2->0: inserted", got.jokers[:3], jnp.array([J_BOOT, J_JOKER, J_GREEN]))
+    got, _, _ = env_step(three, act(V_MOVE_JOKER, target=1, dest=2))
+    c.eq("move 1->2 = a neighbour swap", got.jokers[:3], jnp.array([J_JOKER, J_BOOT, J_GREEN]))
+    for name, i, j in [("src == dst", 1, 1), ("dst vacant", 0, 3), ("src vacant", 3, 0),
+                       ("src -1", -1, 0), ("dst -1", 0, -1), ("src 99", 99, 0), ("dst 32", 0, 32)]:
+        got, _, _ = env_step(three, act(V_MOVE_JOKER, target=i, dest=j))
         c.same_state(f"move blocked: {name}", got, three)
-    got, _, _ = env_step(three._replace(game_stage=jnp.int32(STAGE_BLIND)), act(V_MOVE_JOKER, target=0))
+    got, _, _ = env_step(three._replace(game_stage=jnp.int32(STAGE_BLIND)), act(V_MOVE_JOKER, target=0, dest=1))
     c.eq("move is legal in a blind", got.jokers[0], J_GREEN)
     lost = three._replace(game_stage=jnp.int32(STAGE_LOST))
-    got, _, _ = env_step(lost, act(V_MOVE_JOKER, target=0))
+    got, _, _ = env_step(lost, act(V_MOVE_JOKER, target=0, dest=1))
     c.same_state("move blocked when LOST", got, lost)
 
-    # move card: swap hand lanes t and t+1; the play order follows the lanes
+    # move card: INSERT the card in lane i at lane j; the play order follows the lanes
     hand = state(hand="4C KD 9H KC 7C 9S 7S 3H")
-    got, r, _ = env_step(hand, act(V_MOVE_CARD, target=0))
-    c.eq("move card 0: swapped", got.hand[:3], hand.hand[jnp.array([1, 0, 2])])
-    c.eq("move card 0: reward 0, deck untouched", (int(r), int(got.deck_ptr)), (0, int(hand.deck_ptr)))
-    back, _, _ = env_step(got, act(V_MOVE_CARD, target=0))
-    c.same_state("move card 0 twice: back to the start", back, hand)
-    got, _, _ = env_step(hand, act(V_MOVE_CARD, target=6))
-    c.eq("move card 6: last two swapped", got.hand[6:8], hand.hand[jnp.array([7, 6])])
-    for name, t in [("past hand_size", 7), ("target -1", -1), ("target 99", 99)]:
-        got, _, _ = env_step(hand, act(V_MOVE_CARD, target=t))
+    got, r, _ = env_step(hand, act(V_MOVE_CARD, target=0, dest=7))
+    c.eq("move card 0->7: inserted", got.hand[:8], hand.hand[jnp.array([1, 2, 3, 4, 5, 6, 7, 0])])
+    c.eq("move card 0->7: reward 0, deck untouched", (int(r), int(got.deck_ptr)), (0, int(hand.deck_ptr)))
+    back, _, _ = env_step(got, act(V_MOVE_CARD, target=7, dest=0))
+    c.same_state("move card 7->0 undoes 0->7", back, hand)
+    got, _, _ = env_step(hand, act(V_MOVE_CARD, target=5, dest=2))
+    c.eq("move card 5->2: inserted", got.hand[:8], hand.hand[jnp.array([0, 1, 5, 2, 3, 4, 6, 7])])
+    for name, i, j in [("src == dst", 3, 3), ("dst past hand_size", 0, 8), ("src past hand_size", 8, 0),
+                       ("src -1", -1, 2), ("dst -1", 2, -1), ("dst 99", 0, 99)]:
+        got, _, _ = env_step(hand, act(V_MOVE_CARD, target=i, dest=j))
         c.same_state(f"move card blocked: {name}", got, hand)
     holed = hand._replace(hand=hand.hand.at[3].set(-1), hand_valid=hand.hand_valid.at[3].set(False))
-    got, _, _ = env_step(holed, act(V_MOVE_CARD, target=2))
+    got, _, _ = env_step(holed, act(V_MOVE_CARD, target=2, dest=3))
     c.eq("move card into a hole", (int(got.hand[3]), bool(got.hand_valid[2])), (int(hand.hand[2]), False))
-    both = holed._replace(hand=holed.hand.at[4].set(-1), hand_valid=holed.hand_valid.at[4].set(False))
-    got, _, _ = env_step(both, act(V_MOVE_CARD, target=3))
-    c.same_state("move card blocked: two holes", got, both)
+    got, _, _ = env_step(holed, act(V_MOVE_CARD, target=3, dest=0))
+    c.same_state("move card blocked: src is a hole", got, holed)
+    got, _, _ = env_step(holed, act(V_MOVE_CARD, target=0, dest=5))
+    c.eq("move card across a hole: the hole shifts too", got.hand_valid[:6],
+         jnp.array([True, True, False, True, True, True]))
+    c.eq("move card across a hole: the card lands at 5", got.hand[5], hand.hand[0])
     shop_hand = hand._replace(game_stage=jnp.int32(STAGE_SHOP))
-    got, _, _ = env_step(shop_hand, act(V_MOVE_CARD, target=0))
+    got, _, _ = env_step(shop_hand, act(V_MOVE_CARD, target=0, dest=1))
     c.same_state("move card blocked in the shop", got, shop_hand)
 
     # acquire: the shared entry point (BUY, and the GUI dev button)
@@ -470,11 +477,12 @@ def run_fuzz_test(n_envs=128, n_steps=120, seed=0):
     akey = jax.random.key(seed + 1)
     seen_stage = np.zeros(4, int)
     for t in range(n_steps):
-        akey, k1, k2, k3 = jax.random.split(akey, 4)
+        akey, k1, k2, k3, k4 = jax.random.split(akey, 5)
         verb = jax.random.randint(k1, (n_envs,), -1, 9)            # includes illegal verbs
         sel = jax.random.bernoulli(k2, 0.3, (n_envs, MAX_HAND_SIZE))
         target = jax.random.randint(k3, (n_envs,), -2, 34)
-        states, r, d = step(states, balatroAction(verb=verb, select=sel, target=target))
+        dest = jax.random.randint(k4, (n_envs,), -2, 10)
+        states, r, d = step(states, balatroAction(verb=verb, select=sel, target=target, dest=dest))
         # keep the easy half easy after a NEXT
         states = states._replace(blind_target=jnp.where(easy, 1, states.blind_target))
         host = _host(states)
@@ -516,8 +524,12 @@ def run_legal_mask_test(n_envs=64, n_steps=60, seed=5):
     """agent.legal_mask must mirror env_step: a legal choice changes the state,
     a masked one is a no-op. Checked on every state of a random-play batch.
     One documented exception: DISCARD with 0 discards left is masked, but the
-    env repairs it to a PLAY (it is a duplicate of PLAY, not a no-op)."""
-    from agent import legal_mask, decode, N_ACTIONS, A_DISCARD, action_name
+    env repairs it to a PLAY (it is a duplicate of PLAY, not a no-op).
+    The MOVE verbs are checked per (src, dst) pair against move_masks / dst_mask
+    (pairs over the first NP slots; a run never holds more than 8 cards or 5 jokers)."""
+    from agent import (legal_mask, move_masks, dst_mask, decode, N_ACTIONS, A_DISCARD,
+                       A_MOVE_JOKER, A_MOVE_CARD, action_name)
+    NP = 10
     c = Checks("legal mask")
     states = jax.vmap(lambda k: reset(k, 52, 8, 0.05))(jax.random.split(jax.random.key(seed), n_envs))
     states = states._replace(money=jnp.full(n_envs, 12, jnp.int32))
@@ -528,29 +540,57 @@ def run_legal_mask_test(n_envs=64, n_steps=60, seed=5):
                                   zip(jax.tree.leaves(a._replace(key=jnp.int32(0))),
                                       jax.tree.leaves(b._replace(key=jnp.int32(0))))]))
 
+    pairs = jnp.array([(i, j) for i in range(NP) for j in range(NP)], jnp.int32)
+
     @jax.jit
     def probe(s):
         def one(a):
             nxt, _, _ = env_step(s, decode(a, sel))
             return changed(nxt, s)
-        return legal_mask(s), jax.vmap(one)(jnp.arange(N_ACTIONS))
+
+        def one_pair(a, ij):
+            nxt, _, _ = env_step(s, decode(a, sel, ij[0], ij[1]))
+            return changed(nxt, s)
+
+        legal, mm = legal_mask(s), move_masks(s)
+        def pair_legal(a, row):
+            ok = jax.vmap(lambda ij: mm[row, ij[0]] & dst_mask(mm[row + 1], ij[0])[ij[1]])(pairs)
+            return legal[a] & ok
+        pl = jnp.stack([pair_legal(A_MOVE_JOKER, 0), pair_legal(A_MOVE_CARD, 2)])
+        pm = jnp.stack([jax.vmap(lambda ij: one_pair(A_MOVE_JOKER, ij))(pairs),
+                        jax.vmap(lambda ij: one_pair(A_MOVE_CARD, ij))(pairs)])
+        return legal, jax.vmap(one)(jnp.arange(N_ACTIONS)), pl, pm
 
     @jax.jit
     def advance(s, key):
         legal = legal_mask(s)
-        a = jax.random.categorical(key, jnp.where(legal, 0.0, -1e9))
-        nxt, _, _ = env_step(s, decode(a, sel))
+        k1, k2, k3 = jax.random.split(key, 3)
+        a = jax.random.categorical(k1, jnp.where(legal, 0.0, -1e9))
+        mm = move_masks(s)
+        row = jnp.where(a == A_MOVE_JOKER, 0, 2)
+        src = jax.random.categorical(k2, jnp.where(mm[row], 0.0, -1e9))
+        dst = jax.random.categorical(k3, jnp.where(dst_mask(mm[row + 1], src), 0.0, -1e9))
+        nxt, _, _ = env_step(s, decode(a, sel, src, dst))
         over = (nxt.game_stage == STAGE_LOST) | (nxt.game_stage == STAGE_WON)
         return jax.tree.map(lambda x, y: jnp.where(over, x, y), s, nxt)   # stay live
 
     key = jax.random.key(seed + 1)
     bad = 0
     for t in range(n_steps):
-        legal, moved = jax.device_get(jax.vmap(probe)(states))
+        legal, moved, pl, pm = jax.device_get(jax.vmap(probe)(states))
         no_discards = np.asarray(states.discards) <= 0
         for i in range(n_envs):
+            for k, a in enumerate((A_MOVE_JOKER, A_MOVE_CARD)):
+                if bool(legal[i, a]) != bool(pm[i, k].any()) and bad < 10:
+                    bad += 1
+                    c.check(f"step {t} env {i}: {action_name(a)} legal={bool(legal[i, a])} "
+                            f"but some pair changes={bool(pm[i, k].any())}", False)
+                for p in np.nonzero(pl[i, k] != pm[i, k])[0][:max(0, 10 - bad)]:
+                    bad += 1
+                    c.check(f"step {t} env {i}: {action_name(a, *pairs[p])} legal={bool(pl[i, k, p])} "
+                            f"but changed={bool(pm[i, k, p])}", False)
             for a in range(N_ACTIONS):
-                if a == A_DISCARD and no_discards[i]:
+                if (a == A_DISCARD and no_discards[i]) or a in (A_MOVE_JOKER, A_MOVE_CARD):
                     continue
                 if bool(legal[i, a]) != bool(moved[i, a]) and bad < 10:
                     bad += 1
@@ -562,9 +602,37 @@ def run_legal_mask_test(n_envs=64, n_steps=60, seed=5):
     return c.done()
 
 
+def run_move_reach_test(n_perms=40, seed=3):
+    """Any order is reachable with at most n - 1 INSERT moves: for place p = 0, 1, ...
+    insert the wanted item at p. Jokers (5 slots) and hand cards (8 lanes)."""
+    c = Checks("move reach")
+    rng = np.random.default_rng(seed)
+    names = ("Joker", "The Duo", "Bull", "Banner", "Green Joker")
+    base_j = state(game_stage=STAGE_SHOP, jokers=names, joker_value=(4.0, 2.0, 2.0, 30.0, 3.0))
+    base_c = state(hand="4C KD 9H KC 7C 9S 7S 3H")
+    step = jax.jit(env_step)
+    for kind, base, arr, verb, n in (("jokers", base_j, "jokers", V_MOVE_JOKER, 5),
+                                     ("cards", base_c, "hand", V_MOVE_CARD, 8)):
+        start = [int(x) for x in getattr(base, arr)[:n]]
+        worst = 0
+        for t in range(n_perms):
+            want = [start[i] for i in rng.permutation(n)]
+            s, cur, steps = base, list(start), 0
+            for p in range(n):
+                src = cur.index(want[p], p)
+                if src != p:
+                    cur.insert(p, cur.pop(src))
+                    s, _, _ = step(s, act(verb, target=src, dest=p))
+                    steps += 1
+            worst = max(worst, steps)
+            c.eq(f"{kind} perm {t}: reached", getattr(s, arr)[:n], jnp.array(want))
+        c.check(f"{kind}: at most {n - 1} moves (worst {worst})", worst <= n - 1, worst)
+    return c.done()
+
+
 ALL = [run_repair_test, run_deal_empty_test, run_blind_end_test, run_targets_test,
        run_shop_test, run_explain_test, run_vmap_determinism_test, run_full_run_test,
-       run_fuzz_test, run_legal_mask_test]
+       run_move_reach_test, run_fuzz_test, run_legal_mask_test]
 
 
 def run_all():

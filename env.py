@@ -48,8 +48,8 @@ V_BUY     = 2   # target = shop slot
 V_SELL    = 3   # target = joker slot; legal in the blind AND the shop
 V_REROLL  = 4
 V_NEXT    = 5   # leave the shop, start the next blind
-V_MOVE_JOKER = 6  # target = joker slot t: swap slots t and t+1 (joker order sets XMULT order)
-V_MOVE_CARD  = 7  # target = hand lane t: swap lanes t and t+1 (lane order = play order, Death)
+V_MOVE_JOKER = 6  # INSERT the joker in slot target at slot dest (joker order sets XMULT order)
+V_MOVE_CARD  = 7  # INSERT the card in lane target at lane dest (lane order = play order, Death)
 N_VERBS   = 8
 V_NOOP    = 8   # internal: the repair target of every illegal action
 VERB_NAMES = ["PLAY", "DISCARD", "BUY", "SELL", "REROLL", "NEXT", "MOVE_JOKER", "MOVE_CARD"]
@@ -141,7 +141,8 @@ class balatroEnvState(NamedTuple):
 class balatroAction(NamedTuple):
     verb   : jax.Array                    # scalar int32 -- V_*
     select : jax.Array                    # (32,)  bool  -- which lanes to act on
-    target : jax.Array = jnp.int32(0)     # scalar int32 -- shop slot (BUY) / joker slot (SELL)
+    target : jax.Array = jnp.int32(0)     # scalar int32 -- shop slot (BUY) / joker slot (SELL) / MOVE source
+    dest   : jax.Array = jnp.int32(0)     # scalar int32 -- MOVE destination (read only by the MOVE verbs)
 
 
 class PlayResult(NamedTuple):
@@ -232,8 +233,8 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
       - a verb the current stage does not accept    -> no-op
       - DISCARD with 0 discards left                -> PLAY
       - BUY / SELL with a bad target, too little $, or no free slot -> no-op
-      - MOVE_JOKER unless slots t and t+1 both hold a joker -> no-op
-      - MOVE_CARD unless t+1 < hand_size and lane t or t+1 holds a card -> no-op
+      - MOVE_JOKER unless target != dest and both are held slots (< held count) -> no-op
+      - MOVE_CARD unless target != dest, both < hand_size, and lane target holds a card -> no-op
       - more than 5 cards selected                  -> the first 5 valid lanes
     """
     verb = action.verb.astype(jnp.int32)
@@ -242,7 +243,8 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     stage = jnp.clip(state.game_stage, 0, LEGAL.shape[0] - 1)
     legal = in_range & LEGAL[stage, jnp.clip(verb, 0, N_VERBS - 1)]
     branch = jnp.where(legal, verb, V_NOOP)
-    action = action._replace(verb=verb, target=jnp.asarray(action.target, jnp.int32))
+    action = action._replace(verb=verb, target=jnp.asarray(action.target, jnp.int32),
+                             dest=jnp.asarray(action.dest, jnp.int32))
     return jax.lax.switch(branch, _HANDLERS, state, action)
 
 
@@ -412,14 +414,23 @@ def _next(state: balatroEnvState, action: balatroAction):
     return nxt, jnp.int32(0), jnp.bool_(False)
 
 
+def insert_perm(n, src, dst):
+    """Gather index for 'take the item at src, put it at dst': the items between
+    shift one place toward src. new[k] = old[perm[k]]."""
+    k = jnp.arange(n)
+    down = (src < dst) & (k >= src) & (k < dst)     # src left of dst: the gap fills from the right
+    up = (src > dst) & (k > dst) & (k <= src)       # src right of dst: the gap fills from the left
+    return jnp.where(k == dst, src, jnp.where(down, k + 1, jnp.where(up, k - 1, k)))
+
+
 def _move_joker(state: balatroEnvState, action: balatroAction):
-    """Swap joker slots t and t+1. Every per-slot array moves with its joker."""
-    t = action.target
-    slot = jnp.clip(t, 0, MAX_JOKERS - 2)
-    ok = ((t >= 0) & (t < MAX_JOKERS - 1)
-          & (state.jokers[slot] != J_EMPTY) & (state.jokers[slot + 1] != J_EMPTY))
-    i = jnp.arange(MAX_JOKERS)
-    perm = jnp.where(i == slot, slot + 1, jnp.where(i == slot + 1, slot, i))
+    """Insert the joker in slot target at slot dest. Every per-slot array moves
+    with its joker. Held jokers are packed (slots 0..held-1), so both ends must
+    be < held."""
+    i, j = action.target, action.dest
+    held = (state.jokers != J_EMPTY).sum()
+    ok = (i >= 0) & (j >= 0) & (i < held) & (j < held) & (i != j)
+    perm = insert_perm(MAX_JOKERS, jnp.clip(i, 0, MAX_JOKERS - 1), jnp.clip(j, 0, MAX_JOKERS - 1))
     moved = state._replace(
         jokers=state.jokers[perm],
         joker_value=state.joker_value[perm],
@@ -430,14 +441,13 @@ def _move_joker(state: balatroEnvState, action: balatroAction):
 
 
 def _move_card(state: balatroEnvState, action: balatroAction):
-    """Swap hand lanes t and t+1. One lane may be a hole (an empty deck leaves
-    holes), so a card can step across it."""
-    t = action.target
-    lane = jnp.clip(t, 0, MAX_HAND_SIZE - 2)
-    ok = ((t >= 0) & (t + 1 < state.hand_size)
-          & (state.hand_valid[lane] | state.hand_valid[lane + 1]))
-    i = jnp.arange(MAX_HAND_SIZE)
-    perm = jnp.where(i == lane, lane + 1, jnp.where(i == lane + 1, lane, i))
+    """Insert the card in lane target at lane dest. Lanes may be holes (an empty
+    deck leaves holes); holes shift like cards, but only a card can be moved."""
+    i, j = action.target, action.dest
+    src = jnp.clip(i, 0, MAX_HAND_SIZE - 1)
+    ok = ((i >= 0) & (j >= 0) & (i < state.hand_size) & (j < state.hand_size) & (i != j)
+          & state.hand_valid[src])
+    perm = insert_perm(MAX_HAND_SIZE, src, jnp.clip(j, 0, MAX_HAND_SIZE - 1))
     moved = state._replace(hand=state.hand[perm], hand_valid=state.hand_valid[perm])
     return tree_where(ok, moved, state), jnp.int32(0), jnp.bool_(False)
 
