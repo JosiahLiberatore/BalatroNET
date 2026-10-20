@@ -94,9 +94,25 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       beta $1 (0, -0.50, -0.75, -0.88, ... -> -1). train.py --move-alpha / --move-beta; logged
       run_move_penalty ($ per run) + move_streak_max. Tuning plan: mask MOVE on the old eval to
       price a move, then sweep (alpha, beta) on short runs.
+- [x] Sequential card picker (2026-10-19) — the 72k insert run (59.6% win) still spent 34% of its
+      steps on MOVEs: the 32 independent Bernoulli select lanes selected 7-8 cards, and the env's
+      "first 5 selected lanes" repair made MOVE the way to choose cards (masking card MOVEs on that
+      policy: win 58.4% -> 1.9%). Now PLAY / DISCARD pick lanes one at a time, up to 5, then STOP
+      (STOP needs >= 1 card); each pick sees the verb (query Wq per verb), the lane's card (Wu over
+      rank + suit, read back from obs by hand_feats), the cards picked so far (Wc over their summed
+      rank + suit) and the count (Wn); scores vo / vs / bstop start at 0 = uniform. act returns
+      picks (5,) (STOP padded) besides sel; the loss teacher-forces the picks; pick entropy = the
+      per-step entropies along the taken picks. Env unchanged. Old params do not load (Ws -> Wq...).
+      train logs play_cards (cards per PLAY); debug_agent prints cards per PLAY / DISCARD; the GUI
+      card odds = P(card picked) from 256 sampled sequences, for the chosen verb.
+      tests_run picker test: hand_feats, all pick sequences sum to 1, 1..5 distinct valid lanes,
+      sampled logp = teacher-forced logp.
+      GPU memory: the first node run hit OOM (train_step temp 7.93 GiB on an 8 GiB 2070S);
+      jax.checkpoint on the pick_logp_entropy step -> 2.59 GiB, same math. ~2.7 updates/s.
 - [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
       hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
-      fires Green -1. Real Balatro does not allow either. The agent can sample an empty select.
+      fires Green -1. Real Balatro does not allow either. The agent no longer samples an empty
+      select (the picker needs >= 1 card); a human in the GUI still can.
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 

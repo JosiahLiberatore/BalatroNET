@@ -630,9 +630,76 @@ def run_move_reach_test(n_perms=40, seed=3):
     return c.done()
 
 
+def run_picker_test(n_envs=256, seed=11):
+    """The card picker: hand_feats reads the hand back from obs; the probabilities
+    of every pick sequence sum to 1; a sampled pick is 1..5 distinct valid lanes,
+    its sel mask matches, and its sampled logp equals the teacher-forced one."""
+    from agent import (init_params, observe, legal_mask, move_masks, masked_logits, hand_feats,
+                       sample_picks, pick_logp_entropy, act, MAX_PICK, STOP)
+    c = Checks("picker")
+    params = init_params(jax.random.key(seed))
+    k1, k2, k3 = jax.random.split(jax.random.key(seed + 1), 3)
+    params["vo"] = jax.random.normal(k1, params["vo"].shape)     # not uniform: a real test
+    params["vs"] = jax.random.normal(k2, params["vs"].shape)
+    params["bstop"] = jnp.array([0.3])
+
+    s = state(hand="4C KD 9H KC 7C 9S 7S 3H")
+    x = hand_feats(observe(s))
+    c.eq("hand_feats rank", jnp.argmax(x[:8, :13], 1), s.hand[:8] % 13)
+    c.eq("hand_feats suit", jnp.argmax(x[:8, 13:], 1), s.hand[:8] // 13)
+    c.eq("hand_feats holes are zero", x[8:].sum(), 0.0)
+
+    holed = s._replace(hand_valid=s.hand_valid.at[3:].set(False))      # 3 cards: lanes 0..2
+    hd = masked_logits(params, observe(holed), legal_mask(holed), holed.hand_valid, move_masks(holed))
+    for v in (0, 1):
+        total = 0.0
+        for k in range(1, 4):
+            for seq in itertools.permutations(range(3), k):
+                picks = jnp.array(list(seq) + [STOP] * (MAX_PICK - k), jnp.int32)
+                lp, _ = pick_logp_entropy(params, hd, v, holed.hand_valid, picks)
+                total += float(jnp.exp(lp))
+        c.check(f"verb {v}: all pick sequences sum to 1", abs(total - 1.0) < 1e-4, total, 1.0)
+
+    states = jax.vmap(lambda k: reset(k, 52, 8, 0.05))(jax.random.split(k3, n_envs))
+    _, (a, sel, picks, *_r, logp) = jax.jit(jax.vmap(act, in_axes=(None, 0, 0)))(
+        params, states, jax.random.split(jax.random.key(seed + 2), n_envs))
+
+    def again(st, a, picks):
+        hd = masked_logits(params, observe(st), legal_mask(st), st.hand_valid, move_masks(st))
+        lp, _ = pick_logp_entropy(params, hd, (a == 1).astype(jnp.int32), st.hand_valid, picks)
+        return lp
+    lp_tf = jax.vmap(again)(states, a, picks)
+    a, sel, picks, valid = jax.device_get((a, sel, picks, states.hand_valid))
+    counts = []
+    for i in range(n_envs):
+        lanes = [int(p) for p in picks[i] if p != STOP]
+        after_stop = list(picks[i][len(lanes):])
+        counts.append(len(lanes))
+        c.check(f"env {i}: 1..5 picks", 1 <= len(lanes) <= MAX_PICK, len(lanes))
+        c.check(f"env {i}: STOP only at the end", all(p == STOP for p in after_stop), picks[i])
+        c.check(f"env {i}: distinct", len(set(lanes)) == len(lanes), lanes)
+        c.check(f"env {i}: valid lanes", all(valid[i][l] for l in lanes), lanes)
+        c.eq(f"env {i}: sel = picks", np.nonzero(sel[i])[0], sorted(lanes))
+    _, (_, _, picks0, *_r) = jax.jit(jax.vmap(act, in_axes=(None, 0, 0)))(     # fresh params
+        init_params(jax.random.key(seed)), states, jax.random.split(jax.random.key(seed + 3), n_envs))
+    counts0 = set(int(n) for n in (np.asarray(picks0) != STOP).sum(1))
+    c.check("fresh params: every count 1..5 is sampled", counts0 == set(range(1, 6)), sorted(counts0))
+
+    # the action logp = verb + picks for PLAY/DISCARD; check the picks part
+    from agent import masked_logits as _ml
+    hd = jax.vmap(lambda st: _ml(params, observe(st), legal_mask(st), st.hand_valid,
+                                 move_masks(st)))(states)
+    lp_a = jax.vmap(lambda l, a: jax.nn.log_softmax(l)[a])(hd.a, jnp.asarray(a))
+    uses = np.isin(a, (0, 1))
+    diff = np.abs(np.asarray(logp) - np.asarray(lp_a) - np.asarray(lp_tf))[uses]
+    c.check("some PLAY / DISCARD sampled", uses.sum() > 20, uses.sum())
+    c.check("sampled logp = teacher-forced logp", diff.max() < 1e-4, diff.max())
+    return c.done()
+
+
 ALL = [run_repair_test, run_deal_empty_test, run_blind_end_test, run_targets_test,
        run_shop_test, run_explain_test, run_vmap_determinism_test, run_full_run_test,
-       run_move_reach_test, run_fuzz_test, run_legal_mask_test]
+       run_move_reach_test, run_fuzz_test, run_legal_mask_test, run_picker_test]
 
 
 def run_all():

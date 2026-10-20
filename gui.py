@@ -47,7 +47,7 @@ from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J
                     MAX_JOKERS, rows_for, resolve, COMMON, UNCOMMON, RARE,
                     E_ADD_MULT, E_ADD_CHIPS, E_XMULT, E_ADD_MONEY, EFFECT_NAMES)
 from scoring import HAND_NAMES
-from agent import (observe, legal_mask, move_masks, masked_logits, sample_src, sample_dst,
+from agent import (observe, legal_mask, move_masks, masked_logits, sample_src, sample_dst, sample_picks,
                    init_params, action_name, is_move, OBS_DIM, N_ACTIONS, ACTION_VERB,
                    ACTION_TARGET, A_PLAY, A_DISCARD, A_BUY, A_SELL, A_MOVE_JOKER, A_MOVE_CARD,
                    A_REROLL)
@@ -121,13 +121,17 @@ _acquire = jax.jit(acquire)
 @jax.jit
 def model_view(params, state, key):
     """Everything the model panel shows for one state: the probability of every
-    choice, every select lane, the value, and a sampled and a greedy pick."""
+    choice, the chance each card is picked (per verb: PLAY, DISCARD; from 256
+    sampled pick sequences), the value, and a sampled and a greedy pick."""
     obs, legal, mmask = observe(state), legal_mask(state), move_masks(state)
     hd = masked_logits(params, obs, legal, state.hand_valid, mmask)
     pa = jax.nn.softmax(hd.a)
-    ps = jax.nn.sigmoid(hd.s) * state.hand_valid
-    k1, k2, k3, k4 = jax.random.split(key, 4)
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+    pick = lambda v, k, greedy=False: sample_picks(params, hd, v, state.hand_valid, k, greedy)[1]
+    ps = jnp.stack([jax.vmap(lambda k: pick(v, k))(jax.random.split(k5, 256)).mean(0)
+                    for v in (0, 1)])
     a_s, a_g = jax.random.categorical(k1, hd.a), jnp.argmax(pa)
+    verb = lambda a: (a == A_DISCARD).astype(jnp.int32)
     # the move pointers: src first, then dst given that src (as act() samples them)
     src_s = sample_src(hd, a_s, k3)
     src_g = jnp.where(a_g == A_MOVE_JOKER, jnp.argmax(hd.ptr[0]), jnp.argmax(hd.ptr[2]))
@@ -136,10 +140,10 @@ def model_view(params, state, key):
     dst_g = jnp.where(a_g == A_MOVE_JOKER, jnp.argmax(hd_g.ptr[1]), jnp.argmax(hd_g.ptr[3]))
     return {"pa": pa, "ps": ps, "value": hd.value, "legal": legal,
             "a_sample": a_s,
-            "sel_sample": (jax.random.uniform(k2, ps.shape) < ps) & state.hand_valid,
+            "sel_sample": pick(verb(a_s), k2),
             "src_sample": src_s, "dst_sample": sample_dst(hd_s, a_s, k4),
             "a_greedy": a_g,
-            "sel_greedy": (ps > 0.5) & state.hand_valid,
+            "sel_greedy": pick(verb(a_g), k2, True),
             "src_greedy": src_g, "dst_greedy": dst_g}
 
 
@@ -148,7 +152,7 @@ def load_model(path):
     if path and os.path.exists(path):
         params = load_params(path)
         if (params["W1"].shape[0] != OBS_DIM or params["Wa"].shape[1] != N_ACTIONS
-                or "Wm" not in params):
+                or "Wq" not in params):
             print(f"{path}: saved for a different obs/action layout; using a random policy")
         else:
             return jax.tree.map(jnp.asarray, params), os.path.basename(path)
@@ -965,7 +969,7 @@ class App:
                 continue
             if lane in picked:
                 pygame.draw.rect(self.screen, AI_C, r.inflate(10, 10), 3, border_radius=12)
-            p = float(self.ai["ps"][lane])
+            p = float(self.ai["ps"][int(a == A_DISCARD)][lane])
             tag = pygame.Rect(0, 0, 52, 22)
             tag.midbottom = (r.centerx, r.y - 7)
             box(self.screen, tag, PANEL, 6, AI_C if lane in picked else None, 2)
@@ -1022,11 +1026,12 @@ class App:
         # card select odds, in hand order (also drawn above the cards)
         if live and int(h.game_stage) == STAGE_BLIND:
             y = 548
-            text(s, f.small, "card odds (if PLAY / DISCARD)", DIM, (x, y - 2))
+            text(s, f.small, f"card odds (if {'DISCARD' if a == A_DISCARD else 'PLAY'})",
+                 DIM, (x, y - 2))
             order = self.hand_order()
             cell = (PANEL_W - 38) // max(len(order), 1)
             for k, lane in enumerate(order):
-                p = float(self.ai["ps"][lane])
+                p = float(self.ai["ps"][int(a == A_DISCARD)][lane])
                 cid = int(h.hand[lane])
                 rk = "10" if RANK_CHARS[cid % 13] == "T" else RANK_CHARS[cid % 13]
                 cx = x + k * cell + cell // 2

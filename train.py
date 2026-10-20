@@ -31,7 +31,7 @@ import jax.numpy as jnp
 
 from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP
 from agent import (init_params, act, masked_logits, log_prob_entropy, is_move, OBS_DIM,
-                   A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, N_ACTIONS)
+                   A_PLAY, A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, N_ACTIONS)
 
 # --- config -----------------------------------------------------------------------
 N_ENVS        = 1024
@@ -84,7 +84,7 @@ def env_step_auto(params, state, run, key, scale):
     """One policy step on one env; a finished run resets in place.
     run = the per-env running stats (ret, buys, steps, streak, pen)."""
     k_act, k_reset = jax.random.split(key)
-    action, (a, sel, src, dst, obs, legal, mmask, value, logp) = act(params, state, k_act)
+    action, (a, sel, picks, src, dst, obs, legal, mmask, value, logp) = act(params, state, k_act)
     nxt, reward, done = env_step(state, action)
     reward = reward.astype(jnp.float32)
 
@@ -99,12 +99,13 @@ def env_step_auto(params, state, run, key, scale):
                 "cleared": reward > 0, "failed": done & (nxt.game_stage == STAGE_LOST),
                 "in_shop": state.game_stage == STAGE_SHOP,
                 "sell": (a >= A_SELL) & (a < A_MOVE_JOKER), "move": moved,   # joker + card moves
-                "streak": streak, "reroll": a == A_REROLL}
+                "streak": streak, "reroll": a == A_REROLL,
+                "play": a == A_PLAY, "play_cards": sel.sum() * (a == A_PLAY)}
     fresh = reset(k_reset, DECK, HAND, scale)
     nxt = tree_where(done, fresh, nxt)
     keep = ~done
     traj = {"obs": obs, "legal": legal, "hand_valid": state.hand_valid, "mmask": mmask,
-            "a": a, "sel": sel, "src": src, "dst": dst,
+            "a": a, "picks": picks, "src": src, "dst": dst,
             "reward": (reward + pen) * REWARD_SCALE, "done": done, "value": value}
     return nxt, jax.tree.map(lambda x: x * keep, run), traj, finished
 
@@ -142,8 +143,8 @@ def gae(reward, value, done, last_value):
 def loss_fn(params, batch):
     hd = jax.vmap(masked_logits, in_axes=(None, 0, 0, 0, 0, 0))(
         params, batch["obs"], batch["legal"], batch["hand_valid"], batch["mmask"], batch["src"])
-    logp, ent = jax.vmap(log_prob_entropy)(hd, batch["a"], batch["sel"], batch["src"],
-                                           batch["dst"], batch["hand_valid"])
+    logp, ent = jax.vmap(log_prob_entropy, in_axes=(None, 0, 0, 0, 0, 0, 0))(
+        params, hd, batch["a"], batch["picks"], batch["src"], batch["dst"], batch["hand_valid"])
     value = hd.value
     adv = batch["adv"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -159,7 +160,7 @@ def train_step(params, m, v, t, carry, key, scale):
     carry, traj, fin, last_value = rollout(params, carry, key, scale)
     adv, ret = gae(traj["reward"], traj["value"], traj["done"], last_value)
     flat = lambda x: x.reshape((T * N_ENVS,) + x.shape[2:])
-    batch = {k: flat(traj[k]) for k in ("obs", "legal", "hand_valid", "mmask", "a", "sel", "src", "dst")}
+    batch = {k: flat(traj[k]) for k in ("obs", "legal", "hand_valid", "mmask", "a", "picks", "src", "dst")}
     batch["adv"], batch["ret"] = flat(adv), flat(ret)
 
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
@@ -198,6 +199,7 @@ def train_step(params, m, v, t, carry, key, scale):
         "sell_frac": fin["sell"].mean(),
         "move_frac": fin["move"].mean(),
         "reroll_frac": fin["reroll"].mean(),
+        "play_cards": fin["play_cards"].sum() / jnp.maximum(fin["play"].sum(), 1),   # cards per PLAY
     }
     return params, m, v, t, carry, metrics
 
@@ -285,7 +287,8 @@ if __name__ == "__main__":
 
     if args.mode != "fresh" and os.path.exists(CKPT_PATH):
         ckpt = load_ckpt()
-        if ckpt.get("obs_dim") != OBS_DIM or ckpt.get("n_actions") != N_ACTIONS:
+        if (ckpt.get("obs_dim") != OBS_DIM or ckpt.get("n_actions") != N_ACTIONS
+                or set(ckpt["params"]) != set(init_params(jax.random.key(0)))):
             sys.exit(f"{CKPT_PATH} was saved for a different obs/action layout; "
                      f"run `python train.py fresh`.")
         if ckpt.get("curriculum", True) != curriculum:
@@ -332,6 +335,7 @@ if __name__ == "__main__":
                       f"win {metrics['win_rate']:5.1%}  clear {clear_ema:5.1%}  scale {scale:.3f}  "
                       f"buys {metrics['run_buys']:4.1f}  ent {metrics['entropy']:5.2f}  "
                       f"ev {metrics['explained_var']:5.2f}  move {metrics['move_frac']:4.0%} "
+                      f"cards {metrics['play_cards']:3.1f} "
                       f"pen {metrics['run_move_penalty']:5.1f}  {rate / 1e3:5.0f}k st/s")
             if completed % CKPT_EVERY == 0:
                 save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum, move_cfg)

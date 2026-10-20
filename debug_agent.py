@@ -65,7 +65,7 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
     total = 0
     for step in range(max_steps):
         key, sk = jax.random.split(key)
-        action, (a, sel, src, dst, *_r, value, logp) = _act(params, state, sk)
+        action, (a, sel, picks, src, dst, *_r, value, logp) = _act(params, state, sk)
         p, _ = _probs(params, state)
         a = int(a)
         where = (f"A{int(state.ante)} {BLIND_NAMES[int(state.blind_index)][:5]}"
@@ -109,7 +109,7 @@ def _run_batch(params, keys, scale, max_steps):
             nxt, r, d = env_step(s, action)
             live = ~done
             rec = {"a": jnp.where(live, a, -1), "hand": jnp.where(live & (a == A_PLAY), res.handtype, -1),
-                   "r": r * live}
+                   "r": r * live, "n": jnp.where(live & ((a == A_PLAY) | (a == A_DISCARD)), sel.sum(), -1)}
             return (jax.tree.map(lambda x, y: jnp.where(done, x, y), s, nxt), done | d), rec
         (final, done), recs = jax.lax.scan(step, (state, jnp.bool_(False)),
                                            jax.random.split(key, max_steps))
@@ -131,6 +131,11 @@ def behavior_stats(params, key, scale=1.0, n=512, max_steps=600):
           "  ".join(f"A{k}:{antes[k]}" for k in sorted(antes)))
     print(f" steps / run         {len(a) / n:7.1f}")
     print(f" jokers held at end  {(final.jokers >= 0).sum(axis=1).mean():7.2f}")
+    pa, n = recs["a"], recs["n"]
+    for name, v in (("PLAY", A_PLAY), ("DISCARD", A_DISCARD)):
+        k = n[(pa == v) & (n >= 0)]
+        print(f" cards per {name:8s} {k.mean() if len(k) else 0:7.2f}   " +
+              "  ".join(f"{c}:{(k == c).mean():.0%}" for c in range(1, 6)))
     print("\n action mix:")
     names = Counter(action_name(x).split()[0] for x in a)
     for k, c in names.most_common():
