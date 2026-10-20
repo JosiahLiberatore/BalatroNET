@@ -4,12 +4,14 @@
     python train.py fresh            start a new run
     python train.py --curriculum     use the target-scale curriculum (off by default)
     python train.py --steps 100000   number of updates (default 20000)
+    python train.py --move-alpha 0.5 --move-beta 1.0   the MOVE streak penalty
 
 EPISODE  = one full run (8 antes, the shop included). Envs AUTO-RESET: each
            update steps every env T more steps and a finished run restarts at
            once, so no scan step is wasted on a padded tail.
-REWARD   = cashout $ per cleared blind (env_step's contract); x REWARD_SCALE
-           for the value head only.
+REWARD   = cashout $ per cleared blind (env_step's contract), plus the MOVE
+           streak penalty (see MOVE_ALPHA); x REWARD_SCALE for the learner only.
+           The logged $/run is the env's cashout alone.
 ADVANTAGE= GAE(gamma, lambda) on the value head; bootstrap from the value of
            the carried state at the end of the segment, cut at run ends.
 CURRICULUM: OFF by default: target_scale stays 1.0, the real game.
@@ -28,7 +30,7 @@ import jax
 import jax.numpy as jnp
 
 from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP
-from agent import (init_params, act, masked_logits, log_prob_entropy, OBS_DIM,
+from agent import (init_params, act, masked_logits, log_prob_entropy, is_move, OBS_DIM,
                    A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, N_ACTIONS)
 
 # --- config -----------------------------------------------------------------------
@@ -43,6 +45,13 @@ VF_COEF       = 0.5
 ENTROPY_BETA  = 0.01
 MAX_GRAD_NORM = 0.5
 REWARD_SCALE  = 0.1         # cashout $ -> value-head units
+
+# MOVE streak penalty (learner reward only; the env's money never changes):
+# the k-th MOVE in a row gets -MOVE_BETA * (1 - MOVE_ALPHA ** (k - 1)) $.
+# k = 1 is free, then -0.50, -0.75, -0.88, ... -> -MOVE_BETA. Any non-MOVE
+# action sets k back to 0. Set from --move-alpha / --move-beta.
+MOVE_ALPHA    = 0.5
+MOVE_BETA     = 1.0         # $ per move at full strength
 
 SCALE_START   = 0.02        # ante-1 small blind = 6 chips: one card clears it
 SCALE_MAX     = 1.0
@@ -62,39 +71,52 @@ def init_carry(key, scale):
     keys = jax.random.split(key, N_ENVS)
     states = jax.vmap(lambda k: reset(k, DECK, HAND, scale))(keys)
     zeros = jnp.zeros(N_ENVS)
-    return {"state": states, "ret": zeros, "buys": zeros, "steps": zeros}
+    return {"state": states, "ret": zeros, "buys": zeros, "steps": zeros,
+            "streak": zeros, "pen": zeros}
 
 
-def env_step_auto(params, state, ret, buys, steps, key, scale):
-    """One policy step on one env; a finished run resets in place."""
+def move_penalty(streak):
+    """$ penalty of the streak-th MOVE in a row (streak >= 1); 0 for streak 0."""
+    return jnp.where(streak > 0, -MOVE_BETA * (1.0 - MOVE_ALPHA ** jnp.maximum(streak - 1, 0)), 0.0)
+
+
+def env_step_auto(params, state, run, key, scale):
+    """One policy step on one env; a finished run resets in place.
+    run = the per-env running stats (ret, buys, steps, streak, pen)."""
     k_act, k_reset = jax.random.split(key)
     action, (a, sel, src, dst, obs, legal, mmask, value, logp) = act(params, state, k_act)
     nxt, reward, done = env_step(state, action)
     reward = reward.astype(jnp.float32)
 
-    ret, buys, steps = ret + reward, buys + ((a >= A_BUY) & (a < A_SELL)), steps + 1
-    finished = {"done": done, "ret": ret, "ante": nxt.ante.astype(jnp.float32),
-                "won": nxt.game_stage == STAGE_WON, "buys": buys, "steps": steps,
+    moved = is_move(a)
+    streak = jnp.where(moved, run["streak"] + 1, 0.0)
+    pen = move_penalty(streak)
+    run = {"ret": run["ret"] + reward, "buys": run["buys"] + ((a >= A_BUY) & (a < A_SELL)),
+           "steps": run["steps"] + 1, "streak": streak, "pen": run["pen"] + pen}
+    finished = {"done": done, "ret": run["ret"], "ante": nxt.ante.astype(jnp.float32),
+                "won": nxt.game_stage == STAGE_WON, "buys": run["buys"], "steps": run["steps"],
+                "pen": run["pen"],
                 "cleared": reward > 0, "failed": done & (nxt.game_stage == STAGE_LOST),
                 "in_shop": state.game_stage == STAGE_SHOP,
-                "sell": (a >= A_SELL) & (a < A_MOVE_JOKER), "move": (a >= A_MOVE_JOKER) & (a < A_REROLL),   # joker + card moves
-                "reroll": a == A_REROLL}
+                "sell": (a >= A_SELL) & (a < A_MOVE_JOKER), "move": moved,   # joker + card moves
+                "streak": streak, "reroll": a == A_REROLL}
     fresh = reset(k_reset, DECK, HAND, scale)
     nxt = tree_where(done, fresh, nxt)
     keep = ~done
     traj = {"obs": obs, "legal": legal, "hand_valid": state.hand_valid, "mmask": mmask,
             "a": a, "sel": sel, "src": src, "dst": dst,
-            "reward": reward * REWARD_SCALE, "done": done, "value": value}
-    return nxt, ret * keep, buys * keep, steps * keep, traj, finished
+            "reward": (reward + pen) * REWARD_SCALE, "done": done, "value": value}
+    return nxt, jax.tree.map(lambda x: x * keep, run), traj, finished
 
 
 def rollout(params, carry, key, scale):
     """T steps on every env. -> (carry, traj [T, N], finished [T, N], last_value [N])"""
     def step(c, k):
         ks = jax.random.split(k, N_ENVS)
-        s, ret, buys, steps, traj, fin = jax.vmap(env_step_auto, in_axes=(None, 0, 0, 0, 0, 0, None))(
-            params, c["state"], c["ret"], c["buys"], c["steps"], ks, scale)
-        return {"state": s, "ret": ret, "buys": buys, "steps": steps}, (traj, fin)
+        run = {n: c[n] for n in ("ret", "buys", "steps", "streak", "pen")}
+        s, run, traj, fin = jax.vmap(env_step_auto, in_axes=(None, 0, 0, 0, None))(
+            params, c["state"], run, ks, scale)
+        return {"state": s, **run}, (traj, fin)
 
     carry, (traj, fin) = jax.lax.scan(step, carry, jax.random.split(key, T))
     _, (*_, last_value, _) = jax.vmap(act, in_axes=(None, 0, 0))(
@@ -166,6 +188,8 @@ def train_step(params, m, v, t, carry, key, scale):
         "run_ante": per_run(fin["ante"]),
         "run_steps": per_run(fin["steps"]),
         "run_buys": per_run(fin["buys"]),
+        "run_move_penalty": per_run(fin["pen"]),          # $ the learner lost to MOVE streaks per run
+        "move_streak_max": fin["streak"].max(),
         "win_rate": per_run(fin["won"].astype(jnp.float32)),
         "blinds_cleared": n_cleared,
         "blinds_failed": n_failed,
@@ -199,12 +223,12 @@ def load_params(path=PARAMS_PATH):
         return pickle.load(f)
 
 
-def save_ckpt(params, m, v, t, key, step, run_dir, scale, clear_ema, curriculum, path=CKPT_PATH):
+def save_ckpt(params, m, v, t, key, step, run_dir, scale, clear_ema, curriculum, move_cfg=(MOVE_ALPHA, MOVE_BETA), path=CKPT_PATH):
     ckpt = {"params": jax.device_get(params), "m": jax.device_get(m), "v": jax.device_get(v),
             "t": jax.device_get(t),
             "key_data": jax.device_get(jax.random.key_data(key)),   # typed keys don't pickle
             "step": step, "run_dir": run_dir, "scale": scale, "clear_ema": clear_ema,
-            "curriculum": curriculum,
+            "curriculum": curriculum, "move_cfg": tuple(move_cfg),
             "obs_dim": OBS_DIM, "n_actions": N_ACTIONS}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -240,8 +264,14 @@ if __name__ == "__main__":
     ap.add_argument("--curriculum", action="store_true",
                     help="start blind targets at SCALE_START and raise them with the clear rate")
     ap.add_argument("--steps", type=int, default=20000, help="total updates")
+    ap.add_argument("--move-alpha", type=float, default=MOVE_ALPHA,
+                    help="MOVE streak decay: the k-th move in a row costs beta * (1 - alpha^(k-1))")
+    ap.add_argument("--move-beta", type=float, default=MOVE_BETA,
+                    help="MOVE streak penalty at full strength, in $ (0 = moves are free)")
     args = ap.parse_args()
     curriculum = args.curriculum
+    MOVE_ALPHA, MOVE_BETA = args.move_alpha, args.move_beta   # read when train_step traces
+    move_cfg = (MOVE_ALPHA, MOVE_BETA)
 
     key = jax.random.key(42)
     key, init_key = jax.random.split(key)
@@ -261,6 +291,9 @@ if __name__ == "__main__":
         if ckpt.get("curriculum", True) != curriculum:
             sys.exit(f"{CKPT_PATH} was saved with curriculum={ckpt.get('curriculum', True)}; "
                      f"pass the same setting or run `python train.py fresh`.")
+        if tuple(ckpt.get("move_cfg", (None, None))) != move_cfg:
+            sys.exit(f"{CKPT_PATH} was saved with (move_alpha, move_beta)={ckpt.get('move_cfg')}; "
+                     f"pass the same values or run `python train.py fresh`.")
         params, m, v, t = ckpt["params"], ckpt["m"], ckpt["v"], ckpt["t"]
         key, start_step, run_dir = ckpt["key"], ckpt["step"], ckpt["run_dir"]
         scale, clear_ema = ckpt["scale"], ckpt["clear_ema"]
@@ -270,7 +303,8 @@ if __name__ == "__main__":
     STEPS = args.steps
     writer = SummaryWriter(run_dir)
     print(f"devices {jax.devices()}   envs {N_ENVS} x T {T} = {N_ENVS * T} steps/update")
-    print(f"curriculum {'ON' if curriculum else 'OFF (real blind targets)'}   updates {STEPS}")
+    print(f"curriculum {'ON' if curriculum else 'OFF (real blind targets)'}   updates {STEPS}   "
+          f"move streak penalty alpha {MOVE_ALPHA} beta ${MOVE_BETA}")
     print(f"logging to {run_dir}\nview with:  tensorboard --logdir {RUNS_ROOT}")
 
     key, ck = jax.random.split(key)
@@ -297,16 +331,18 @@ if __name__ == "__main__":
                 print(f"step {step:5d}  $/run {metrics['run_return']:6.1f}  ante {metrics['run_ante']:4.2f}  "
                       f"win {metrics['win_rate']:5.1%}  clear {clear_ema:5.1%}  scale {scale:.3f}  "
                       f"buys {metrics['run_buys']:4.1f}  ent {metrics['entropy']:5.2f}  "
-                      f"ev {metrics['explained_var']:5.2f}  move {metrics['move_frac']:4.0%}  {rate / 1e3:5.0f}k st/s")
+                      f"ev {metrics['explained_var']:5.2f}  move {metrics['move_frac']:4.0%} "
+                      f"pen {metrics['run_move_penalty']:5.1f}  {rate / 1e3:5.0f}k st/s")
             if completed % CKPT_EVERY == 0:
-                save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum)
+                save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum, move_cfg)
                 save_params(params)
     except KeyboardInterrupt:
         print(f"\ninterrupted -- saving checkpoint at step {completed}")
 
     writer.close()
-    save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum)
+    save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum, move_cfg)
     save_params(params)
-    resume = "python train.py" + (" --curriculum" if curriculum else "") + f" --steps {STEPS}"
+    resume = ("python train.py" + (" --curriculum" if curriculum else "")
+              + f" --steps {STEPS} --move-alpha {MOVE_ALPHA} --move-beta {MOVE_BETA}")
     print(f"stopped at step {completed}/{STEPS}. resume with:  {resume}")
     print("inspect with:  python debug_agent.py")

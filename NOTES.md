@@ -89,6 +89,11 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       GUI: one drag = one MOVE step; Sort = inserts (<= hand_size - 1 steps).
       tests: tests_run move tests, move-reach (random orders in <= n - 1), legal-mask checks every
       (src, dst) pair; tests_jokers reference model inserts.
+- [x] MOVE streak penalty (2026-10-18) — learner reward only (env money unchanged): the k-th MOVE in
+      a row gets -beta * (1 - alpha^(k-1)) $; any other action resets k. Default alpha 0.5,
+      beta $1 (0, -0.50, -0.75, -0.88, ... -> -1). train.py --move-alpha / --move-beta; logged
+      run_move_penalty ($ per run) + move_streak_max. Tuning plan: mask MOVE on the old eval to
+      price a move, then sweep (alpha, beta) on short runs.
 - [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
       hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
       fires Green -1. Real Balatro does not allow either. The agent can sample an empty select.
