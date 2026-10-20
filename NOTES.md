@@ -72,6 +72,13 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       steps, every step through the reference transition model; finished runs swap for fresh ones).
       Mutation check: 5 planted bugs (XMULT order, a suit, Blue off-by-one, counter floor,
       Popcorn round update) each fail several suites. ~30 s. A new joker = a REF row + spec cases.
+- [x] curriculum OFF by default (2026-10-18) — train.py --curriculum turns it on; --steps N. A run
+      dir ends in -real / -curr; the ckpt records the setting. First real-target run on the node
+      (100k updates, ~6 h): win 0.9% at 10k -> ~53% at 96k (fixed 512-run eval: 53.5%, mean ante
+      5.39). Early wins were the Bull + Bootstraps money engine (legal; no boss effects here).
+      That policy spent 60% of its steps on free MOVEs -> the two changes below.
+      Node: C:\Users\Josiah\.wslconfig vmIdleTimeout=-1 + instanceIdleTimeout=-1, else WSL stops
+      the VM (and tmux) minutes after the last SSH client exits.
 - [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
       hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
       fires Green -1. Real Balatro does not allow either. The agent can sample an empty select.

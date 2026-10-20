@@ -1,7 +1,9 @@
 """A2C + GAE on full Balatro runs, with an adaptive blind-target curriculum.
 
-    python train.py          resume from runs/ckpt_run.pkl if it exists
-    python train.py fresh    start a new run
+    python train.py                  resume from runs/ckpt_run.pkl if it exists
+    python train.py fresh            start a new run
+    python train.py --curriculum     use the target-scale curriculum (off by default)
+    python train.py --steps 100000   number of updates (default 20000)
 
 EPISODE  = one full run (8 antes, the shop included). Envs AUTO-RESET: each
            update steps every env T more steps and a finished run restarts at
@@ -10,10 +12,11 @@ REWARD   = cashout $ per cleared blind (env_step's contract); x REWARD_SCALE
            for the value head only.
 ADVANTAGE= GAE(gamma, lambda) on the value head; bootstrap from the value of
            the carried state at the end of the segment, cut at run ends.
-CURRICULUM: target_scale multiplies every blind target (env.blind_target).
-           The clear rate (blinds cleared / blinds ended) moves it: above
-           CLEAR_HI the scale rises, below CLEAR_LO it falls. New runs read the
-           current scale at reset; 1.0 is the real game.
+CURRICULUM: OFF by default: target_scale stays 1.0, the real game.
+           With --curriculum, target_scale multiplies every blind target
+           (env.blind_target), starting at SCALE_START. The clear rate (blinds
+           cleared / blinds ended) moves it: above CLEAR_HI the scale rises,
+           below CLEAR_LO it falls. New runs read the current scale at reset.
 """
 
 import datetime
@@ -194,11 +197,12 @@ def load_params(path=PARAMS_PATH):
         return pickle.load(f)
 
 
-def save_ckpt(params, m, v, t, key, step, run_dir, scale, clear_ema, path=CKPT_PATH):
+def save_ckpt(params, m, v, t, key, step, run_dir, scale, clear_ema, curriculum, path=CKPT_PATH):
     ckpt = {"params": jax.device_get(params), "m": jax.device_get(m), "v": jax.device_get(v),
             "t": jax.device_get(t),
             "key_data": jax.device_get(jax.random.key_data(key)),   # typed keys don't pickle
             "step": step, "run_dir": run_dir, "scale": scale, "clear_ema": clear_ema,
+            "curriculum": curriculum,
             "obs_dim": OBS_DIM, "n_actions": N_ACTIONS}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -226,7 +230,16 @@ def next_scale(scale, clear_ema, since_change):
 
 
 if __name__ == "__main__":
+    import argparse
     from tensorboardX import SummaryWriter
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", nargs="?", choices=["fresh"], help="fresh = ignore the checkpoint")
+    ap.add_argument("--curriculum", action="store_true",
+                    help="start blind targets at SCALE_START and raise them with the clear rate")
+    ap.add_argument("--steps", type=int, default=20000, help="total updates")
+    args = ap.parse_args()
+    curriculum = args.curriculum
 
     key = jax.random.key(42)
     key, init_key = jax.random.split(key)
@@ -234,24 +247,28 @@ if __name__ == "__main__":
     m = jax.tree.map(jnp.zeros_like, params)
     v = jax.tree.map(jnp.zeros_like, params)
     t = jnp.float32(0.0)
-    start_step, scale, clear_ema = 0, SCALE_START, 0.0
-    run_dir = os.path.join(RUNS_ROOT, f"{datetime.datetime.now():%Y%m%d-%H%M%S}")
+    start_step, scale, clear_ema = 0, SCALE_START if curriculum else 1.0, 0.0
+    tag = "curr" if curriculum else "real"
+    run_dir = os.path.join(RUNS_ROOT, f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{tag}")
 
-    fresh = len(sys.argv) > 1 and sys.argv[1] == "fresh"
-    if not fresh and os.path.exists(CKPT_PATH):
+    if args.mode != "fresh" and os.path.exists(CKPT_PATH):
         ckpt = load_ckpt()
         if ckpt.get("obs_dim") != OBS_DIM or ckpt.get("n_actions") != N_ACTIONS:
             sys.exit(f"{CKPT_PATH} was saved for a different obs/action layout; "
                      f"run `python train.py fresh`.")
+        if ckpt.get("curriculum", True) != curriculum:
+            sys.exit(f"{CKPT_PATH} was saved with curriculum={ckpt.get('curriculum', True)}; "
+                     f"pass the same setting or run `python train.py fresh`.")
         params, m, v, t = ckpt["params"], ckpt["m"], ckpt["v"], ckpt["t"]
         key, start_step, run_dir = ckpt["key"], ckpt["step"], ckpt["run_dir"]
         scale, clear_ema = ckpt["scale"], ckpt["clear_ema"]
         print(f"RESUMING from step {start_step} at scale {scale:.3f}  ({CKPT_PATH})")
         print("(run `python train.py fresh` to start over instead)")
 
-    STEPS = 20000
+    STEPS = args.steps
     writer = SummaryWriter(run_dir)
     print(f"devices {jax.devices()}   envs {N_ENVS} x T {T} = {N_ENVS * T} steps/update")
+    print(f"curriculum {'ON' if curriculum else 'OFF (real blind targets)'}   updates {STEPS}")
     print(f"logging to {run_dir}\nview with:  tensorboard --logdir {RUNS_ROOT}")
 
     key, ck = jax.random.split(key)
@@ -266,8 +283,9 @@ if __name__ == "__main__":
             metrics = {k: float(x) for k, x in metrics.items()}
             if metrics["blinds_cleared"] + metrics["blinds_failed"] > 0:
                 clear_ema = CLEAR_EMA * clear_ema + (1 - CLEAR_EMA) * metrics["clear_rate"]
-            scale, changed = next_scale(scale, clear_ema, since_change)
-            since_change = 0 if changed else since_change + 1
+            if curriculum:
+                scale, changed = next_scale(scale, clear_ema, since_change)
+                since_change = 0 if changed else since_change + 1
             metrics["target_scale"], metrics["clear_ema"] = scale, clear_ema
             for name, value in metrics.items():
                 writer.add_scalar(name, value, step)
@@ -279,13 +297,14 @@ if __name__ == "__main__":
                       f"buys {metrics['run_buys']:4.1f}  ent {metrics['entropy']:5.2f}  "
                       f"ev {metrics['explained_var']:5.2f}  {rate / 1e3:5.0f}k st/s")
             if completed % CKPT_EVERY == 0:
-                save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema)
+                save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum)
                 save_params(params)
     except KeyboardInterrupt:
         print(f"\ninterrupted -- saving checkpoint at step {completed}")
 
     writer.close()
-    save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema)
+    save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum)
     save_params(params)
-    print(f"stopped at step {completed}/{STEPS}. resume with:  python train.py")
+    resume = "python train.py" + (" --curriculum" if curriculum else "") + f" --steps {STEPS}"
+    print(f"stopped at step {completed}/{STEPS}. resume with:  {resume}")
     print("inspect with:  python debug_agent.py")
