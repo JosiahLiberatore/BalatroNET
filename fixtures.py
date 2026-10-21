@@ -168,6 +168,32 @@ def loadout(names=(), *, money=0, discards=3, deck_left=0, joker_slots=5, joker_
     return rows, active, resolve(rows, active, joker_value, ctx)
 
 
+def play_cards(rank, suit, valid, names=(), *, money=0, discards=3, deck_left=0,
+               joker_slots=5, joker_value=None, mods=None, key=0):
+    """Score 5 played cards with a loadout through the full pipeline (no held
+    cards, nothing played before). -> scoring.PlayOut"""
+    from scoring import play, PlayIn, Targets
+    from jokers import NO_MODS
+    ids = joker_ids(names)
+    active = ids != J_EMPTY
+    rows = rows_for(ids)
+    if joker_value is None:
+        joker_value = jnp.where(active, rows.VALUE, 0.0)
+    else:
+        joker_value = lanes(joker_value, MAX_JOKERS, 0.0, jnp.float32)
+    held = int(active.sum())
+    stencils = int((ids == J_STENCIL).sum())
+    ctx = query_ctx(money=money, discards=discards, deck_left=deck_left, jokers=held,
+                    empty_slots=max(joker_slots - held + stencils, 0))
+    z9 = jnp.zeros(9, jnp.int32)
+    p = PlayIn(jnp.asarray(rank), jnp.asarray(suit), jnp.asarray(valid, bool),
+               jnp.zeros(1, jnp.int32), jnp.zeros(1, jnp.int32), jnp.zeros(1, bool),
+               ids, joker_value, jnp.zeros(MAX_JOKERS, jnp.int32), ctx, jnp.float32(money),
+               jnp.int32(1), z9, z9, jnp.bool_(False),
+               Targets(jnp.int32(51), jnp.int32(12), jnp.int32(3), jnp.int32(3)))
+    return play(p, NO_MODS if mods is None else mods, jax.random.key(key))
+
+
 # ---------------------------------------------------------------------------
 # THE BUILDER — every field defaulted, so a new state field lands only here
 # ---------------------------------------------------------------------------
@@ -177,7 +203,10 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           shop_slots=(EMPTY, EMPTY, EMPTY, EMPTY), jokers=(), consumables=(),
           joker_value=None, joker_state=(), joker_sell_value=None, joker_slots=5,
           consumable_slots=2, money=0, game_stage=0, key=0, blind_index=0,
-          shop_size=2, reroll_cost=5, last_cashout=0, target_scale=1.0):
+          shop_size=2, reroll_cost=5, last_cashout=0, target_scale=1.0,
+          base_hand_size=None, base_hands=None, base_discards=None, discards_used=0,
+          hand_played=(), hand_round=(), idol_card=51, mail_rank=12, ancient_suit=3,
+          castle_suit=3, free_rerolls=0, gros_extinct=False):
     """Author a balatroEnvState from the fields the scenario is actually about.
 
     hand        card-name string, or a list of ids. '.' is an empty lane.
@@ -190,6 +219,10 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
     joker_sell_value defaults to what a buy sets: max(1, cost // 2) per held joker
     key         an int seed, or a real PRNG key to pass straight through
     shop_slots  joker NAMES or ids; '.' is an empty slot
+    base_hand_size defaults to hand_size minus what the held jokers add
+    base_hands / base_discards default to handcount / discardcount
+    hand_played / hand_round  per hand type counts (HAND_NAMES order), default 0
+    idol_card / mail_rank / ancient_suit / castle_suit  the round targets
     """
     ids = cards(hand)
     jids = joker_ids(jokers)
@@ -213,6 +246,10 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         deck_ptr = hand_size
     if not isinstance(key, jax.Array):
         key = jax.random.key(key)
+    if base_hand_size is None:
+        rows = rows_for(jids)
+        add = jnp.where(held, rows.H_SIZE + jnp.where(rows.HSIZE_V, joker_value, 0).astype(jnp.int32), 0).sum()
+        base_hand_size = int(hand_size) - int(add)
 
     return balatroEnvState(
         jokers=jids,
@@ -245,6 +282,16 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         game_stage=jnp.int32(game_stage),
         money=jnp.int32(money),
         last_cashout=jnp.int32(last_cashout),
+        base_hand_size=jnp.int32(base_hand_size),
+        base_hands=jnp.int32(handcount if base_hands is None else base_hands),
+        base_discards=jnp.int32(discardcount if base_discards is None else base_discards),
+        discards_used=jnp.int32(discards_used),
+        hand_played=lanes(hand_played, 9, 0, jnp.int32),
+        hand_round=lanes(hand_round, 9, 0, jnp.int32),
+        idol_card=jnp.int32(idol_card), mail_rank=jnp.int32(mail_rank),
+        ancient_suit=jnp.int32(ancient_suit), castle_suit=jnp.int32(castle_suit),
+        free_rerolls=jnp.int32(free_rerolls),
+        gros_extinct=jnp.bool_(gros_extinct),
     )
 
 

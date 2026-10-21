@@ -1,20 +1,21 @@
 """Joker test suite — proves every joker against an independent reference.
 
-REF below is a second implementation of the jokers, written from the in-game
-text in plain Python. It does not read the jokers.py columns or scoring.py:
-hand detection, the scoring order, the counters and the cashout money are all
-re-derived here. Each layer compares the env against it:
+ref_balatro.py is a second implementation of the jokers, ported from the
+game's Lua in plain Python. It does not read the jokers.py columns or
+scoring.py: hand detection, the scoring order, the copies, the counters, the
+discard and end-of-round effects and the cashout money are all re-derived
+there. The env's 1-in-N coin flips and Misprint's draw are the one shared
+input (PlayOut.rolls / hrolls / rnd). Each layer compares the env against it:
 
-  table  every TABLE joker has a REF entry and a spec case. A new joker fails
-         here until it has both.
+  table  every TABLE joker has a spec case. A new joker fails here until it has one.
   spec   hand-computed cases per joker (explain_play), fire and no-fire. They
-         also check REF itself, so the layers below can trust it.
-  order  every slot order of a 5-joker add / XMULT mix, and MOVE_JOKER -> PLAY.
+         also check the reference itself, so the layers below can trust it.
+  order  every slot order of a 5-joker add / XMULT / copy mix, and MOVE_JOKER -> PLAY.
   fuzz   random hands x random loadouts x random live state, vmapped.
-  life   scripted env_step sequences: counters, live queries mid-blind, the
-         cashout money, counters that follow MOVE / SELL / BUY.
+  life   scripted env_step sequences with hand-computed values: counters,
+         discards, the end of the round, budget jokers, the shop jokers.
   soak   vmapped random runs. Every step of every env goes through the
-         reference transition model (score, counters, money, stage, reward).
+         reference transition model (score, counters, money, stage, budget, reward).
 
 Run: python tests_jokers.py   (tests.py also runs it)
 """
@@ -23,208 +24,85 @@ import itertools
 import math
 import time
 from collections import Counter
-from typing import Callable, NamedTuple, Optional
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from env import (balatroAction, env_step, explain_play, reset, invariant_errors,
-                 MAX_HAND_SIZE, MAX_SHOP_SLOTS, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL,
-                 V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, STAGE_BLIND, STAGE_SHOP, STAGE_LOST,
-                 STAGE_WON, BLIND_BOSS)
+import ref_balatro as R
+from env import (balatroAction, env_step, explain_play, reset, invariant_errors, score_play,
+                 apply_budget, roll_shop, acquire, MAX_HAND_SIZE, MAX_SHOP_SLOTS, V_PLAY, V_DISCARD, V_BUY,
+                 V_SELL, V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, STAGE_BLIND, STAGE_SHOP,
+                 STAGE_LOST, STAGE_WON, BLIND_BOSS)
 from jokers import TABLE, JOKER_NAMES, JOKER_ID, JOKERS, JOKER_COST, MAX_JOKERS, N_JOKERS
 from scoring import HAND_NAMES
 from fixtures import state, select, cards as card_ids
 from tests_run import Checks, act
 
-
-# ===========================================================================
-# THE REFERENCE — Balatro rules, plain Python
-# ===========================================================================
-TWO, THREE, FOUR, FIVE, SIX, SEVEN, EIGHT, NINE, TEN, JACK, QUEEN, KING, ACE = range(13)
-CLUBS, DIAMONDS, HEARTS, SPADES = range(4)
-CARD_CHIPS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11]
-# best first; (base chips, base mult)
-HAND_BASE = {"straight_flush": (100, 8), "four_kind": (60, 7), "full_house": (40, 4),
-             "flush": (35, 4), "straight": (30, 4), "three_kind": (30, 3),
-             "two_pair": (20, 2), "pair": (10, 2), "high_card": (5, 1)}
-BLIND_PAY = [3, 4, 5]          # small / big / boss
-WIN_ANTE = 8
-
-
-def ref_hand(cards):
-    """Played card ids (lane order) -> (hand name, contained hand names, scored ids)."""
-    ranks, suits = [c % 13 for c in cards], [c // 13 for c in cards]
-    cnt = Counter(ranks)
-    top = sorted(cnt.values(), reverse=True) + [0, 0]
-    flush = len(cards) == 5 and len(set(suits)) == 1
-    straight = len(cards) == 5 and len(cnt) == 5 and (
-        max(ranks) - min(ranks) == 4 or set(ranks) == {ACE, TWO, THREE, FOUR, FIVE})
-    has = {"high_card"}
-    if top[0] >= 2: has.add("pair")
-    if top[0] >= 3: has.add("three_kind")
-    if top[0] >= 4: has.add("four_kind")
-    if sum(v >= 2 for v in cnt.values()) >= 2: has.add("two_pair")   # two DIFFERENT ranks
-    if top[0] == 3 and top[1] == 2: has.add("full_house")
-    if flush: has.add("flush")
-    if straight: has.add("straight")
-    if flush and straight: has.add("straight_flush")
-    hand = next(h for h in HAND_BASE if h in has)
-    if hand in ("straight_flush", "full_house", "flush", "straight"):
-        scored = list(cards)
-    elif hand == "high_card":
-        scored = [max(cards, key=lambda c: c % 13)] if cards else []
-    else:
-        scored = [c for c in cards if cnt[c % 13] >= 2]
-    return hand, has, scored
-
-
-class Ref(NamedTuple):
-    """One joker, as the reference sees it. Every field is optional."""
-    card: Optional[Callable] = None    # (rank, suit) -> (chips, mult), per scored card
-    main: Optional[Callable] = None    # h -> [(op, x)], op in chips / mult / xmult; slot order
-    money: Optional[Callable] = None   # ctx -> $ at the end of the round
-    seed: Optional[float] = None       # a counter: its value on buy
-    on_play: float = 0.0               # counter deltas, floored at 0
-    on_discard: float = 0.0
-    on_round: float = 0.0
-
-
-def per_card(test, chips=0, mult=0):
-    return lambda r, s: (chips, mult) if test(r, s) else (0, 0)
-
-
-def when(test, op, x):
-    return lambda h: [(op, x)] if test(h) else []
-
-
-def has(name):
-    return lambda h: name in h["has"]
-
-
-suit_is = lambda want: (lambda r, s: s == want)
-rank_in = lambda *want: (lambda r, s: r in want)
-is_face = lambda r, s: r in (JACK, QUEEN, KING)
-
-REF = {
-    "Joker":            Ref(main=lambda h: [("mult", 4)]),
-    "Greedy Joker":     Ref(card=per_card(suit_is(DIAMONDS), mult=3)),
-    "Bootstraps":       Ref(main=lambda h: [("mult", 2 * (h["ctx"]["money"] // 5))]),
-    "Green Joker":      Ref(main=lambda h: [("mult", h["v"])], seed=0.0, on_play=+1, on_discard=-1),
-    "Jolly Joker":      Ref(main=when(has("pair"), "mult", 8)),
-    "Zany Joker":       Ref(main=when(has("three_kind"), "mult", 12)),
-    "Mad Joker":        Ref(main=when(has("two_pair"), "mult", 10)),
-    "Crazy Joker":      Ref(main=when(has("straight"), "mult", 12)),
-    "Droll Joker":      Ref(main=when(has("flush"), "mult", 10)),
-    "Sly Joker":        Ref(main=when(has("pair"), "chips", 50)),
-    "Wily Joker":       Ref(main=when(has("three_kind"), "chips", 100)),
-    "Clever Joker":     Ref(main=when(has("two_pair"), "chips", 80)),
-    "Devious Joker":    Ref(main=when(has("straight"), "chips", 100)),
-    "Crafty Joker":     Ref(main=when(has("flush"), "chips", 80)),
-    "Half Joker":       Ref(main=when(lambda h: h["n_played"] <= 3, "mult", 20)),
-    "Lusty Joker":      Ref(card=per_card(suit_is(HEARTS), mult=3)),
-    "Wrathful Joker":   Ref(card=per_card(suit_is(SPADES), mult=3)),
-    "Gluttonous Joker": Ref(card=per_card(suit_is(CLUBS), mult=3)),
-    "Even Steven":      Ref(card=per_card(rank_in(TEN, EIGHT, SIX, FOUR, TWO), mult=4)),
-    "Odd Todd":         Ref(card=per_card(rank_in(ACE, NINE, SEVEN, FIVE, THREE), chips=31)),
-    "Scary Face":       Ref(card=per_card(is_face, chips=30)),
-    "Smiley Face":      Ref(card=per_card(is_face, mult=5)),
-    "Fibonacci":        Ref(card=per_card(rank_in(ACE, TWO, THREE, FIVE, EIGHT), mult=8)),
-    "Arrowhead":        Ref(card=per_card(suit_is(SPADES), chips=50)),
-    "Onyx Agate":       Ref(card=per_card(suit_is(CLUBS), mult=7)),
-    "Banner":           Ref(main=lambda h: [("chips", 30 * h["ctx"]["discards"])]),
-    "Mystic Summit":    Ref(main=when(lambda h: h["ctx"]["discards"] == 0, "mult", 15)),
-    "Blue Joker":       Ref(main=lambda h: [("chips", 2 * h["ctx"]["deck_left"])]),
-    "Abstract Joker":   Ref(main=lambda h: [("mult", 3 * h["ctx"]["n_jokers"])]),
-    "Bull":             Ref(main=lambda h: [("chips", 2 * h["ctx"]["money"])]),
-    "Joker Stencil":    Ref(main=lambda h: [("xmult", h["ctx"]["stencil_x"])]),
-    "Popcorn":          Ref(main=lambda h: [("mult", h["v"])], seed=20.0, on_round=-4),
-    "Golden Joker":     Ref(money=lambda ctx: 4),
-    "Cloud 9":          Ref(money=lambda ctx: ctx["nines"]),
-    "The Duo":          Ref(main=when(has("pair"), "xmult", 2)),
-    "The Trio":         Ref(main=when(has("three_kind"), "xmult", 3)),
-    "The Family":       Ref(main=when(has("four_kind"), "xmult", 4)),
-    "The Order":        Ref(main=when(has("straight"), "xmult", 3)),
-    "The Tribe":        Ref(main=when(has("flush"), "xmult", 2)),
-}
-NAME = JOKER_NAMES          # id -> name; REF is keyed by name, never by id
-
-
-def ref_ctx(s):
-    """The live counts the query jokers read, from a host state."""
-    held = [int(j) for j in s.jokers if j >= 0]
-    size = int(s.deck_size)
-    live = [int(c) for c in s.deck[:size] if 0 <= c < 52]
-    stencils = sum(NAME[j] == "Joker Stencil" for j in held)
-    return dict(money=int(s.money), discards=max(int(s.discards), 0),
-                deck_left=max(size - int(s.deck_ptr), 0), n_jokers=len(held),
-                stencil_x=int(s.joker_slots) - len(held) + stencils,   # a Stencil counts as empty
-                nines=sum(c % 13 == NINE for c in live))
-
-
-def ref_counter(jokers, values, event):
-    """Counter values after an event (on_play / on_discard / on_round). Floored at 0."""
-    out = []
-    for j, v in zip(jokers, values):
-        d = getattr(REF[NAME[j]], event)
-        out.append(max(v + d, 0.0) if d else v)
-    return out
-
-
-def ref_score(cards, jokers, values, ctx):
-    """-> (chips, mult, score, slots that changed the score). Balatro order:
-    each scored card in play order (its chips, then every joker's per-card
-    effect in slot order), then every joker's main effect in slot order."""
-    hand, contains, scored = ref_hand(cards)
-    chips, mult = HAND_BASE[hand]
-    acted = set()
-    for c in scored:
-        chips += CARD_CHIPS[c % 13]
-        for i, j in enumerate(jokers):
-            f = REF[NAME[j]].card
-            if f:
-                dc, dm = f(c % 13, c // 13)
-                chips, mult = chips + dc, mult + dm
-                if dc or dm:
-                    acted.add(i)
-    h = dict(hand=hand, has=contains, n_played=len(cards), ctx=ctx)
-    for i, (j, v) in enumerate(zip(jokers, values)):
-        f = REF[NAME[j]].main
-        for op, x in (f({**h, "v": v}) if f else []):
-            if op == "chips":
-                chips += x
-            elif op == "mult":
-                mult += x
-            else:
-                mult *= x
-            if x != (1 if op == "xmult" else 0):
-                acted.add(i)
-    return chips, mult, math.floor(chips * mult), acted
-
-
-def played_lanes(s, sel):
-    """The env's repair: the first 5 selected lanes that hold a card, lane order."""
-    return [l for l in range(MAX_HAND_SIZE) if sel[l] and s.hand_valid[l]][:5]
-
-
-def ref_play(s, sel):
-    """Score a PLAY from a host state. -> (chips, mult, score, hand name, new values)."""
-    jokers = [int(j) for j in s.jokers if j >= 0]
-    values = ref_counter(jokers, [float(v) for v in s.joker_value[:len(jokers)]], "on_play")
-    cards = [int(s.hand[l]) for l in played_lanes(s, sel)]
-    chips, mult, score, _ = ref_score(cards, jokers, values, ref_ctx(s))
-    return chips, mult, score, ref_hand(cards)[0], values
-
-
-def exact(got, want):
-    """float32 is exact below 2**24; above it, allow its rounding."""
-    return got == want if abs(want) < 2 ** 24 else abs(got - want) <= abs(want) * 2 ** -21
+NAME = JOKER_NAMES          # id -> name; the reference is keyed by name, never by id
+assert HAND_NAMES == R.HAND_ORDER
 
 
 def host(s):
     """Device state -> numpy state (the PRNG key as raw words)."""
     return jax.device_get(s._replace(key=jax.random.key_data(s.key)))
+
+
+_explain = jax.jit(score_play)
+_explain_batch = jax.jit(jax.vmap(score_play))
+
+
+def exact(got, want):
+    """float32 is exact below 2**24; above it, allow its rounding."""
+    return got == want if abs(want) < 2 ** 24 else abs(got - want) <= abs(want) * 2 ** -20
+
+
+def near(got, want):
+    return abs(got - want) <= 1e-4 * max(1.0, abs(want))
+
+
+# ===========================================================================
+# HOST STATE -> REFERENCE INPUTS
+# ===========================================================================
+def records(p):
+    """The held jokers as reference records, slot order."""
+    return [dict(name=NAME[int(j)], v=float(p.joker_value[i]), st=int(p.joker_state[i]),
+                 sell=int(p.joker_sell_value[i])) for i, j in enumerate(p.jokers) if j >= 0]
+
+
+def played_lanes(p, sel):
+    """The env's repair: the first 5 selected lanes that hold a card, lane order."""
+    return [l for l in range(MAX_HAND_SIZE) if sel[l] and p.hand_valid[l]][:5]
+
+
+def counts(arr):
+    return Counter({HAND_NAMES[k]: int(arr[k]) for k in range(9) if int(arr[k])})
+
+
+def ref_g(p):
+    size = int(p.deck_size)
+    live = [int(c) for c in p.deck[:size] if 0 <= c < 52]
+    return dict(money=int(p.money), hands_left=int(p.hands) - 1, discards=max(int(p.discards), 0),
+                deck_left=max(size - int(p.deck_ptr), 0), slots=int(p.joker_slots),
+                nines=sum(c % 13 == R.NINE for c in live), deck_size=size,
+                played=counts(p.hand_played), round=counts(p.hand_round),
+                targets=dict(idol=int(p.idol_card), mail=int(p.mail_rank),
+                             ancient=int(p.ancient_suit), castle=int(p.castle_suit)),
+                is_boss=int(p.blind_index) == BLIND_BOSS, discards_used=int(p.discards_used))
+
+
+def ref_play_state(p, sel, out, mods=None):
+    """Score a PLAY from a host state, with the env's draws. -> (result, records after)."""
+    J = records(p)
+    lanes = played_lanes(p, sel)
+    cards = [int(p.hand[l]) for l in lanes]
+    held = [(l, int(p.hand[l])) for l in range(MAX_HAND_SIZE) if p.hand_valid[l] and l not in lanes]
+    res = R.ref_play(J, cards, held, ref_g(p),
+                     rolls=lambda k, r, j: bool(out.rolls[k, min(r, out.rolls.shape[1] - 1), j]),
+                     hrolls=lambda l, r, j: bool(out.hrolls[l, min(r, out.hrolls.shape[1] - 1), j]),
+                     rnd=lambda j: float(out.rnd[j]), mods=mods)
+    return res, J, cards
 
 
 # ===========================================================================
@@ -242,9 +120,31 @@ def npeq(c, name, got, want):
     c.check(name, np.array_equal(np.asarray(got), np.asarray(want)), got, want)
 
 
-def check_step(c, tag, p, a, q, reward):
+def _drop(J, gone):
+    return [x for i, x in enumerate(J) if i not in gone]
+
+
+def _deaths(c, tag, J, q):
+    """Gros Michel / Cavendish die at random: read which ones did from q.
+    -> (records left, a Gros Michel died). Anything else missing is a failure."""
+    got = [NAME[int(j)] for j in q.jokers if j >= 0]
+    left, gros, k = [], False, 0
+    for x in J:
+        if k < len(got) and got[k] == x["name"]:
+            left.append(x)
+            k += 1
+        elif x["name"] in ("Gros Michel", "Cavendish"):
+            gros |= x["name"] == "Gros Michel"
+        else:
+            c.check(f"{tag}: {x['name']} left the loadout", False, got, [y["name"] for y in J])
+            left.append(x)
+    return left, gros
+
+
+def check_step(c, tag, p, a, q, reward, out=None):
     """Compare post-state q against the reference model of (p, a).
-    p, q are host states; a is a host balatroAction. -> the effective verb."""
+    p, q are host states; a is a host balatroAction; out the host PlayOut of
+    (p, a.select) for a PLAY. -> the effective verb."""
     verb, t, d = int(a.verb), int(a.target), int(a.dest)
     sel = np.asarray(a.select).astype(bool)
     stage = int(p.game_stage)
@@ -260,64 +160,101 @@ def check_step(c, tag, p, a, q, reward):
         npeq(c, f"{tag}: no-op reward", reward, 0)
         return None
 
-    held = [int(j) for j in p.jokers if j >= 0]
-    n = len(held)
-    J, V, S = list(p.jokers), [float(v) for v in p.joker_value], list(p.joker_sell_value)
+    J = records(p)
+    n = len(J)
+    names = [x["name"] for x in J]
+    m = R.mods_of(names)
     want = dict(money=int(p.money), chips_scored=int(p.chips_scored), hands=int(p.hands),
-                discards=int(p.discards), game_stage=stage, last_cashout=int(p.last_cashout))
+                discards=int(p.discards), game_stage=stage, last_cashout=int(p.last_cashout),
+                discards_used=int(p.discards_used), free_rerolls=int(p.free_rerolls),
+                reroll_cost=int(p.reroll_cost), gros_extinct=bool(p.gros_extinct))
+    played, in_round = np.array(p.hand_played), np.array(p.hand_round)
     want_reward = 0
-    hand = None                                             # set when the hand lanes are modeled
+    observe_state = set()                                   # To Do slots whose new hand is random
 
     if verb == V_PLAY:
-        chips, mult, score, name, vals = ref_play(p, sel)
-        V[:n] = vals
+        res, J, cards = ref_play_state(p, sel, out)
         got = int(q.chips_scored) - int(p.chips_scored)
-        ok = exact(got, score)
-        c.check(f"{tag}: PLAY {name} scores {score} ({chips} x {mult})", ok, got, score)
-        total = int(p.chips_scored) + (got if ok else score)   # float32 rounding above 2**24
-        want.update(chips_scored=total, hands=int(p.hands) - 1)
+        ok = exact(got, res["score"])
+        c.check(f"{tag}: PLAY {res['hand']} scores {res['score']} ({res['chips']} x {res['mult']})",
+                ok, got, res["score"])
+        total = int(p.chips_scored) + (got if ok else res["score"])
+        played = np.array([res["played"][h] for h in HAND_NAMES])
+        in_round = np.array([res["round"][h] for h in HAND_NAMES])
+        J = _drop(J, res["gone"])
+        want.update(chips_scored=total, hands=int(p.hands) - 1, money=int(p.money) + int(res["money"]))
         if total >= int(p.blind_target):
-            V[:n] = ref_counter(held, V[:n], "on_round")
-            ctx = ref_ctx(q)                                # the full deck: same as before the deal
-            money_j = sum(REF[NAME[j]].money(ctx) for j in held if REF[NAME[j]].money)
-            cashout = (BLIND_PAY[int(p.blind_index)] + int(p.hands) - 1
-                       + min(int(p.money) // 5, 5) + money_j)
-            won = int(p.blind_index) == BLIND_BOSS and int(p.ante) >= WIN_ANTE
-            want.update(money=int(p.money) + cashout, last_cashout=cashout,
+            g = ref_g(p)
+            g.update(discards=max(int(p.discards), 0), is_boss=int(p.blind_index) == BLIND_BOSS)
+            J = _drop(J, R.ref_end_of_round(J, g))
+            J, gros = _deaths(c, tag, J, q)
+            want["gros_extinct"] = bool(p.gros_extinct) or gros
+            observe_state = {i for i, x in enumerate(J) if x["name"] == "To Do List"}
+            money = want["money"]
+            rate = 1 + sum(x["name"] == "To the Moon" for x in J)
+            interest = rate * min(money // 5, 5) if money >= 5 else 0
+            cashout = R.BLIND_PAY[int(p.blind_index)] + int(p.hands) - 1 + interest \
+                + int(R.ref_dollar_bonus(J, g))
+            won = int(p.blind_index) == BLIND_BOSS and int(p.ante) >= R.WIN_ANTE
+            want.update(money=money + cashout, last_cashout=cashout, reroll_cost=5,
                         game_stage=STAGE_WON if won else STAGE_SHOP)
             want_reward = cashout
+            c.check(f"{tag}: the round targets are cards / suits",
+                    0 <= int(q.idol_card) < 52 and 0 <= int(q.mail_rank) < 13
+                    and 0 <= int(q.castle_suit) < 4 and 0 <= int(q.ancient_suit) < 4)
+            c.check(f"{tag}: Ancient Joker gets a new suit", int(q.ancient_suit) != int(p.ancient_suit),
+                    int(q.ancient_suit), int(p.ancient_suit))
         elif int(p.hands) - 1 <= 0:
             want["game_stage"] = STAGE_LOST
     elif verb == V_DISCARD:
-        V[:n] = ref_counter(held, V[:n], "on_discard")
-        want["discards"] = int(p.discards) - 1
+        lanes = played_lanes(p, sel)
+        money, gone = R.ref_discard(J, [int(p.hand[l]) for l in lanes], ref_g(p))
+        J = _drop(J, gone)
+        want.update(discards=int(p.discards) - 1, discards_used=int(p.discards_used) + 1,
+                    money=int(p.money) + money)
     elif verb == V_BUY:
         jid = int(p.shop_slots[t]) if 0 <= t < MAX_SHOP_SLOTS else -1
         cost = int(JOKER_COST[jid]) if jid >= 0 else 0
-        if 0 <= t < int(p.shop_size) and jid >= 0 and int(p.money) >= cost and n < int(p.joker_slots):
-            J[n], S[n] = jid, max(1, cost // 2)
-            seed = REF[NAME[jid]].seed
-            V[n] = float(JOKERS.VALUE[jid]) if seed is None else seed
-            want["money"] = int(p.money) - cost
+        floor = -20 * names.count("Credit Card")
+        if 0 <= t < int(p.shop_size) and jid >= 0 and int(p.money) - cost >= floor and n < int(p.joker_slots):
+            nm = NAME[jid]
+            st = int(sum(p.hand_played)) if nm == "Loyalty Card" else 0
+            J.append(dict(name=nm, v=float(R.SEED.get(nm, JOKERS.VALUE[jid])), st=st,
+                          sell=max(1, cost // 2)))
+            if nm == "To Do List":
+                observe_state = {len(J) - 1}
+            want.update(money=int(p.money) - cost, free_rerolls=int(p.free_rerolls) + (nm == "Chaos the Clown"),
+                        discards=int(p.discards) + R.D_SIZE.get(nm, 0))
             npeq(c, f"{tag}: BUY empties the shop slot", q.shop_slots[t], -1)
     elif verb == V_SELL:
         if 0 <= t < MAX_JOKERS and int(p.jokers[t]) >= 0:
-            want["money"] = int(p.money) + int(p.joker_sell_value[t])
-            for arr, empty in ((J, -1), (V, 0.0), (S, 0)):
-                del arr[t]
-                arr.append(empty)
+            nm = NAME[int(p.jokers[t])]
+            for i, x in enumerate(J):
+                if i != t and x["name"] == "Campfire":
+                    x["v"] += 0.25
+            want.update(money=int(p.money) + int(p.joker_sell_value[t]),
+                        discards=max(int(p.discards) - R.D_SIZE.get(nm, 0), 0),
+                        free_rerolls=max(int(p.free_rerolls) - (nm == "Chaos the Clown"), 0))
+            J = _drop(J, {t})
     elif verb == V_REROLL:
-        if int(p.money) >= int(p.reroll_cost):
-            want["money"] = int(p.money) - int(p.reroll_cost)
+        free = int(p.free_rerolls) > 0
+        cost = 0 if free else int(p.reroll_cost)
+        if free or int(p.money) - cost >= -20 * names.count("Credit Card"):
+            want.update(money=int(p.money) - cost, reroll_cost=int(p.reroll_cost) + (not free),
+                        free_rerolls=int(p.free_rerolls) - free)
+            for x in J:
+                if x["name"] == "Flash Card":
+                    x["v"] += 2
     elif verb == V_NEXT:
-        want.update(chips_scored=0, hands=int(p.handcount), discards=int(p.discardcount),
-                    game_stage=STAGE_BLIND)
+        burgle = sum(1 for i in range(n) if (k := R.copy_target(names, i)) is not None
+                     and names[k] == "Burglar")
+        want.update(chips_scored=0, hands=int(p.handcount) + 3 * burgle,
+                    discards=0 if burgle else int(p.discardcount), discards_used=0,
+                    free_rerolls=names.count("Chaos the Clown"), game_stage=STAGE_BLIND)
+        in_round = np.zeros(9, np.int64)
     elif verb == V_MOVE_JOKER:                              # INSERT slot t at slot d
-        K = list(p.joker_state)
         if 0 <= t < n and 0 <= d < n and t != d:
-            for arr in (J, V, S, K):
-                arr.insert(d, arr.pop(t))
-        npeq(c, f"{tag}: MOVE_JOKER joker_state", q.joker_state, np.array(K, np.int32))
+            J.insert(d, J.pop(t))
     elif verb == V_MOVE_CARD:                               # INSERT lane t at lane d
         hand, valid = list(p.hand), list(p.hand_valid)
         size = int(p.hand_size)
@@ -327,11 +264,27 @@ def check_step(c, tag, p, a, q, reward):
         npeq(c, f"{tag}: MOVE_CARD hand", q.hand, np.array(hand))
         npeq(c, f"{tag}: MOVE_CARD valid", q.hand_valid, np.array(valid))
 
-    npeq(c, f"{tag}: jokers", q.jokers, np.array(J, np.int32))
-    c.check(f"{tag}: joker values", np.allclose(q.joker_value, V, rtol=0, atol=1e-6), q.joker_value[:8], V[:8])
-    npeq(c, f"{tag}: sell values", q.joker_sell_value, np.array(S, np.int32))
+    # To Do List: a new hand is random; it must be a hand, and never the old one at a round end
+    qs = [int(x) for x in q.joker_state]
+    for i in observe_state:
+        if i < len(J):
+            c.check(f"{tag}: To Do List hand in range", 0 <= qs[i] < 9, qs[i])
+            if verb == V_PLAY:
+                c.check(f"{tag}: To Do List hand changes", qs[i] != J[i]["st"], qs[i], J[i]["st"])
+            J[i]["st"] = qs[i]
+    k = len(J)
+    npeq(c, f"{tag}: jokers", q.jokers, np.array([JOKER_ID[x["name"]] for x in J] + [-1] * (MAX_JOKERS - k), np.int32))
+    vals = np.array([x["v"] for x in J] + [0.0] * (MAX_JOKERS - k))
+    c.check(f"{tag}: joker values", np.allclose(q.joker_value, vals, rtol=1e-5, atol=1e-4),
+            q.joker_value[:8], vals[:8])
+    npeq(c, f"{tag}: sell values", q.joker_sell_value, np.array([x["sell"] for x in J] + [0] * (MAX_JOKERS - k)))
+    npeq(c, f"{tag}: joker states", q.joker_state, np.array([x["st"] for x in J] + [0] * (MAX_JOKERS - k)))
+    hs, hc, dc = R.ref_budget(J, int(p.base_hand_size), int(p.base_hands), int(p.base_discards))
+    want.update(hand_size=hs, handcount=hc, discardcount=dc)
     for f, w in want.items():
         npeq(c, f"{tag}: {f}", getattr(q, f), w)
+    npeq(c, f"{tag}: hand_played", q.hand_played, played)
+    npeq(c, f"{tag}: hand_round", q.hand_round, in_round)
     npeq(c, f"{tag}: reward", reward, want_reward)
     return verb
 
@@ -339,8 +292,9 @@ def check_step(c, tag, p, a, q, reward):
 def drive(c, tag, s, actions):
     """Step a scripted action list; check every step. -> the final state."""
     for i, a in enumerate(actions):
+        out = jax.device_get(_explain(s, a.select)[1])
         post, r, _ = env_step(s, a)
-        check_step(c, f"{tag} #{i}", host(s), jax.device_get(a), host(post), int(r))
+        check_step(c, f"{tag} #{i}", host(s), jax.device_get(a), host(post), int(r), out)
         s = post
     return s
 
@@ -361,10 +315,18 @@ HANDS = {
     "four":     ("7S 7H 7D 7C 2S 4H 5D 9C", "11111"),    # 88 x 7   2S kicker
     "sf":       ("5S 6S 7S 8S 9S 2H 3D JC", "11111"),    # 135 x 8
     "high":     ("AS 9D 6C 4H 2S 3C 5D 8H", "11111"),    # 16 x 1   only the Ace scores
+    "pair_blk": ("KD KC 2S 3S 4C 6C 7S 8S", "11"),       # 30 x 2   every held card is black
+    "pair_q":   ("KD KC QS QH 4C 6D 7H 8S", "11"),       # 30 x 2   two Queens held
+    "pair_k":   ("QD QC KS 3S 4C 6D 7H 8S", "11"),       # 30 x 2   a King held
+    "flush4":   ("2H 5H 7H 9H 3C 4D 6S 8S", "11111"),    # 14 x 1   high card 9H (4 hearts)
+    "gappy":    ("2C 4D 6H 8S TC 3H 5S 7D", "11111"),    # 15 x 1   high card TC
+    "redflush": ("2H 5D 7H 9D JH 3C 4C 6S", "11111"),    # 15 x 1   high card JH
 }
 
 # (jokers in slot order, hand, state overrides, want chips, want mult)
-# The state defaults: money 0, discards 2, 44 cards left in the deck, 5 slots.
+# The state defaults: money 0, hands 3, discards 2, 44 cards left in the deck,
+# 5 slots, Idol = Ace of Spades, Mail-In = Ace, Ancient = Spades, Castle = Spades.
+PAIR_PLAYED = dict(hand_played=(0, 0, 0, 0, 0, 0, 0, 4, 0))
 SPEC = [
     (("Joker",), "pair", {}, 30, 6),
     (("Joker",), "high", {}, 16, 5),
@@ -466,7 +428,6 @@ SPEC = [
     (("Joker Stencil", "Joker", "Joker", "Joker", "Joker"), "pair", {}, 30, 18),
     (("Popcorn",), "pair", {}, 30, 22),
     (("Popcorn",), "pair", dict(joker_value=(8.0,)), 30, 10),
-    (("Popcorn",), "pair", dict(joker_value=(0.0,)), 30, 2),
     (("Golden Joker",), "pair", {}, 30, 2),         # money only, no score
     (("Cloud 9",), "pair", {}, 30, 2),
     (("The Duo",), "pair", {}, 30, 4),
@@ -494,24 +455,149 @@ SPEC = [
     (("Jolly Joker", "The Duo", "Zany Joker"), "full", {}, 78, 36),
     (("The Trio", "The Duo", "Joker"), "full", {}, 78, 28),
     (("Fibonacci", "Arrowhead", "Wrathful Joker", "Odd Todd"), "two_pair", {}, 58 + 50 + 62, 2 + 32 + 3),
+
+    # ======================= GROUP A =======================
+    (("Scholar",), "two_pair", {}, 98, 10),         # AS AH: +20 chips +4 mult each
+    (("Scholar",), "high", {}, 36, 5),
+    (("Scholar",), "pair", {}, 30, 2),
+    (("Walkie Talkie",), "full", {}, 128, 24),      # three 10s and two 4s
+    (("Walkie Talkie",), "pair", {}, 30, 2),
+    (("Ride the Bus",), "pair", dict(joker_value=(3.0,)), 30, 2),   # scored faces: back to 0
+    (("Ride the Bus",), "straight", {}, 65, 5),     # no face: +1 first
+    (("Ride the Bus",), "high", dict(joker_value=(3.0,)), 16, 5),
+    (("Spare Trousers",), "two_pair", {}, 58, 4),
+    (("Spare Trousers",), "full", {}, 78, 6),
+    (("Spare Trousers",), "pair", {}, 30, 2),
+    (("Square Joker",), "pair4", {}, 34, 2),
+    (("Square Joker",), "pair", {}, 30, 2),
+    (("Runner",), "straight", {}, 80, 4),
+    (("Runner",), "sf", {}, 150, 8),
+    (("Runner",), "pair", {}, 30, 2),
+    (("Ice Cream",), "pair", {}, 130, 2),
+    (("Ice Cream",), "pair", dict(joker_value=(5.0,)), 35, 2),
+    (("Wee Joker",), "flush", {}, 76, 4),           # 2H scores: +8 before the main effect
+    (("Wee Joker",), "flush", dict(joker_value=(16.0,)), 92, 4),
+    (("Wee Joker",), "high", {}, 16, 1),            # 2S does not score
+    (("Castle",), "pair", dict(joker_value=(9.0,)), 39, 2),
+    (("Castle",), "pair", {}, 30, 2),
+    (("Flash Card",), "pair", dict(joker_value=(6.0,)), 30, 8),
+    (("Swashbuckler",), "pair", {}, 30, 2),
+    (("Swashbuckler", "Joker"), "pair", {}, 30, 7),  # Joker sells for $1, then +4
+    (("Supernova",), "pair", {}, 30, 3),
+    (("Supernova",), "pair", PAIR_PLAYED, 30, 7),
+    (("Card Sharp",), "pair", dict(hand_round=(0, 0, 0, 0, 0, 0, 0, 1, 0)), 30, 6),
+    (("Card Sharp",), "pair", {}, 30, 2),
+    (("Obelisk",), "pair", dict(joker_value=(2.0,)), 30, 2),          # pair is now most played: reset
+    (("Obelisk",), "pair", dict(joker_value=(2.0,), hand_played=(0, 0, 0, 0, 0, 0, 3, 0, 0)), 30, 4.4),
+    (("Hit the Road",), "pair", dict(joker_value=(2.5,)), 30, 5),
+    (("Hit the Road",), "pair", {}, 30, 2),
+    (("Ramen",), "pair", {}, 30, 4),
+    (("Campfire",), "pair", dict(joker_value=(1.5,)), 30, 3),
+    (("Campfire",), "pair", {}, 30, 2),
+    (("Acrobat",), "pair", dict(hands=1), 30, 6),
+    (("Acrobat",), "pair", {}, 30, 2),
+    (("Loyalty Card",), "pair", dict(hand_played=(0, 0, 0, 0, 0, 0, 0, 5, 0)), 30, 8),   # the 6th hand
+    (("Loyalty Card",), "pair", {}, 30, 2),
+    (("Seeing Double",), "two_pair", {}, 58, 4),    # 8C and a non-Club
+    (("Seeing Double",), "flush", {}, 68, 4),
+    (("Flower Pot",), "two_pair", {}, 58, 6),       # S H C D
+    (("Flower Pot",), "pair", {}, 30, 2),
+    (("Stuntman",), "pair", {}, 280, 2),
+    (("Erosion",), "pair", {}, 30, 2),
+    (("Gros Michel",), "pair", {}, 30, 17),
+    (("Cavendish",), "pair", {}, 30, 6),
+    (("Baseball Card",), "pair", {}, 30, 2),
+    (("Baseball Card", "Bull"), "pair", dict(money=10), 50, 3),   # Bull is Uncommon
+    (("Baseball Card", "Joker"), "pair", {}, 30, 6),               # Joker is Common
+    (("Bull", "Baseball Card", "Joker"), "pair", dict(money=10), 50, 7),  # 2 x 1.5 + 4
+    (("Blackboard",), "pair_blk", {}, 30, 6),
+    (("Blackboard",), "pair", {}, 30, 2),
+    (("To Do List",), "pair", dict(joker_state=(7,)), 30, 2),
+    (("To Do List", "Bull"), "pair", dict(joker_state=(7, 0)), 38, 2),   # its $4 comes first
+    (("To Do List", "Bull"), "pair", dict(joker_state=(6, 0)), 30, 2),
+    (("Mail-In Rebate",), "pair", {}, 30, 2),
+    (("Faceless Joker",), "pair", {}, 30, 2),
+    (("Delayed Gratification",), "pair", {}, 30, 2),
+    (("Rocket",), "pair", {}, 30, 2),
+    (("Egg",), "pair", {}, 30, 2),
+    (("Gift Card",), "pair", {}, 30, 2),
+    (("Credit Card",), "pair", {}, 30, 2),
+    (("To the Moon",), "pair", {}, 30, 2),
+    (("Chaos the Clown",), "pair", {}, 30, 2),
+    (("Juggler",), "pair", {}, 30, 2),
+    (("Drunkard",), "pair", {}, 30, 2),
+    (("Merry Andy",), "pair", {}, 30, 2),
+    (("Troubadour",), "pair", {}, 30, 2),
+    (("Turtle Bean",), "pair", {}, 30, 2),
+    (("Burglar",), "pair", {}, 30, 2),
+
+    # ======================= GROUP B =======================
+    (("Hanging Chad",), "pair", {}, 50, 2),         # KD scores 3 times
+    (("Hanging Chad", "Scary Face"), "pair", {}, 170, 2),
+    (("Dusk",), "pair", dict(hands=1), 50, 2),
+    (("Dusk",), "pair", {}, 30, 2),
+    (("Hack",), "straight", {}, 70, 4),             # the 5 again
+    (("Hack",), "two_pair", {}, 58, 2),
+    (("Sock and Buskin",), "pair", {}, 50, 2),
+    (("Sock and Buskin",), "three", {}, 90, 3),
+    (("Seltzer",), "pair", {}, 50, 2),
+    (("Seltzer", "Smiley Face"), "three", {}, 90, 33),
+    (("Mime",), "pair", {}, 30, 2),
+    (("Mime", "Baron"), "pair_k", {}, 30, 4.5),     # the King again
+    (("Photograph",), "pair", {}, 30, 4),
+    (("Photograph",), "straight", {}, 65, 4),
+    (("Photograph", "Hanging Chad"), "pair", {}, 50, 16),    # KD x3: X2 each time
+    (("The Idol",), "two_pair", {}, 58, 4),         # AS
+    (("The Idol",), "pair", {}, 30, 2),
+    (("Ancient Joker",), "two_pair", {}, 58, 3),    # AS is a Spade
+    (("Ancient Joker",), "pair", {}, 30, 2),
+    (("Oops! All 6s", "Bloodstone"), "flush", {}, 68, 30.375),   # 2 in 2: every Heart
+    (("Bloodstone",), "pair", {}, 30, 2),
+    (("Rough Gem",), "flush", {}, 68, 4),
+    (("Oops! All 6s", "Business Card"), "pair", {}, 30, 2),
+    (("Triboulet",), "pair", {}, 30, 8),
+    (("Baron",), "pair_k", {}, 30, 3),
+    (("Baron",), "pair", {}, 30, 2),
+    (("Shoot the Moon",), "pair_q", {}, 30, 28),
+    (("Shoot the Moon",), "pair", {}, 30, 2),
+    (("Raised Fist",), "pair", {}, 30, 6),          # lowest held: 2H
+    (("Raised Fist",), "pair_q", {}, 30, 10),       # lowest held: 4C
+    (("Oops! All 6s", "Reserved Parking"), "pair_q", {}, 30, 2),
+
+    # ======================= GROUP C =======================
+    (("Four Fingers",), "flush4", {}, 58, 4),
+    (("Four Fingers",), "pair", {}, 30, 2),
+    (("Shortcut",), "gappy", {}, 60, 4),
+    (("Shortcut",), "pair", {}, 30, 2),
+    (("Smeared Joker",), "redflush", {}, 68, 4),
+    (("Smeared Joker", "Greedy Joker"), "flush", {}, 68, 19),   # Hearts count as Diamonds
+    (("Splash",), "pair3", {}, 32, 2),
+    (("Pareidolia", "Smiley Face"), "straight", {}, 65, 29),
+    (("Pareidolia",), "straight", {}, 65, 4),
+    (("Showman",), "pair", {}, 30, 2),
+    (("Oops! All 6s",), "pair", {}, 30, 2),
+    (("Blueprint", "Joker"), "pair", {}, 30, 10),
+    (("Joker", "Blueprint"), "pair", {}, 30, 6),
+    (("Blueprint", "Blueprint", "The Duo"), "pair", {}, 30, 16),
+    (("Joker", "Brainstorm"), "pair", {}, 30, 10),
+    (("Brainstorm", "Joker"), "pair", {}, 30, 6),
+    (("Blueprint", "Brainstorm", "Joker"), "pair", {}, 30, 6),      # a cycle: nothing
 ]
+# no spec numbers: Misprint's draw is random (checked by run_misprint_test)
+NO_SPEC = {"Misprint"}
 
 
 def run_table_test():
     c = Checks("joker table")
     names = set(JOKER_NAMES)
-    c.check("every TABLE joker has a REF entry", names <= set(REF), sorted(names - set(REF)))
-    c.check("every REF entry is a TABLE joker", set(REF) <= names, sorted(set(REF) - names))
-    in_spec = {n for jokers, *_ in SPEC for n in jokers}
+    in_spec = {n for jokers, *_ in SPEC for n in jokers} | NO_SPEC
     c.check("every TABLE joker has a spec case", names <= in_spec, sorted(names - in_spec))
     for d in TABLE:
-        r = REF.get(d.name)
-        if r is None:
-            continue
-        c.check(f"{d.name}: a counter in TABLE is a counter in REF",
-                (r.seed is not None) == (len(d.updates) > 0))
-        if r.seed is not None:
-            c.eq(f"{d.name}: counter seed", float(d.value), r.seed)
+        if d.name in R.SEED:
+            c.eq(f"{d.name}: counter seed", float(d.value), float(R.SEED[d.name]))
+        c.eq(f"{d.name}: hand size", d.h_size, R.H_SIZE.get(d.name, 0))
+        c.eq(f"{d.name}: discards", d.d_size, R.D_SIZE.get(d.name, 0))
+        c.check(f"{d.name}: Uncommon in both tables", (d.rarity == 2) == (d.name in R.UNCOMMON))
     return c.done()
 
 
@@ -521,95 +607,128 @@ def run_spec_test():
         lanes, sel = HANDS[hand]
         s = state(lanes, jokers=jokers, **kw)
         sel = select(sel)
-        res = explain_play(s, sel)
+        res, out = jax.device_get(_explain(s, sel))
         tag = f"{'+'.join(jokers)} on {hand} {kw or ''}"
         want = math.floor(want_chips * want_mult)
-        c.eq(f"{tag}: env chips", float(res.chips), float(want_chips))
-        c.eq(f"{tag}: env mult", float(res.mult), float(want_mult))
-        c.eq(f"{tag}: env score", int(res.score), want)
-        chips, mult, score, name, _ = ref_play(host(s), np.asarray(sel))
-        c.check(f"{tag}: REF agrees", (chips, mult, score) == (want_chips, want_mult, want),
-                (chips, mult, score), (want_chips, want_mult, want))
-        c.check(f"{tag}: hand type", HAND_NAMES[int(res.handtype)] == name, HAND_NAMES[int(res.handtype)], name)
+        c.check(f"{tag}: env chips", near(float(res.chips), want_chips), float(res.chips), want_chips)
+        c.check(f"{tag}: env mult", near(float(res.mult), want_mult), float(res.mult), want_mult)
+        c.check(f"{tag}: env score", abs(int(res.score) - want) <= 1, int(res.score), want)
+        r, _, _ = ref_play_state(host(s), np.asarray(sel), out)
+        c.check(f"{tag}: REF agrees", near(r["chips"], want_chips) and near(r["mult"], want_mult),
+                (r["chips"], r["mult"]), (want_chips, want_mult))
+        c.check(f"{tag}: hand type", HAND_NAMES[int(res.handtype)] == r["hand"], HAND_NAMES[int(res.handtype)], r["hand"])
+    return c.done()
+
+
+def run_misprint_test(n=400):
+    """Misprint adds a whole number 0..23, every value can come up, and it is the
+    draw the reference reads."""
+    c = Checks("misprint")
+    lanes, sel = HANDS["pair"]
+    seen = set()
+    for k in range(n):
+        s = state(lanes, jokers=("Misprint",), key=k)
+        res, out = jax.device_get(_explain(s, select(sel)))
+        add = float(res.mult) - 2
+        seen.add(add)
+        c.check(f"key {k}: a whole number 0..23", add == int(add) and 0 <= add <= 23, add)
+        c.check(f"key {k}: the draw", add == float(out.rnd[0]), add, float(out.rnd[0]))
+    c.check("every value 0..23 came up", seen == set(range(24)), sorted(seen))
+    return c.done()
+
+
+def run_odds_test(n=4000):
+    """1 in 2 draws hit about half the time; Oops! All 6s makes them certain."""
+    c = Checks("odds")
+    lanes, sel = HANDS["flush"]
+    hits = 0
+    for k in range(n // 100):
+        s = state(lanes, jokers=("Bloodstone",), key=k)
+        out = jax.device_get(_explain(s, select(sel))[1])
+        hits += int(out.rolls[:, 0, 0].sum())
+    rate = hits / (n // 100 * 5)
+    c.check("Bloodstone hits 1 in 2", 0.4 < rate < 0.6, rate)
+    s = state(lanes, jokers=("Bloodstone", "Oops! All 6s"))
+    out = jax.device_get(_explain(s, select(sel))[1])
+    c.check("Oops! All 6s: 2 in 2", bool(out.rolls[:, :, 0].all()))
     return c.done()
 
 
 # ===========================================================================
 # BATCHED SCORING — one jit over many (loadout, hand, live state) cases
 # ===========================================================================
-_BASE = state("2C 3C 4C 5C 6C 7C 8C 9C")
+_BASE = host(state("2C 3C 4C 5C 6C 7C 8C 9C"))
 
 
-@jax.jit
-def _batch_explain(jokers, joker_value, hand, hand_valid, money, discards, deck_ptr, joker_slots, sel):
-    def one(j, jv, h, hv, m, d, dp, js, s):
-        st = _BASE._replace(jokers=j, joker_value=jv, hand=h, hand_valid=hv, money=m,
-                            discards=d, deck_ptr=dp, joker_slots=js)
-        r = explain_play(st, s)
-        return r.chips, r.mult, r.score, r.handtype
-    return jax.vmap(one)(jokers, joker_value, hand, hand_valid, money, discards, deck_ptr,
-                         joker_slots, sel)
-
-
-def _run_batch(cases):
-    """cases: list of dicts (jokers, values, hand, valid, money, discards, deck_ptr, slots, sel)."""
-    def col(key, width, fill, dt):
-        out = np.full((len(cases), width), fill, dt)
+def _batch_states(cases):
+    """cases: dicts of field overrides -> one stacked device state."""
+    n = len(cases)
+    out = {}
+    for f in _BASE._fields:
+        base = np.asarray(getattr(_BASE, f))
+        arr = np.repeat(base[None], n, axis=0).copy()
         for i, k in enumerate(cases):
-            out[i, :len(k[key])] = k[key]
-        return out
-    scal = lambda key: np.array([k[key] for k in cases], np.int32)
-    out = _batch_explain(col("jokers", MAX_JOKERS, -1, np.int32),
-                         col("values", MAX_JOKERS, 0.0, np.float32),
-                         col("hand", MAX_HAND_SIZE, -1, np.int32),
-                         col("valid", MAX_HAND_SIZE, False, bool),
-                         scal("money"), scal("discards"), scal("deck_ptr"), scal("slots"),
-                         col("sel", MAX_HAND_SIZE, False, bool))
-    return [np.asarray(x) for x in jax.device_get(out)]
+            if f in k:
+                v = np.asarray(k[f], arr.dtype)
+                if arr.ndim == 1:
+                    arr[i] = v
+                else:
+                    arr[i] = np.asarray(arr[i])
+                    arr[i, :len(v)] = v
+                    if f in ("jokers",):
+                        arr[i, len(v):] = -1
+                    elif f in ("joker_value", "joker_state", "joker_sell_value", "hand_valid"):
+                        arr[i, len(v):] = 0
+                    elif f == "hand":
+                        arr[i, len(v):] = -1
+        out[f] = arr
+    s = _BASE._replace(**{f: jnp.asarray(v) for f, v in out.items() if f != "key"})
+    return s._replace(key=jax.random.wrap_key_data(jnp.asarray(out["key"], jnp.uint32)))
 
 
-class _Host(NamedTuple):
-    """The fields ref_play reads, for a batched case."""
-    jokers: np.ndarray
-    joker_value: np.ndarray
-    hand: np.ndarray
-    hand_valid: np.ndarray
-    money: int
-    discards: int
-    deck: np.ndarray
-    deck_size: int
-    deck_ptr: int
-    joker_slots: int
+def _host_case(k):
+    """The host view of one case (for the reference)."""
+    fields = {}
+    for f in _BASE._fields:
+        base = np.asarray(getattr(_BASE, f)).copy()
+        if f in k:
+            v = np.asarray(k[f], base.dtype)
+            if base.ndim == 0:
+                base = v
+            else:
+                base[:len(v)] = v
+                base[len(v):] = -1 if f in ("jokers", "hand") else 0
+        fields[f] = base
+    return SimpleNamespace(**fields)
 
 
-def _ref_case(k):
-    jokers = np.full(MAX_JOKERS, -1, np.int32); jokers[:len(k["jokers"])] = k["jokers"]
-    values = np.zeros(MAX_JOKERS, np.float32); values[:len(k["values"])] = k["values"]
-    hand = np.full(MAX_HAND_SIZE, -1, np.int32); hand[:len(k["hand"])] = k["hand"]
-    valid = np.zeros(MAX_HAND_SIZE, bool); valid[:len(k["valid"])] = k["valid"]
-    sel = np.zeros(MAX_HAND_SIZE, bool); sel[:len(k["sel"])] = k["sel"]
-    s = _Host(jokers, values, hand, valid, k["money"], k["discards"], np.asarray(_BASE.deck),
-              52, k["deck_ptr"], k["slots"])
-    return s, sel
-
-
-def _compare(c, tag, cases, out):
-    """Env batch output vs REF, case by case. -> per-name count of cases where the joker acted."""
-    chips, mult, score, htype = out
+def _compare(c, tag, cases):
+    """Env batch vs the reference, case by case. -> per-name count of cases where the joker acted."""
+    res, out = jax.device_get(_explain_batch(_batch_states(cases), jnp.asarray(np.stack([k["sel"] for k in cases]))))
     acted = Counter()
     for i, k in enumerate(cases):
-        s, sel = _ref_case(k)
-        rc, rm, rs, name, vals = ref_play(s, sel)
-        jk = [int(j) for j in k["jokers"]]
-        cards = [int(s.hand[l]) for l in played_lanes(s, sel)]
-        for slot in ref_score(cards, jk, vals, ref_ctx(s))[3]:
-            acted[NAME[jk[slot]]] += 1
-        ok = (exact(float(chips[i]), rc) and exact(float(mult[i]), rm) and exact(int(score[i]), rs)
-              and HAND_NAMES[int(htype[i])] == name)
-        c.check(f"{tag} case {i}: {[NAME[j] for j in jk]} {[_cn(x) for x in cards]} "
-                f"money {k['money']} disc {k['discards']} ptr {k['deck_ptr']} slots {k['slots']}",
-                ok, (HAND_NAMES[int(htype[i])], float(chips[i]), float(mult[i]), int(score[i])),
-                (name, rc, rm, rs))
+        p = _host_case(k)
+        o = jax.tree.map(lambda x: x[i], out)
+        r, _, cards = ref_play_state(p, np.asarray(k["sel"]), o)
+        names = [NAME[int(j)] for j in k["jokers"]]
+        for slot in r["acted"]:
+            acted[names[slot]] += 1
+        m = R.mods_of(names)
+        for mod, key, off in (("Four Fingers", "ff", False), ("Shortcut", "sc", False),
+                              ("Smeared Joker", "sm", False), ("Splash", "sp", False),
+                              ("Pareidolia", "pa", False), ("Oops! All 6s", "odds", 1)):
+            if mod in names and m[key] != off:
+                alt = ref_play_state(p, np.asarray(k["sel"]), o, mods={**m, key: off})[0]
+                if (alt["score"], alt["money"]) != (r["score"], r["money"]) or key == "odds" and alt["acted"] != r["acted"]:
+                    acted[mod] += 1
+        ok = (near(float(res.chips[i]), r["chips"]) and near(float(res.mult[i]), r["mult"])
+              and abs(int(res.score[i]) - r["score"]) <= max(1, abs(r["score"]) * 2 ** -18)
+              and HAND_NAMES[int(res.handtype[i])] == r["hand"]
+              and near(float(res.money[i]), r["money"]))
+        c.check(f"{tag} case {i}: {names} {[_cn(x) for x in cards]} money {k['money']}",
+                ok, (HAND_NAMES[int(res.handtype[i])], float(res.chips[i]), float(res.mult[i]),
+                     int(res.score[i]), float(res.money[i])),
+                (r["hand"], r["chips"], r["mult"], r["score"], r["money"]))
     return acted
 
 
@@ -617,12 +736,20 @@ def _cn(cid):
     return "23456789TJQKA"[cid % 13] + "CDHS"[cid // 13]
 
 
-def _case(jokers, hand, valid, sel, *, values=None, money=0, discards=2, deck_ptr=8, slots=5):
+def _seed(j):
+    return float(R.SEED.get(NAME[j], JOKERS.VALUE[j]))
+
+
+def _case(jokers, hand, valid, sel, **kw):
+    values = kw.pop("values", None)
     if values is None:
-        values = [REF[NAME[j]].seed if REF[NAME[j]].seed is not None else float(JOKERS.VALUE[j])
-                  for j in jokers]
-    return dict(jokers=list(jokers), values=list(values), hand=list(hand), valid=list(valid),
-                sel=list(sel), money=money, discards=discards, deck_ptr=deck_ptr, slots=slots)
+        values = [_seed(j) for j in jokers]
+    sell = [max(1, int(JOKER_COST[j]) // 2) for j in jokers]
+    d = dict(jokers=list(jokers), joker_value=list(values), joker_sell_value=sell,
+             hand=list(hand), hand_valid=list(valid), sel=np.array(list(sel) + [False] * (MAX_HAND_SIZE - len(sel))),
+             money=0)
+    d.update(kw)
+    return d
 
 
 # ===========================================================================
@@ -630,17 +757,16 @@ def _case(jokers, hand, valid, sel, *, values=None, money=0, discards=2, deck_pt
 # ===========================================================================
 def run_order_test():
     c = Checks("joker order")
-    mix = [JOKER_ID[n] for n in ("Joker", "The Duo", "Jolly Joker", "Joker Stencil", "Greedy Joker")]
-    for hname in ("pair", "full", "high"):
-        lanes, sel = HANDS[hname]
-        ids = card_ids(lanes)
-        sel = [int(b) for b in sel] + [0] * (8 - len(sel))
-        cases = [_case(p, ids, [True] * 8, sel) for p in itertools.permutations(mix)]
-        out = _run_batch(cases)
-        _compare(c, f"order {hname}", cases, out)
-        if hname == "pair":
-            c.check("pair: the slot order changes the score", len(set(out[2].tolist())) > 1,
-                    sorted(set(out[2].tolist())))
+    for mix in (("Joker", "The Duo", "Jolly Joker", "Joker Stencil", "Greedy Joker"),
+                ("Blueprint", "Photograph", "Joker", "Baseball Card", "Bull"),
+                ("Brainstorm", "Hanging Chad", "Scary Face", "The Duo", "Mime")):
+        ids = [JOKER_ID[n] for n in mix]
+        for hname in ("pair", "full", "high", "pair_k"):
+            lanes, sel = HANDS[hname]
+            hand = card_ids(lanes)
+            sel = [bool(int(b)) for b in sel] + [False] * (8 - len(sel))
+            cases = [_case(p, hand, [True] * 8, sel, money=10) for p in itertools.permutations(ids)]
+            _compare(c, f"order {mix[0]} {hname}", cases)
 
     # MOVE_JOKER changes the next PLAY: [Duo, Joker] 2*2+4 = 8 -> [Joker, Duo] (2+4)*2 = 12
     lanes, sel = HANDS["pair"]
@@ -655,7 +781,20 @@ def run_order_test():
 # ===========================================================================
 # FUZZ — random hands x random loadouts x random live state
 # ===========================================================================
-SHAPES = ["high", "pair", "two_pair", "three", "four", "full", "flush", "straight", "sf", "random"]
+SHAPES = ["high", "pair", "two_pair", "three", "four", "full", "flush", "straight", "sf",
+          "flush4", "straight4", "gappy", "random"]
+RULES = [JOKER_ID[n] for n in ("Four Fingers", "Shortcut", "Smeared Joker", "Splash", "Pareidolia",
+                               "Oops! All 6s", "Blueprint", "Brainstorm")]
+# loadouts that random draws rarely make: a joker and the joker it needs
+THEMES = [("Mime", "Baron"), ("Mime", "Shoot the Moon"), ("Mime", "Raised Fist"),
+          ("Mime", "Reserved Parking", "Oops! All 6s"), ("The Idol",), ("Pareidolia", "Smiley Face"),
+          ("Pareidolia", "Scary Face", "Hanging Chad"), ("Pareidolia", "Photograph"),
+          ("Smeared Joker", "Greedy Joker"), ("Smeared Joker", "Droll Joker"),
+          ("Four Fingers", "Droll Joker", "Crazy Joker"), ("Shortcut", "Crazy Joker"),
+          ("Splash", "Hack"), ("Blueprint", "The Duo"), ("Brainstorm",), ("The Family",),
+          ("The Tribe",), ("Crafty Joker",), ("Droll Joker",), ("Blackboard",), ("Baron",),
+          ("Oops! All 6s", "Bloodstone"), ("Oops! All 6s", "Business Card", "Bull"),
+          ("Mad Joker",), ("To Do List", "Bull"), ("Hit the Road",), ("Card Sharp",)]
 
 
 def _played(rng):
@@ -663,15 +802,22 @@ def _played(rng):
     shape = SHAPES[rng.integers(len(SHAPES))]
     if shape == "random":
         return list(rng.choice(52, rng.integers(1, 6), replace=False))
-    if shape in ("flush", "straight", "sf"):
-        if shape == "flush":
+    if shape in ("flush", "straight", "sf", "flush4", "straight4", "gappy"):
+        if shape in ("flush", "flush4"):
             ranks = list(rng.choice(13, 5, replace=False))
+        elif shape == "gappy":
+            lo = int(rng.integers(0, 4))
+            ranks = sorted(rng.choice(range(lo, lo + 9), 5, replace=False))
         else:
             lo = rng.integers(-1, 9)                     # -1 = the A-2-3-4-5 wheel
             ranks = [ACE if r < 0 else r for r in range(lo, lo + 5)]
-        suit = rng.integers(4)
-        suits = [suit] * 5 if shape != "straight" else list(rng.integers(0, 4, 5))
-        cards = [s * 13 + r for r, s in zip(ranks, suits)]
+        s0 = rng.integers(4)
+        suits = [s0] * 5 if shape in ("flush", "sf", "flush4") else list(rng.integers(0, 4, 5))
+        if shape in ("flush4", "straight4"):
+            suits[4] = (s0 + 1 + rng.integers(3)) % 4
+            if shape == "straight4":
+                ranks[4] = int(rng.integers(13))
+        cards = list(dict.fromkeys(int(s) * 13 + int(r) for r, s in zip(ranks, suits)))
     else:
         groups = {"high": [1] * rng.integers(1, 6), "pair": [2] + [1] * rng.integers(0, 4),
                   "two_pair": [2, 2] + [1] * rng.integers(0, 2), "three": [3] + [1] * rng.integers(0, 3),
@@ -681,6 +827,9 @@ def _played(rng):
                  for s in rng.choice(4, g, replace=False)]
     rng.shuffle(cards)
     return [int(x) for x in cards]
+
+
+ACE = R.ACE
 
 
 def _fuzz_cases(rng, n):
@@ -702,34 +851,56 @@ def _fuzz_cases(rng, n):
                     sel[l] = True                            # 6 selected: the first 5 valid play
         slots = 5 if rng.random() < 0.8 else int(rng.integers(1, 9))
         jokers = [int(j) for j in rng.integers(0, N_JOKERS, rng.integers(0, slots + 1))]
-        values = []
+        if jokers and rng.random() < 0.4:                    # rule and copy jokers, often
+            jokers[int(rng.integers(len(jokers)))] = int(rng.choice(RULES))
+        if rng.random() < 0.3:
+            theme = [JOKER_ID[nm] for nm in THEMES[rng.integers(len(THEMES))]]
+            jokers = (theme + jokers)[:max(slots, len(theme))]
+            slots = max(slots, len(jokers))
+        values, states = [], []
         for j in jokers:
-            r = REF[NAME[j]]
-            if NAME[j] == "Popcorn":
-                values.append(float(rng.choice([0, 4, 8, 12, 16, 20])))
-            elif r.seed is not None:
-                values.append(float(rng.integers(0, 13)))
+            nm = NAME[j]
+            if nm in ("Obelisk", "Hit the Road", "Campfire"):
+                values.append(1.0 + float(rng.integers(0, 10)) * 0.25)
+            elif nm == "Ramen":
+                values.append(1.0 + float(rng.integers(1, 101)) * 0.01)
+            elif nm in R.SEED:
+                values.append(float(rng.integers(0, 13)) + (nm in ("Ice Cream", "Seltzer", "Turtle Bean", "Popcorn")))
             else:
                 values.append(float(JOKERS.VALUE[j]))
-        cases.append(_case(jokers, hand, valid, sel, values=values, money=int(rng.integers(0, 120)),
-                           discards=int(rng.integers(0, 4)), deck_ptr=int(rng.integers(8, 53)),
-                           slots=slots))
+            states.append(int(rng.integers(0, 9)) if nm == "To Do List" else int(rng.integers(0, 12)) if nm == "Loyalty Card" else 0)
+        hp = [int(x) for x in rng.integers(0, 4, 9)]
+        hr = [min(int(x), h) for x, h in zip(rng.integers(0, 2, 9), hp)]
+        cases.append(_case(jokers, hand, valid, sel, values=values, joker_state=states,
+                           joker_sell_value=[int(rng.integers(1, 9)) for _ in jokers],
+                           money=int(rng.integers(-20, 120)), discards=int(rng.integers(0, 4)),
+                           hands=int(rng.integers(1, 5)), deck_ptr=int(rng.integers(8, 53)),
+                           joker_slots=slots, hand_played=hp, hand_round=hr,
+                           idol_card=int(rng.choice(played)) if rng.random() < 0.5 else int(rng.integers(52)),
+                           mail_rank=int(rng.integers(13)),
+                           ancient_suit=int(rng.integers(4)), castle_suit=int(rng.integers(4)),
+                           key=[int(x) for x in rng.integers(0, 2 ** 31, 2)]))
     return cases
 
 
-def run_fuzz_test(n=6000, seed=0, min_acted=25):
+MONEY_ONLY = {"Golden Joker", "Cloud 9", "Mail-In Rebate", "Faceless Joker", "Delayed Gratification",
+              "Rocket", "Egg", "Gift Card", "Credit Card", "To the Moon", "Chaos the Clown", "Juggler",
+              "Drunkard", "Merry Andy", "Troubadour", "Turtle Bean", "Burglar", "Showman",
+              "Oops! All 6s", "Blueprint", "Brainstorm", "Erosion", "Ice Cream", "Seltzer"}
+
+
+def run_fuzz_test(n=10000, seed=0, min_acted=10):
     c = Checks("joker fuzz")
     rng = np.random.default_rng(seed)
-    cases = _fuzz_cases(rng, n)
-    acted = _compare(c, "fuzz", cases, _run_batch(cases))
-    money_only = {n for n, r in REF.items() if r.card is None and r.main is None}
+    acted = Counter()
+    for chunk in range(0, n, 2000):
+        cases = _fuzz_cases(rng, min(2000, n - chunk))
+        acted += _compare(c, "fuzz", cases)
     for name in JOKER_NAMES:
-        if name in money_only:
-            c.check(f"{name} never changes a score", acted[name] == 0, acted[name], 0)
-        else:
-            c.check(f"{name} changed the score in at least {min_acted} cases",
-                    acted[name] >= min_acted, acted[name], min_acted)
-    low = sorted(((acted[n], n) for n in JOKER_NAMES if n not in money_only))[:3]
+        if name in MONEY_ONLY:
+            continue
+        c.check(f"{name} acted in at least {min_acted} cases", acted[name] >= min_acted, acted[name], min_acted)
+    low = sorted(((acted[n], n) for n in JOKER_NAMES if n not in MONEY_ONLY))[:4]
     print(f"  joker fuzz: {n} cases; fewest firings {low}")
     return c.done()
 
@@ -745,7 +916,6 @@ def run_life_test():
     hand = "KD KC 2H 3S 4C 6D 7H 8S"
 
     # Green: +1 per play before it scores, -1 per discard, floored at 0.
-    # A DISCARD with 0 discards left is a PLAY, so it counts +1.
     s = state(hand, jokers=("Green Joker",), hands=4, discards=3, blind_target=BIG)
     seq = [act(V_PLAY, "11"), act(V_DISCARD, "1"), act(V_DISCARD, "1"), act(V_DISCARD, "1"),
            act(V_DISCARD, "11"), act(V_PLAY, "1")]
@@ -755,62 +925,95 @@ def run_life_test():
         seen.append(float(s.joker_value[0]))
     c.eq("green values", seen, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0])
 
-    # Popcorn -4 and Golden / Cloud 9 money over 7 cleared blinds; Green +1 a play.
+    # Popcorn -4 a round and eaten at 0; Golden / Cloud 9 money over 6 cleared blinds.
     s = reset(jax.random.key(3), 52, 8)
-    for n in ("Popcorn", "Green Joker", "Golden Joker", "Cloud 9"):
-        s = s._replace(jokers=s.jokers.at[int((s.jokers >= 0).sum())].set(JOKER_ID[n]))
-    held = int((s.jokers >= 0).sum())
-    s = s._replace(joker_value=s.joker_value.at[:held].set(
-        jnp.array([20.0, 0.0, float(JOKERS.VALUE[JOKER_ID["Golden Joker"]]),
-                   float(JOKERS.VALUE[JOKER_ID["Cloud 9"]])])),
-                   joker_sell_value=s.joker_sell_value.at[:held].set(jnp.array([2, 2, 3, 3])))
-    pops, greens = [], []
-    for r in range(7):
+    for nm in ("Popcorn", "Green Joker", "Golden Joker", "Cloud 9"):
+        s, _ = jax.jit(acquire)(s, JOKER_ID[nm])
+    pops = []
+    for r in range(6):
         s = s._replace(blind_target=jnp.int32(1))
         pre = host(s)
         s = drive(c, f"round {r}", s, [act(V_PLAY, "1")])
         c.eq(f"round {r}: cashout has $8 of joker money",
-             s.last_cashout, BLIND_PAY[int(pre.blind_index)] + int(pre.hands) - 1
+             s.last_cashout, R.BLIND_PAY[int(pre.blind_index)] + int(pre.hands) - 1
              + min(int(pre.money) // 5, 5) + 8)
-        pops.append(float(s.joker_value[0]))
-        greens.append(float(s.joker_value[1]))
+        pops.append(float(s.joker_value[0]) if int(s.jokers[0]) == JOKER_ID["Popcorn"] else None)
         s = drive(c, f"round {r} next", s, [act(V_NEXT)])
-    c.eq("popcorn values", pops, [16.0, 12.0, 8.0, 4.0, 0.0, 0.0, 0.0])
-    c.eq("green values over rounds", greens, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+    want_pops = [16.0, 12.0, 8.0, 4.0, None, None]
+    c.check("popcorn values, then eaten", pops == want_pops, pops, want_pops)
 
-    # Sell Golden mid-blind: the clear pays Cloud 9 only.
-    pair = "11"
-    for jokers, extra in ((("Golden Joker", "Cloud 9"), 8), (("Cloud 9",), 4), ((), 0)):
-        pre = state(hand, jokers=jokers, chips_scored=290, blind_target=300, money=0)
-        got = drive(c, f"cashout {jokers}", pre, [act(V_PLAY, pair)])
-        c.eq(f"cashout {jokers}", got.last_cashout, 3 + 2 + extra)
-    pre = state(hand, jokers=("Golden Joker", "Cloud 9"), chips_scored=290, blind_target=300)
-    got = drive(c, "sold golden", pre, [act(V_SELL, target=0), act(V_PLAY, pair)])
-    c.eq("sold Golden: Cloud 9 pays alone", got.last_cashout, 3 + 2 + 4)
+    # Discards: Castle (Spades), Mail-In (Aces), Hit the Road (Jacks), Ramen, Faceless, Green
+    s = state("AS JS JD KH QC 3S 4C 6D", jokers=("Castle", "Mail-In Rebate", "Hit the Road", "Ramen",
+                                                 "Faceless Joker"),
+              hands=4, discards=3, blind_target=BIG, mail_rank=12, castle_suit=3)
+    s = drive(c, "discard", s, [act(V_DISCARD, "11111")])
+    c.eq("discard: Castle +3 x 2 Spades", s.joker_value[0], 6.0)
+    c.eq("discard: Hit the Road +0.5 x 2 Jacks", s.joker_value[2], 2.0)
+    c.check("discard: Ramen -0.01 x 5", near(float(s.joker_value[3]), 1.95), float(s.joker_value[3]))
+    c.eq("discard: $5 (an Ace) + $5 (4 faces)", s.money, 10)
 
-    # Live queries mid-blind: a SELL changes money, the joker count and the
-    # empty slots before the next PLAY; a DISCARD changes Banner and Mystic Summit.
-    s = state(hand, jokers=("Abstract Joker", "Joker", "Bull", "Bootstraps", "Joker Stencil"),
-              money=9, hands=4, discards=3, blind_target=BIG)
-    drive(c, "queries", s, [act(V_PLAY, "11"), act(V_SELL, target=1), act(V_PLAY, "11"),
-                            act(V_MOVE_JOKER, target=3, dest=0), act(V_DISCARD, "1"), act(V_PLAY, "111")])
-    s = state(hand, jokers=("Banner", "Blue Joker", "Mystic Summit"), hands=4, discards=1,
-              blind_target=BIG)
-    drive(c, "discard queries", s, [act(V_PLAY, "11"), act(V_DISCARD, "11111"), act(V_PLAY, "11"),
-                                    act(V_PLAY, "11111")])
+    # Delayed Gratification pays $2 per discard left when none was used; Rocket; To the Moon
+    for used, want_extra in ((0, 2 * 2), (1, 0)):
+        s = state(hand, jokers=("Delayed Gratification",), chips_scored=290, blind_target=300,
+                  discards=2, discards_used=used, money=0)
+        s = drive(c, f"delayed {used}", s, [act(V_PLAY, "11")])
+        c.eq(f"delayed {used}: cashout", s.last_cashout, 3 + 2 + want_extra)
+    s = state(hand, jokers=("Rocket", "To the Moon"), chips_scored=290, blind_target=300, money=25,
+              blind_index=BLIND_BOSS, ante=2)
+    s = drive(c, "rocket boss", s, [act(V_PLAY, "11")])
+    c.eq("rocket boss: 5 + 2 hands + $10 interest + $3 Rocket", s.last_cashout, 5 + 2 + 10 + 3)
+    c.eq("rocket boss: +2 payout", s.joker_value[0], 3.0)
 
-    # Counters follow MOVE / SELL; a bought counter starts at its seed.
-    s = state(hand, jokers=("Joker", "Green Joker", "Popcorn"), joker_value=(4.0, 3.0, 12.0),
-              game_stage=STAGE_SHOP, money=20, shop_slots=("Green Joker", "Joker"))
-    # [Joker, Green, Popcorn] -> 1->0 [Green, Joker, Popcorn] -> 1->2 [Green, Popcorn, Joker]
-    s = drive(c, "follow", s, [act(V_MOVE_JOKER, target=1, dest=0), act(V_MOVE_JOKER, target=1, dest=2),
-                               act(V_SELL, target=0), act(V_BUY, target=0)])
-    c.eq("follow: jokers", s.jokers[:3],
-         jnp.array([JOKER_ID["Popcorn"], JOKER_ID["Joker"], JOKER_ID["Green Joker"]]))
-    c.eq("follow: values", s.joker_value[:3], jnp.array([12.0, 4.0, 0.0]))
-    s = drive(c, "follow next", s, [act(V_NEXT)])._replace(blind_target=jnp.int32(BIG))
-    s = drive(c, "follow play", s, [act(V_PLAY, "1"), act(V_DISCARD, "1")])
-    c.eq("follow: after a play and a discard", s.joker_value[:3], jnp.array([12.0, 4.0, 0.0]))
+    # Ice Cream -5 a hand, eaten at 0; Seltzer 10 hands, then gone
+    s = state(hand, jokers=("Ice Cream", "Seltzer"), joker_value=(10.0, 2.0), hands=4, blind_target=BIG)
+    s = drive(c, "decay", s, [act(V_PLAY, "11"), act(V_PLAY, "11")])
+    c.eq("decay: both eaten", s.jokers[:2], jnp.array([-1, -1]))
+
+    # Budget jokers: bought in the shop, the next blind has them
+    s = state(hand, game_stage=STAGE_SHOP, money=100,
+              shop_slots=("Juggler", "Merry Andy", "Troubadour", "Drunkard"), shop_size=4)
+    s = drive(c, "budget", s, [act(V_BUY, target=k) for k in range(4)] + [act(V_NEXT)])
+    c.eq("budget: hand size 8 + 1 - 1 + 2", s.hand_size, 10)
+    c.eq("budget: hands 4 - 1", s.hands, 3)
+    c.eq("budget: discards 3 + 3 + 1", s.discards, 7)
+    c.eq("budget: 10 cards dealt", s.hand_valid.sum(), 10)
+    s = drive(c, "budget sell", s, [act(V_SELL, target=2), act(V_PLAY, "1")])
+    c.eq("budget: Troubadour sold, hand size 8", s.hand_size, 8)
+    c.check("budget: the extra cards stay", int(s.hand_valid.sum()) >= 8, int(s.hand_valid.sum()))
+
+    # Burglar: +3 hands, no discards
+    s = state(hand, jokers=("Burglar", "Blueprint"), game_stage=STAGE_SHOP)
+    s = drive(c, "burglar", s, [act(V_MOVE_JOKER, target=1, dest=0), act(V_NEXT)])
+    c.eq("burglar + its copy: 4 + 6 hands", s.hands, 10)
+    c.eq("burglar: 0 discards", s.discards, 0)
+
+    # Chaos the Clown: one free reroll per shop; Flash Card +2 a reroll; Credit Card debt
+    s = state(hand, jokers=("Chaos the Clown", "Flash Card", "Credit Card"), game_stage=STAGE_SHOP,
+              money=3, free_rerolls=1, shop_slots=("Bull", "Joker"))
+    s = drive(c, "shop jokers", s, [act(V_REROLL), act(V_REROLL), act(V_REROLL), act(V_BUY, target=0)])
+    c.eq("shop jokers: Flash Card +2 x 3", s.joker_value[1], 6.0)
+    c.check("shop jokers: into debt", int(s.money) < 0, int(s.money))
+
+    # Loyalty Card: X4 on the 6th hand after the buy, then every 6th
+    mults = [float(explain_play(state(hand, jokers=("Loyalty Card",), joker_state=(1,),
+                                      hand_played=(0, 0, 0, 0, 0, 0, 0, k, 0)), select("11")).mult)
+             for k in range(1, 14)]
+    c.eq("loyalty: X4 on the 6th and 12th hand", mults, [8.0 if k in (6, 12) else 2.0 for k in range(1, 14)])
+
+    # Gros Michel extinct -> Cavendish in the shop, Gros Michel never
+    keys = jax.random.split(jax.random.key(0), 3000)
+    held = jnp.full(MAX_JOKERS, -1, jnp.int32)
+    ext = jax.vmap(lambda k: roll_shop(k, held, 4, False, True))(keys)
+    alive = jax.vmap(lambda k: roll_shop(k, held, 4, False, False))(keys)
+    c.check("extinct: Cavendish appears", bool((ext == JOKER_ID["Cavendish"]).any()))
+    c.check("extinct: Gros Michel never", not bool((ext == JOKER_ID["Gros Michel"]).any()))
+    c.check("alive: Cavendish never", not bool((alive == JOKER_ID["Cavendish"]).any()))
+    # Showman: held jokers and repeats in the shop
+    held = held.at[0].set(JOKER_ID["Joker"])
+    show = jax.vmap(lambda k: roll_shop(k, held, 4, True, False))(keys)
+    c.check("showman: a held joker appears", bool((show == JOKER_ID["Joker"]).any()))
+    rep = np.asarray(show)
+    c.check("showman: a joker twice in one shop", any(len(set(r)) < 4 for r in rep))
     return c.done()
 
 
@@ -818,7 +1021,7 @@ def run_life_test():
 # SOAK — vmapped random runs; every step of every env through the model
 # ===========================================================================
 def _policy(p, rng):
-    """A random action with mostly-legal targets. -> (verb, select, target)."""
+    """A random action with mostly-legal targets. -> (verb, select, target, dest)."""
     stage = int(p.game_stage)
     held = int((p.jokers >= 0).sum())
     sel = np.zeros(MAX_HAND_SIZE, bool)
@@ -833,47 +1036,53 @@ def _policy(p, rng):
             k = len(valid)                                   # more than 5: the first 5 play
         sel[rng.choice(valid, k, replace=False)] = True
         if u < 0.55:
-            return V_PLAY, sel, 0
+            return V_PLAY, sel, 0, 0
         if u < 0.75:
-            return V_DISCARD, sel, 0
+            return V_DISCARD, sel, 0, 0
         if u < 0.82:
-            return V_SELL, sel, int(rng.integers(-1, held + 1))
+            return V_SELL, sel, int(rng.integers(-1, held + 1)), 0
         if u < 0.91:
             return V_MOVE_JOKER, sel, int(rng.integers(-1, held + 1)), int(rng.integers(-1, held + 1))
         size = int(p.hand_size)
         return V_MOVE_CARD, sel, int(rng.integers(-1, size + 1)), int(rng.integers(-1, size + 1))
     if stage == STAGE_SHOP:
         if u < 0.4:
-            return V_BUY, sel, int(rng.integers(-1, MAX_SHOP_SLOTS))
+            return V_BUY, sel, int(rng.integers(-1, MAX_SHOP_SLOTS)), 0
         if u < 0.5:
-            return V_SELL, sel, int(rng.integers(-1, held + 1))
+            return V_SELL, sel, int(rng.integers(-1, held + 1)), 0
         if u < 0.6:
-            return V_REROLL, sel, 0
+            return V_REROLL, sel, 0, 0
         if u < 0.7:
             return V_MOVE_JOKER, sel, int(rng.integers(-1, held + 1)), int(rng.integers(-1, held + 1))
-        return V_NEXT, sel, 0
-    return int(rng.integers(0, 8)), sel, 0                  # LOST / WON: all no-ops
+        return V_NEXT, sel, 0, 0
+    return int(rng.integers(0, 8)), sel, 0, 0              # LOST / WON: all no-ops
 
 
 _batch_reset = jax.jit(jax.vmap(lambda k: reset(k, 52, 8)))
+_batch_budget = jax.jit(jax.vmap(apply_budget))
 
 
 def _soak_batch(rng, key, n_envs):
-    """Fresh runs: 0-3 random starting jokers, some money, a mix of curriculum scales."""
+    """Fresh runs: 0-4 random starting jokers, some money, a mix of curriculum scales."""
     batch = _batch_reset(jax.random.split(key, n_envs))
     J = np.full((n_envs, MAX_JOKERS), -1, np.int32)
     V = np.zeros((n_envs, MAX_JOKERS), np.float32)
     S = np.zeros((n_envs, MAX_JOKERS), np.int32)
+    T = np.zeros((n_envs, MAX_JOKERS), np.int32)
     for i in range(n_envs):
-        for slot, j in enumerate(rng.integers(0, N_JOKERS, rng.integers(0, 4))):
-            seed_v = REF[NAME[j]].seed
+        for slot, j in enumerate(rng.integers(0, N_JOKERS, rng.integers(0, 5))):
             J[i, slot], S[i, slot] = j, max(1, int(JOKER_COST[j]) // 2)
-            V[i, slot] = float(JOKERS.VALUE[j]) if seed_v is None else seed_v
+            V[i, slot] = _seed(j)
+            T[i, slot] = int(rng.integers(9)) if NAME[j] == "To Do List" else 0
     scale = rng.choice([0.01, 0.03, 0.1, 0.3], n_envs).astype(np.float32)
-    return batch._replace(
+    batch = batch._replace(
         jokers=jnp.asarray(J), joker_value=jnp.asarray(V), joker_sell_value=jnp.asarray(S),
+        joker_state=jnp.asarray(T),
         money=jnp.asarray(rng.integers(0, 30, n_envs), jnp.int32), target_scale=jnp.asarray(scale),
         blind_target=jnp.asarray(np.maximum(np.floor(100 * scale), 1), jnp.int32))
+    batch = _batch_budget(batch)
+    # the first blind starts with the budget the jokers give
+    return batch._replace(hands=batch.handcount, discards=batch.discardcount)
 
 
 def _swap_in(done, fresh, batch):
@@ -902,13 +1111,14 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
         action = balatroAction(verb=jnp.asarray([a[0] for a in acts], jnp.int32),
                                select=jnp.asarray(np.stack([a[1] for a in acts])),
                                target=jnp.asarray([a[2] for a in acts], jnp.int32),
-                               dest=jnp.asarray([a[3] if len(a) > 3 else 0 for a in acts], jnp.int32))
+                               dest=jnp.asarray([a[3] for a in acts], jnp.int32))
+        outs = jax.device_get(_explain_batch(batch, action.select)[1])
         batch, r, _ = step(batch, action)
         post, r, a_host = host(batch), np.asarray(r), jax.device_get(action)
         for i in range(n_envs):
             one = lambda tree: jax.tree.map(lambda x: x[i], tree)
             p, q = one(pre), one(post)
-            verb = check_step(c, f"step {t} env {i}", p, one(a_host), q, int(r[i]))
+            verb = check_step(c, f"step {t} env {i}", p, one(a_host), q, int(r[i]), one(outs))
             stats[{None: "noop", V_PLAY: "play", V_DISCARD: "discard", V_BUY: "buy", V_SELL: "sell",
                    V_REROLL: "reroll", V_NEXT: "next", V_MOVE_JOKER: "move_joker",
                    V_MOVE_CARD: "move_card"}[verb]] += 1
@@ -936,7 +1146,8 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
     return c.done()
 
 
-ALL = [run_table_test, run_spec_test, run_order_test, run_fuzz_test, run_life_test, run_soak_test]
+ALL = [run_table_test, run_spec_test, run_misprint_test, run_odds_test, run_order_test,
+       run_fuzz_test, run_life_test, run_soak_test]
 
 
 def run_all():

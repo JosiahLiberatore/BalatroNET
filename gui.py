@@ -42,10 +42,14 @@ import pygame
 from env import (balatroAction, env_step, reset, explain_play, preview, build_ctx, acquire,
                  invariant_errors, MAX_HAND_SIZE, STAGE_BLIND, STAGE_SHOP, STAGE_LOST,
                  STAGE_WON, BLIND_NAMES, BLIND_REWARD, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_MOVE_JOKER, V_MOVE_CARD,
-                 V_REROLL, V_NEXT, WIN_ANTE, INTEREST_PER, INTEREST_CAP, RANK_CHARS)
+                 V_REROLL, V_NEXT, WIN_ANTE, INTEREST_PER, INTEREST_CAP, RANK_CHARS, SUIT_CHARS,
+                 live_v, bankrupt_at, reroll_price)
 from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J_EMPTY,
-                    MAX_JOKERS, rows_for, resolve, COMMON, UNCOMMON, RARE,
-                    E_ADD_MULT, E_ADD_CHIPS, E_XMULT, E_ADD_MONEY, EFFECT_NAMES)
+                    MAX_JOKERS, rows_for, resolve, COMMON, UNCOMMON, RARE, LEGENDARY,
+                    E_ADD_MULT, E_ADD_CHIPS, E_XMULT, E_ADD_MONEY, EFFECT_NAMES,
+                    E_CHIPS_MULT, E_RETRIGGER, E_MULT_NOMINAL, E_MULT_RANDOM, E_XMULT_UNCOMMON,
+                    E_NONE, E_SELL_VALUE, E_SELL_VALUE_ALL, E_BURGLAR, S_COUNTER, ST_TODO,
+                    ST_LOYALTY)
 from scoring import HAND_NAMES
 from agent import (observe, legal_mask, move_masks, masked_logits, sample_src, sample_dst, sample_picks,
                    init_params, action_name, is_move, OBS_DIM, N_ACTIONS, ACTION_VERB,
@@ -72,12 +76,13 @@ CARD_EDGE = (190, 185, 175)
 SEL_EDGE  = (255, 210, 80)
 SUIT_C    = [(35, 89, 85), (240, 107, 63), (240, 52, 100), (60, 67, 104)]   # C D H S
 SUIT_GLYPH = ["\u2663", "\u2666", "\u2665", "\u2660"]
-RARITY_C  = {COMMON: (0, 147, 255), UNCOMMON: (53, 189, 134), RARE: (254, 95, 85)}
+RARITY_C  = {COMMON: (0, 147, 255), UNCOMMON: (53, 189, 134), RARE: (254, 95, 85),
+             LEGENDARY: (178, 108, 187)}
 BTN_PLAY  = (0, 147, 255)
 BTN_DISC  = (254, 95, 85)
 BTN_SHOP  = (243, 140, 50)
 BTN_GREEN = (53, 189, 134)
-RARITY_NAME = {COMMON: "Common", UNCOMMON: "Uncommon", RARE: "Rare"}
+RARITY_NAME = {COMMON: "Common", UNCOMMON: "Uncommon", RARE: "Rare", LEGENDARY: "Legendary"}
 AI_C      = (90, 220, 230)    # the model's colour: panel edge, its pick
 BAR_C     = (40, 110, 130)
 
@@ -91,9 +96,30 @@ HAND_LABEL = {"straight_flush": "Straight Flush", "four_kind": "Four of a Kind",
               "three_kind": "Three of a Kind", "two_pair": "Two Pair", "pair": "Pair",
               "high_card": "High Card"}
 
-def effect_label(jid, v):
+SUIT_WORD = ["Club", "Diamond", "Heart", "Spade"]
+HAND_WORD = ["Straight Flush", "Four of a Kind", "Full House", "Flush", "Straight",
+             "Three of a Kind", "Two Pair", "Pair", "High Card"]
+RANK_WORD = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace"]
+
+
+def joker_text(jid, h, slot=None):
+    """The joker's in-game text with this round's targets filled in."""
+    todo = HAND_WORD[int(h.joker_state[slot]) % 9] if slot is not None else "(random hand)"
+    idol = int(h.idol_card)
+    return (JOKER_DESC[jid].replace("{castle}", SUIT_WORD[int(h.castle_suit)])
+            .replace("{ancient}", SUIT_WORD[int(h.ancient_suit) % 4])
+            .replace("{mail}", RANK_WORD[int(h.mail_rank)])
+            .replace("{idol}", f"{RANK_WORD[idol % 13]} of {SUIT_WORD[idol // 13]}s")
+            .replace("{todo}", todo))
+
+
+def effect_label(jid, v, h=None, slot=None):
     """The live value v, worded by the joker's EFFECT axis."""
     e = int(JOKERS.EFFECT[jid])
+    counter = int(JOKERS.SOURCE[jid]) == S_COUNTER
+    if int(JOKERS.STATE[jid]) == ST_LOYALTY and h is not None:
+        left = (5 - (int(h.hand_played.sum()) - int(h.joker_state[slot]))) % 6
+        return ("X4 Mult this hand" if left == 0 else f"{left} remaining"), MULT_C
     if e == E_ADD_MULT:
         return f"+{v:g} Mult", MULT_C
     if e == E_ADD_CHIPS:
@@ -102,6 +128,24 @@ def effect_label(jid, v):
         return f"X{v:g} Mult", MULT_C
     if e == E_ADD_MONEY:
         return f"+${v:g}", MONEY_C
+    if e == E_CHIPS_MULT:
+        return f"+{v:g} Chips +{float(JOKERS.VALUE2[jid]):g} Mult", CHIPS_C
+    if e == E_RETRIGGER:
+        return (f"{v:g} hands left" if counter else f"retrigger x{v:g}"), DIM
+    if e == E_MULT_NOMINAL:
+        return "+2x lowest held rank", MULT_C
+    if e == E_MULT_RANDOM:
+        return f"+0-{v:g} Mult", MULT_C
+    if e == E_XMULT_UNCOMMON:
+        return f"X{v:g} per Uncommon", MULT_C
+    if e in (E_SELL_VALUE, E_SELL_VALUE_ALL):
+        return f"+${v:g} sell value", MONEY_C
+    if e == E_BURGLAR:
+        return f"+{v:g} hands", CHIPS_C
+    if bool(JOKERS.HSIZE_V[jid]):
+        return f"+{v:g} hand size", DIM
+    if e == E_NONE:
+        return "passive", DIM
     return f"{EFFECT_NAMES[e]} {v:g}", DIM
 
 
@@ -111,8 +155,7 @@ def effect_label(jid, v):
 @jax.jit
 def live_values(state):
     """v per joker slot, as scoring would read it right now (resolve pass)."""
-    rows = rows_for(state.jokers)
-    return resolve(rows, state.jokers != J_EMPTY, state.joker_value, build_ctx(state))
+    return live_v(state)
 
 
 _acquire = jax.jit(acquire)
@@ -238,26 +281,48 @@ class Button:
 class Dropdown:
     """A toggle button plus a list that opens upward. pick(i) runs on a row click.
 
-    rows() returns [(label, right_text, stripe_color, enabled)]; it is called on
-    every draw, so the list always matches the current state.
+    rows(query) returns [(label, right_text, stripe_color, enabled, key)] for the
+    typed search text; it is called on every draw, so the list always matches the
+    current state. pick(key) runs on a row click, or on Enter for the top row.
     """
-    ROW_H, MAX_ROWS = 30, 14
+    ROW_H, MAX_ROWS, SEARCH_H = 30, 14, 34
 
     def __init__(self, rect, label, rows, pick, width=340):
         self.button = Button(rect, label, PANEL_HI)
-        self.rows, self.pick, self.width = rows, pick, width
-        self.open, self.scroll = False, 0
+        self.rows_q, self.pick, self.width = rows, pick, width
+        self.open, self.scroll, self.query = False, 0, ""
+
+    def rows(self):
+        return self.rows_q(self.query)
 
     def menu_rect(self):
-        n = min(len(self.rows()), self.MAX_ROWS)
+        n = max(min(len(self.rows()), self.MAX_ROWS), 1)
         b = self.button.rect
-        return pygame.Rect(b.x, b.y - 6 - n * self.ROW_H - 8, self.width, n * self.ROW_H + 8)
+        h = self.SEARCH_H + n * self.ROW_H + 8
+        return pygame.Rect(b.x, b.y - 6 - h, self.width, h)
+
+    def search_rect(self):
+        m = self.menu_rect()
+        return pygame.Rect(m.x + 4, m.y + 4, m.w - 8, self.SEARCH_H - 6)
 
     def row_rects(self):
         m, rows = self.menu_rect(), self.rows()
         vis = range(self.scroll, min(self.scroll + self.MAX_ROWS, len(rows)))
-        return [(i, pygame.Rect(m.x + 4, m.y + 4 + k * self.ROW_H, m.w - 8, self.ROW_H - 2))
+        y0 = m.y + 4 + self.SEARCH_H
+        return [(i, pygame.Rect(m.x + 4, y0 + k * self.ROW_H, m.w - 8, self.ROW_H - 2))
                 for k, i in enumerate(vis)]
+
+    def type(self, chars):
+        self.query, self.scroll = self.query + chars, 0
+
+    def key(self, k):
+        """Search keys while open: Backspace edits, Enter picks the top enabled row."""
+        if k == pygame.K_BACKSPACE:
+            self.query, self.scroll = self.query[:-1], 0
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            ok = [r for r in self.rows() if r[3]]
+            if ok:
+                self.pick(ok[0][4])
 
     def wheel(self, dy):
         top = max(len(self.rows()) - self.MAX_ROWS, 0)
@@ -267,13 +332,14 @@ class Dropdown:
         """True when the dropdown used the click (then nothing else gets it)."""
         if self.button.rect.collidepoint(pos):
             self.open = not self.open
+            self.query, self.scroll = "", 0
             return True
         if not self.open:
             return False
         rows = self.rows()
         for i, r in self.row_rects():
             if r.collidepoint(pos) and rows[i][3]:
-                self.pick(i)
+                self.pick(rows[i][4])
                 return True
         if not self.menu_rect().collidepoint(pos):
             self.open = False          # a click outside closes the menu
@@ -290,9 +356,17 @@ class Dropdown:
             return
         rows, m = self.rows(), self.menu_rect()
         box(surf, m, PANEL, 8, PANEL_HI, 2)
+        sr = self.search_rect()
+        box(surf, sr, BG, 6, SEL_EDGE, 2)
+        cursor = "_" if pygame.time.get_ticks() // 500 % 2 else ""
+        text(surf, fonts.body, self.query + cursor if self.query else "type to search" + cursor,
+             TEXT if self.query else DIM, (sr.x + 10, sr.centery), "midleft")
+        if not rows:
+            text(surf, fonts.small, "no match", DIM, (m.x + 16, m.y + 4 + self.SEARCH_H + self.ROW_H // 2),
+                 "midleft")
         mouse = pygame.mouse.get_pos()
         for i, r in self.row_rects():
-            label, right, stripe, ok = rows[i]
+            label, right, stripe, ok, _ = rows[i]
             if ok and r.collidepoint(mouse):
                 box(surf, r, PANEL_HI, 6)
             pygame.draw.rect(surf, stripe, (r.x + 4, r.y + 5, 5, r.h - 10), border_radius=2)
@@ -357,6 +431,8 @@ class App:
     def refresh(self):
         self.h = host(self.state)
         self.v = np.asarray(live_values(self.state))
+        self.floor = int(bankrupt_at(self.state))
+        self.reroll = int(reroll_price(self.state))
         key = jax.random.fold_in(jax.random.key(self.seed), self.ai_n)
         self.ai = jax.device_get(model_view(self.params, self.state, key))
         self.ai_hand = None            # the hand the model's pick would make (PLAY / DISCARD)
@@ -571,7 +647,7 @@ class App:
             jid = int(h.jokers[i])
             return f"SELL {JOKER_NAMES[jid]} (+${int(h.joker_sell_value[i])})" if jid >= 0 else action_name(a)
         if a == A_REROLL:
-            return f"REROLL (${int(h.reroll_cost)})"
+            return f"REROLL (${self.reroll})"
         return action_name(a)
 
     def model_step(self):
@@ -591,14 +667,15 @@ class App:
         self.joker_sel = None
         self.step(verb, target, dest, quiet=is_move(a))
 
-    def joker_menu_rows(self):
+    def joker_menu_rows(self, query=""):
         h = self.h
+        q = query.lower().strip()
         full = int((h.jokers != J_EMPTY).sum()) >= int(h.joker_slots)
         held = list(int(j) for j in h.jokers)
         return [(name + (f"  (x{held.count(jid)})" if jid in held else ""),
                  f"${int(JOKER_COST[jid])}  {RARITY_NAME[int(JOKER_RARITY[jid])]}",
-                 RARITY_C[int(JOKER_RARITY[jid])], not full)
-                for jid, name in enumerate(JOKER_NAMES)]
+                 RARITY_C[int(JOKER_RARITY[jid])], not full, jid)
+                for jid, name in enumerate(JOKER_NAMES) if q in name.lower()]
 
     # --- layout ---------------------------------------------------------------
     def hand_order(self):
@@ -638,8 +715,8 @@ class App:
             b["sort_suit"] = Button((1060, 668, 110, 40), "Sort Suit", PANEL_HI)
         if stage == STAGE_SHOP:
             b["next"] = Button((340, 250, 190, 70), "Next Round", BTN_DISC)
-            b["reroll"] = Button((340, 334, 190, 70), f"Reroll ${int(h.reroll_cost)}", BTN_GREEN,
-                                 int(h.money) >= int(h.reroll_cost))
+            b["reroll"] = Button((340, 334, 190, 70), f"Reroll ${self.reroll}", BTN_GREEN,
+                                 int(h.free_rerolls) > 0 or int(h.money) - self.reroll >= self.floor)
         if self.joker_sel is not None and stage in (STAGE_BLIND, STAGE_SHOP):
             for i, r in self.joker_rects():
                 if i == self.joker_sel:
@@ -882,7 +959,12 @@ class App:
         text(s, f.small, "Round", DIM, (233, y + 6), "midtop")
         text(s, f.big, int(h.round), MONEY_C, (233, y + 26), "midtop")
 
-        y += 76
+        y += 70
+        idol = int(h.idol_card)
+        text(s, f.small, f"Idol {RANK_CHARS[idol % 13]}{SUIT_CHARS[idol // 13]}  Mail {RANK_CHARS[int(h.mail_rank)]}"
+                         f"  Ancient {SUIT_CHARS[int(h.ancient_suit) % 4]}  Castle {SUIT_CHARS[int(h.castle_suit)]}",
+             DIM, (26, y))
+        y += 22
         for line in self.log[-7:]:
             for part in wrap(f.small, line, 270)[:2]:
                 text(s, f.small, part, DIM, (26, y))
@@ -908,10 +990,10 @@ class App:
             box(s, r, PANEL, 10, SEL_EDGE if i in (self.joker_sel, held_slot) else RARITY_C[int(JOKER_RARITY[jid])], 3)
             text(s, fit(f, name, r.w - 10), name, TEXT, (r.centerx, r.y + 8), "midtop")
             yy = r.y + 36
-            for line in wrap(f.small, JOKER_DESC[jid], r.w - 14)[:4]:
+            for line in wrap(f.small, joker_text(jid, h, i), r.w - 14)[:4]:
                 text(s, f.small, line, DIM, (r.centerx, yy), "midtop")
                 yy += 17
-            label, col = effect_label(jid, float(self.v[i]))
+            label, col = effect_label(jid, float(self.v[i]), h, i)
             text(s, f.bold, f"now {label}", col, (r.centerx, r.bottom - 30), "midtop")
 
     def draw_shop(self):
@@ -926,11 +1008,11 @@ class App:
                 continue
             name = JOKER_NAMES[jid]
             cost = int(JOKER_COST[jid])
-            ok = int(h.money) >= cost
+            ok = int(h.money) - cost >= self.floor
             box(s, r, PANEL_HI, 10, RARITY_C[int(JOKER_RARITY[jid])], 3)
             text(s, fit(f, name, r.w - 10), name, TEXT, (r.centerx, r.y + 8), "midtop")
             yy = r.y + 36
-            for line in wrap(f.small, JOKER_DESC[jid], r.w - 14)[:4]:
+            for line in wrap(f.small, joker_text(jid, h), r.w - 14)[:4]:
                 text(s, f.small, line, DIM, (r.centerx, yy), "midtop")
                 yy += 17
             text(s, f.big, f"${cost}", MONEY_C if ok else DIM, (r.centerx, r.bottom - 40), "midtop")
@@ -1110,11 +1192,11 @@ class App:
         if stage in (STAGE_LOST, STAGE_WON):
             reached = f"Ante {int(h.ante)}, round {int(h.round)}, seed {self.seed}"
             self.draw_overlay("GAME OVER" if stage == STAGE_LOST else "YOU WIN", reached)
+        if self.show_model:
+            self.draw_model_panel()                # before the buttons, so its box does not cover them
         for btn in buttons.values():
             btn.draw(s, self.fonts)
         text(s, self.fonts.small, "dev", DIM, (14, 694))
-        if self.show_model:
-            self.draw_model_panel()
         self.joker_menu.draw(s, self.fonts)        # last, so the open list sits on top
         if self.show_deck:
             self.draw_deck_view()
@@ -1139,8 +1221,13 @@ class App:
                     self.drag[3] = e.pos
                 if e.type == pygame.MOUSEWHEEL and self.joker_menu.open:
                     self.joker_menu.wheel(e.y)
+                if e.type == pygame.TEXTINPUT and self.joker_menu.open:
+                    self.joker_menu.type(e.text)
                 if e.type == pygame.KEYDOWN:
-                    self.key(e.key)
+                    if self.joker_menu.open:       # the search box takes every key while open
+                        self.joker_menu.key(e.key)
+                    else:
+                        self.key(e.key)
             now = pygame.time.get_ticks()
             if self.ai_auto and not self.show_deck and now - self.ai_last >= AUTO_MS:
                 self.ai_last = now

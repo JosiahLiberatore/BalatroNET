@@ -109,6 +109,49 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       sampled logp = teacher-forced logp.
       GPU memory: the first node run hit OOM (train_step temp 7.93 GiB on an 8 GiB 2070S);
       jax.checkpoint on the pick_logp_entropy step -> 2.59 GiB, same math. ~2.7 updates/s.
+- [x] Joker pool groups A + B + C (2026-10-20) — 39 -> 109 jokers, rules read from the Balatro
+      1.0.1o Lua (card.lua calculate_joker, state_events.lua evaluate_play / end_round,
+      misc_functions.lua evaluate_poker_hand). The 100k picker run (84.8% win) leaned on Bull +
+      Bootstraps and never learned flushes; a wider pool dilutes them, as in the real shop.
+      A: counters / scaling / money / budget (Scholar ... Burglar). B: held cards (Baron, Shoot the
+      Moon, Raised Fist, Reserved Parking), 1-in-N rolls, retriggers (Hanging Chad, Dusk, Hack,
+      Sock and Buskin, Seltzer, Mime). C: Four Fingers, Shortcut, Smeared, Splash, Pareidolia,
+      Showman, Oops! All 6s, Blueprint, Brainstorm. Not yet: enhancements / tarots / planets /
+      packs / skips + tags / boss effects / joker creation (D-H in the plan).
+      ENGINE: scoring.play() is the evaluate_play order — detect (rule mods), BEFORE (counters,
+      To Do $), scored cards x repetitions x jokers, held cards x Mime repetitions, main effects in
+      slot order + Baseball on Uncommons, AFTER. Mult is affine per step, so each sequence folds
+      into one product + weighted sum (fold_mult); no scan. "Contains" is computed from the cards
+      (a Four Fingers flush can contain a Pair), not from the CONTAINS table. Copies: copy_sources
+      follows Blueprint / Brainstorm chains; copies score but never update counters or pay cashout.
+      Update rules gained (cond, param, mode): M_ADD / M_RESET / M_RESET_ELSE_ADD.
+      ENV: new state = hand counts (run, round), discards_used, the round targets (Idol card,
+      Mail-In rank, Ancient suit, Castle suit), free_rerolls, gros_extinct, base hand size / hands /
+      discards (hand size etc. = base + held jokers, recomputed on every loadout change; a smaller
+      hand keeps its cards and draws fewer). Money may go to -$20 per Credit Card. Jokers can be
+      destroyed (Ice Cream, Seltzer, Popcorn and Turtle Bean at 0, Ramen at X1, Gros Michel 1 in 6,
+      Cavendish 1 in 1000). A PLAY / DISCARD now moves state.key on (rolls come from
+      fold_in(key, purpose), so explain_play = env_step).
+      BEHAVIOUR CHANGES for old jokers: Popcorn is now eaten at 0 (was: stays at 0); Jolly etc. read
+      "contains" from the cards. Interest needs $5+ (same result as before).
+      TESTS: ref_balatro.py = an independent port of the Lua; tests_jokers uses the env's coin flips
+      (PlayOut.rolls / hrolls / rnd). spec 1235, misprint, odds, order 1507, fuzz 10000 cases,
+      life, soak (every step through the transition model). Ramen goes at the 100th card (the game,
+      by float error, at the 101st).
+      AGENT: obs 4999 dims (joker one-hots x 109, To Do / Loyalty state, round targets, hand
+      counts, budget). Old params do not load: a new training run is needed.
+- [x] 109-joker run on the one-hot obs (2026-10-20, stopped at 86.9k of 100k) — first try OOM at
+      update 0 (3.24 GiB alloc; the obs batch alone is 65536 x 4999 f32 = 1.3 GB). train.batch_grads:
+      the loss / grad over 4 equal chunks (lax.scan), mean of the chunk grads = the full-batch grad
+      (advantage normalized over the full batch first; checked: max rel grad diff 1.5e-6). 3.4 GiB,
+      ~2.07 updates/s (136k env steps/s), 100k ~ 13.4 h.
+      Curve: win 11% @5k, 23% @10k, 30% @30k, 39% @50k, 42% @70k, ~43% @86k (39-joker run: 84-88%).
+      Fixed eval (debug_agent, 512 runs, scale 1.0): win 41.0%, $239.1 / run, ante 6.41, 141 steps /
+      run; MOVE 30.2% of actions; hands pair 45%, two pair 21%, high card 20%, flush 0.1%.
+      Stopped because of the obs: each (slot, joker) pair is its own one-hot input (32 x 109 held +
+      4 x 109 shop = 3924 of 4999 dims), so a joker is learned again per slot and 2.8x the jokers
+      means ~2.8x less data per row. Next: a shared joker embedding. Params kept:
+      node runs/old_onehot_abc_20261020/, local runs/params_onehot_abc.pkl.
 - [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
       hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
       fires Green -1. Real Balatro does not allow either. The agent no longer samples an empty

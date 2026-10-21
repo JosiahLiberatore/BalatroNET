@@ -23,7 +23,8 @@ every choice the env would turn into a no-op, so the policy never spends a
 step on one; dst also masks src itself.
 
 OBS LAYOUT — a union of DISJOINT blocks (NOTES: "obs layout"):
-    SHARED      money, ante, blind, stage, curriculum scale, joker loadout
+    SHARED      money, ante, blind, stage, curriculum scale, joker loadout, To Do / Loyalty
+                state, round targets (Idol, Mail-In, Ancient, Castle), hand counts, budget
     BLIND-ONLY  hand ranks/suits, hands/discards left, chips vs target, undealt mask  (0 in the shop)
     SHOP-ONLY   shop offers, costs, affordability, reroll cost                        (0 in a blind)
 """
@@ -35,8 +36,10 @@ import jax.numpy as jnp
 
 from env import (balatroAction, balatroEnvState, build_ctx, MAX_HAND_SIZE, MAX_DECK_SIZE,
                  MAX_SHOP_SLOTS, STAGE_BLIND, STAGE_SHOP, V_PLAY, V_DISCARD, V_BUY, V_SELL,
-                 V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, WIN_ANTE)
-from jokers import MAX_JOKERS, N_JOKERS, J_EMPTY, JOKER_COST, rows_for, resolve
+                 V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, WIN_ANTE, live_v, bankrupt_at,
+                 reroll_price)
+from jokers import (MAX_JOKERS, N_JOKERS, J_EMPTY, JOKER_COST, JOKERS, ST_TODO, ST_LOYALTY,
+                    N_HAND_TYPES, rows_for, resolve)
 
 # --- action layout ------------------------------------------------------------
 A_PLAY, A_DISCARD = 0, 1
@@ -96,7 +99,8 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
     slots = jnp.arange(MAX_SHOP_SLOTS)
     offer = state.shop_slots
     cost = JOKER_COST[jnp.clip(offer, 0, N_JOKERS - 1)]
-    buy = shop & (slots < state.shop_size) & (offer >= 0) & (state.money >= cost) & room
+    floor = bankrupt_at(state)                    # 0, or below with Credit Card
+    buy = shop & (slots < state.shop_size) & (offer >= 0) & (state.money - cost >= floor) & room
     sell = (blind | shop) & held
     move = (blind | shop) & (held.sum() >= 2)
     move_card = blind & (state.hand_size >= 2) & state.hand_valid.any()
@@ -106,7 +110,7 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
         buy,
         sell,
         jnp.stack([move, move_card]),
-        jnp.stack([shop & (state.money >= state.reroll_cost), shop]),
+        jnp.stack([shop & ((state.free_rerolls > 0) | (state.money - reroll_price(state) >= floor)), shop]),
     ])
     return legal.at[A_NEXT].set(legal[A_NEXT] | ~legal.any())
 
@@ -133,16 +137,29 @@ def _shared_block(state: balatroEnvState) -> jax.Array:
     blind = (state.game_stage == STAGE_BLIND).astype(f32)
     shop = (state.game_stage == STAGE_SHOP).astype(f32)
     held = state.jokers != J_EMPTY
-    live_v = resolve(rows_for(state.jokers), held, state.joker_value, build_ctx(state))
+    v = live_v(state)
+    kind = JOKERS.STATE[jnp.clip(state.jokers, 0, N_JOKERS - 1)]
+    todo = jax.nn.one_hot(state.joker_state, N_HAND_TYPES) * (held & (kind == ST_TODO))[:, None]
+    loyal = jnp.where(held & (kind == ST_LOYALTY),
+                      jnp.mod(state.hand_played.sum() - state.joker_state, 6) / 5.0, 0.0)
     shared = jnp.concatenate([
         jnp.stack([state.money / 25.0, jnp.log1p(jnp.maximum(state.money, 0)) / 4.0]),
         jax.nn.one_hot(jnp.clip(state.ante, 1, WIN_ANTE) - 1, WIN_ANTE),
         jax.nn.one_hot(state.blind_index, 3),
         jnp.stack([blind, shop, state.target_scale]),
         (jax.nn.one_hot(state.jokers, N_JOKERS) * held[:, None]).ravel(),   # -1 -> all zero
-        live_v / 10.0,
+        v / 10.0,
         state.joker_sell_value / 10.0,
+        todo.ravel(), loyal,
         jnp.stack([held.sum() / state.joker_slots, state.joker_slots / 5.0]),
+        # the round targets (The Idol, Mail-In Rebate, Ancient Joker, Castle)
+        jax.nn.one_hot(state.idol_card % 13, 13), jax.nn.one_hot(state.idol_card // 13, 4),
+        jax.nn.one_hot(state.mail_rank, 13), jax.nn.one_hot(state.ancient_suit, 4),
+        jax.nn.one_hot(state.castle_suit, 4),
+        state.hand_played / 10.0, state.hand_round / 4.0,
+        jnp.stack([state.hand_size / 10.0, state.handcount / 5.0, state.discardcount / 5.0,
+                   state.discards_used / 3.0, state.free_rerolls.astype(f32),
+                   bankrupt_at(state) / 20.0, state.gros_extinct.astype(f32)]),
     ]).astype(f32)
     return shared
 
@@ -179,7 +196,7 @@ def observe(state: balatroEnvState) -> jax.Array:
         (jax.nn.one_hot(offer, N_JOKERS) * on[:, None]).ravel(),
         cost / 10.0,
         (on & (state.money >= cost)).astype(f32),
-        jnp.stack([state.reroll_cost / 10.0, (state.money >= state.reroll_cost).astype(f32)]),
+        jnp.stack([reroll_price(state) / 10.0, (state.money >= reroll_price(state)).astype(f32)]),
     ]).astype(f32) * shop
 
     return jnp.concatenate([shared, blind_block, shop_block])

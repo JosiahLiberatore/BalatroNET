@@ -146,13 +146,38 @@ def loss_fn(params, batch):
     logp, ent = jax.vmap(log_prob_entropy, in_axes=(None, 0, 0, 0, 0, 0, 0))(
         params, hd, batch["a"], batch["picks"], batch["src"], batch["dst"], batch["hand_valid"])
     value = hd.value
-    adv = batch["adv"]
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    adv = batch["adv"]               # normalized over the full batch in batch_grads
     pg_loss = -(logp * adv).mean()
     v_loss = 0.5 * ((value - batch["ret"]) ** 2).mean()
     entropy = ent.mean()
     loss = pg_loss + VF_COEF * v_loss - ENTROPY_BETA * entropy
     return loss, {"pg_loss": pg_loss, "v_loss": v_loss, "entropy": entropy}
+
+
+GRAD_CHUNKS = 4   # equal slices of the batch; the mean of their grads = the full-batch grad
+
+
+def batch_grads(params, batch):
+    """value_and_grad of loss_fn over the full batch, one chunk at a time (GPU memory).
+
+    Every loss term is a mean over the batch and the chunks are equal, so the mean of
+    the chunk losses / grads equals the full-batch loss / grad. The advantage
+    normalization needs full-batch statistics, so it runs here, before the split.
+    """
+    adv = batch["adv"]
+    batch = {**batch, "adv": (adv - adv.mean()) / (adv.std() + 1e-8)}
+    chunks = jax.tree.map(lambda x: x.reshape((GRAD_CHUNKS, -1) + x.shape[1:]), batch)
+
+    def one(acc, c):
+        (loss, aux), g = jax.value_and_grad(loss_fn, has_aux=True)(params, c)
+        return jax.tree.map(jnp.add, acc, (loss, aux, g)), None
+
+    zero = jax.tree.map(jnp.zeros_like, (jnp.float32(0),
+                                         {"pg_loss": jnp.float32(0), "v_loss": jnp.float32(0),
+                                          "entropy": jnp.float32(0)}, params))
+    tot, _ = jax.lax.scan(one, zero, chunks)
+    loss, aux, grads = jax.tree.map(lambda x: x / GRAD_CHUNKS, tot)
+    return (loss, aux), grads
 
 
 @jax.jit
@@ -163,7 +188,7 @@ def train_step(params, m, v, t, carry, key, scale):
     batch = {k: flat(traj[k]) for k in ("obs", "legal", "hand_valid", "mmask", "a", "picks", "src", "dst")}
     batch["adv"], batch["ret"] = flat(adv), flat(ret)
 
-    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
+    (loss, aux), grads = batch_grads(params, batch)
 
     # global-norm clip, then hand-rolled Adam (same update as v0.1)
     grad_norm = jnp.sqrt(sum(jnp.sum(g * g) for g in jax.tree.leaves(grads)))

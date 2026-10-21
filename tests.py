@@ -9,11 +9,11 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from scoring import scoreHand, joker_score, HAND_NAMES
+from scoring import scoreHand, HAND_NAMES
 from env import balatroAction, deal, env_step, explain_play
 from jokers import update, MAX_JOKERS, T_ONCE_MAIN, T_ON_DISCARD, T_END_OF_ROUND
 from fixtures import (state, select, hand_lanes, mask_lanes, rotated_deck,
-                      loadout, query_ctx, diff_states, report)
+                      loadout, query_ctx, diff_states, report, play_cards)
 
 
 class Case(NamedTuple):
@@ -146,11 +146,9 @@ def run_tests():
     failures = []
     for c in TEST_HANDS:
         rank, suit, valid = jnp.array(c.ranks), jnp.array(c.suits), jnp.array(c.valid)
-        handtype, mask, chips, mult = scoreHand(rank, suit, valid)
-        rows, active, v = loadout(c.jokers, money=c.money, discards=c.discards,
-                                  deck_left=c.deck_left)
-        chips, mult = joker_score(chips, mult, handtype, rank, suit, valid, mask,
-                                  rows, active, v)
+        out = play_cards(rank, suit, valid, c.jokers, money=c.money, discards=c.discards,
+                         deck_left=c.deck_left)
+        handtype, mask, chips, mult = out.handtype, out.mask, out.chips, out.mult
 
         got_type = HAND_NAMES[handtype]
         ok = (got_type == c.type
@@ -224,6 +222,9 @@ def run_env_step_test():
         deck_ptr=jnp.int32(12),
         hands=jnp.int32(2),
         chips_scored=jnp.int32(168),
+        hand_played=pre.hand_played.at[6].set(1),   # two pair, this run and this round
+        hand_round=pre.hand_round.at[6].set(1),
+        key=jax.random.split(pre.key)[0],             # a PLAY or DISCARD moves the key on
     )
     expected_reward = 0
     expected_done = False
@@ -286,6 +287,9 @@ def run_env_step_green_test():
         hands=jnp.int32(2),
         chips_scored=jnp.int32(222),
         joker_value=pre.joker_value.at[0].set(1.0),
+        hand_played=pre.hand_played.at[6].set(1),   # two pair, this run and this round
+        hand_round=pre.hand_round.at[6].set(1),
+        key=jax.random.split(pre.key)[0],             # a PLAY or DISCARD moves the key on
     )
     got, reward, _ = env_step(pre, action)
     failures = diff_states(got, expected, "env_step green play")
@@ -303,6 +307,8 @@ def run_env_step_green_test():
         deck_ptr=jnp.int32(10),
         discards=jnp.int32(1),
         joker_value=pre.joker_value.at[0].set(1.0),
+        discards_used=jnp.int32(1),
+        key=jax.random.split(pre.key)[0],
     )
     got, reward, _ = env_step(pre, action)
     failures += diff_states(got, expected, "env_step green discard")
