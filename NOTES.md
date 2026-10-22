@@ -152,6 +152,23 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       4 x 109 shop = 3924 of 4999 dims), so a joker is learned again per slot and 2.8x the jokers
       means ~2.8x less data per row. Next: a shared joker embedding. Params kept:
       node runs/old_onehot_abc_20261020/, local runs/params_onehot_abc.pkl.
+- [x] Shared joker embedding (2026-10-21) — obs 4999 -> 1111. The 36 (slot, joker) one-hot blocks
+      (32 held + 4 shop, x 109) are now 36 id fields at the front of obs (id + 1, 0 = empty; shop
+      ids only in the shop). W1 does not read them: policy() looks each id up in ONE table
+      e = E[id] (109 x 32, learned) + JOKER_FEATS[id] @ Wf (117 fixed row features: trigger,
+      condition, effect, source, query, state, prob, rarity, pool, magnitudes, update rule), the same
+      for every slot and the shop. h1 = tanh(rest @ W1 + concat_slots(e) @ W1j + b1); W1j has one
+      (32, 256) block per slot, so slot order still matters (Blueprint, slot-order mult). The
+      (slot, joker) input is now the rank-32 product E[j] @ W1j_s: what the agent learns about a
+      joker in one slot (or in the shop) trains the same E[j]. Params 725k (one-hot: ~1.6M).
+      tests_run embed test: ids round-trip, same joker = same vector in any slot / the shop, empty
+      = 0, slot order changes the policy, E[j] gets a gradient from any slot. Old params do not load.
+      GPU memory: 1 grad chunk OOMs (one 3.89 GiB buffer in the loss pass, not the obs);
+      GRAD_CHUNKS = 2 -> 5.7 GiB, 130k env steps/s (4 chunks: 124k), 100k ~ 14 h.
+      Run (100k, 2026-10-21): win 20% @10k, 37% @30k, 44% @40k (one-hot: ~65k), 47% @60k,
+      ~45-50% @85-100k. Fixed eval (512 runs, scale 1.0): win 49.0% (one-hot 41.0%), $277 / run
+      ($239), ante 6.78 (6.41), MOVE 21.6% of actions (30.2%). Hands still pair 46%, high card 23%,
+      two pair 20%, flush 0.1%. Params: node runs/params_run.pkl, local runs/params_embed.pkl.
 - [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
       hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
       fires Green -1. Real Balatro does not allow either. The agent no longer samples an empty

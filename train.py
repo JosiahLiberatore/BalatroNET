@@ -154,7 +154,7 @@ def loss_fn(params, batch):
     return loss, {"pg_loss": pg_loss, "v_loss": v_loss, "entropy": entropy}
 
 
-GRAD_CHUNKS = 4   # equal slices of the batch; the mean of their grads = the full-batch grad
+GRAD_CHUNKS = 2   # equal slices of the batch; the mean of their grads = the full-batch grad
 
 
 def batch_grads(params, batch):

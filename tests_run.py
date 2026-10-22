@@ -697,9 +697,50 @@ def run_picker_test(n_envs=256, seed=11):
     return c.done()
 
 
+def run_embed_test(seed=21):
+    """The shared joker embedding: obs carries the ids (shop ids only in the shop);
+    one joker gives the same embedding in every slot and in the shop; slot order
+    still changes the hidden layer; E[j] gets a gradient from any slot j sits in."""
+    from agent import init_params, observe, joker_ids, joker_embed, policy, J_SLOTS
+    from env import STAGE_SHOP, MAX_SHOP_SLOTS
+    c = Checks("embed")
+    params = init_params(jax.random.key(seed))
+    names = ("Bull", "Blueprint", "Green Joker")
+    s = state(hand="4C KD 9H KC 7C", jokers=names, joker_value=(0.0, 0.0, 2.0))
+    held = [JOKER_ID[n] for n in names]
+    ids = np.asarray(joker_ids(observe(s)))
+    c.eq("held ids", ids[:3], held)
+    c.eq("empty held slots = -1", ids[3:MAX_JOKERS], [-1] * (MAX_JOKERS - 3))
+    c.eq("no shop ids in a blind", ids[MAX_JOKERS:], [-1] * MAX_SHOP_SLOTS)
+    shop = s._replace(game_stage=jnp.int32(STAGE_SHOP),
+                      shop_slots=jnp.array([JOKER_ID["Bull"], -1, JOKER_ID["Baron"], -1], jnp.int32))
+    ids = np.asarray(joker_ids(observe(shop)))
+    c.eq("shop ids in the shop", ids[MAX_JOKERS:], [JOKER_ID["Bull"], -1, JOKER_ID["Baron"], -1])
+
+    e = np.asarray(joker_embed(params, observe(shop)))
+    c.check("Bull: held slot 0 = shop slot 0", np.allclose(e[0], e[MAX_JOKERS]))
+    c.check("empty slots embed to 0", np.abs(e[3:MAX_JOKERS]).max() == 0.0)
+    c.check("different jokers differ", not np.allclose(e[0], e[1]))
+    moved = s._replace(jokers=s.jokers.at[0].set(s.jokers[5]).at[5].set(s.jokers[0]))
+    em = np.asarray(joker_embed(params, observe(moved)))
+    c.check("Bull in slot 5 = Bull in slot 0", np.allclose(em[5], e[0]))
+
+    h = lambda st: policy(params, observe(st), 0)[0]
+    swap = s._replace(jokers=s.jokers.at[0].set(s.jokers[1]).at[1].set(s.jokers[0]))
+    c.check("slot order changes the policy", not np.allclose(h(s), h(swap)))
+
+    bull = JOKER_ID["Bull"]
+    for name, st in (("held slot 5", moved), ("shop only", shop._replace(jokers=jnp.full_like(s.jokers, J_EMPTY)))):
+        g = jax.grad(lambda p: policy(p, observe(st), 0)[3])(params)["E"]
+        g = np.abs(np.asarray(g))
+        c.check(f"E[Bull] has a gradient ({name})", g[bull].max() > 0, g[bull].max())
+        c.check(f"E of an absent joker has none ({name})", g[JOKER_ID["Scholar"]].max() == 0)
+    return c.done()
+
+
 ALL = [run_repair_test, run_deal_empty_test, run_blind_end_test, run_targets_test,
        run_shop_test, run_explain_test, run_vmap_determinism_test, run_full_run_test,
-       run_move_reach_test, run_fuzz_test, run_legal_mask_test, run_picker_test]
+       run_move_reach_test, run_fuzz_test, run_legal_mask_test, run_picker_test, run_embed_test]
 
 
 def run_all():

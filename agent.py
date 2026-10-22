@@ -23,7 +23,11 @@ every choice the env would turn into a no-op, so the policy never spends a
 step on one; dst also masks src itself.
 
 OBS LAYOUT — a union of DISJOINT blocks (NOTES: "obs layout"):
-    SHARED      money, ante, blind, stage, curriculum scale, joker loadout, To Do / Loyalty
+    JOKER IDS   id + 1 per held slot (32), then per shop slot (4, 0 outside the shop); 0 = empty.
+                Not read by W1: policy() looks each id up in the SHARED joker embedding
+                (E[id] + fixed row features @ Wf, the same table for every slot and the shop),
+                and the per-slot blocks of W1j keep the slot order.
+    SHARED      money, ante, blind, stage, curriculum scale, joker values, To Do / Loyalty
                 state, round targets (Idol, Mail-In, Ancient, Castle), hand counts, budget
     BLIND-ONLY  hand ranks/suits, hands/discards left, chips vs target, undealt mask  (0 in the shop)
     SHOP-ONLY   shop offers, costs, affordability, reroll cost                        (0 in a blind)
@@ -38,8 +42,10 @@ from env import (balatroAction, balatroEnvState, build_ctx, MAX_HAND_SIZE, MAX_D
                  MAX_SHOP_SLOTS, STAGE_BLIND, STAGE_SHOP, V_PLAY, V_DISCARD, V_BUY, V_SELL,
                  V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, WIN_ANTE, live_v, bankrupt_at,
                  reroll_price)
-from jokers import (MAX_JOKERS, N_JOKERS, J_EMPTY, JOKER_COST, JOKERS, ST_TODO, ST_LOYALTY,
-                    N_HAND_TYPES, rows_for, resolve)
+import numpy as np
+
+from jokers import (MAX_JOKERS, N_JOKERS, J_EMPTY, JOKER_COST, JOKERS, JOKER_RARITY, ST_TODO,
+                    ST_LOYALTY, N_HAND_TYPES, rows_for, resolve)
 
 # --- action layout ------------------------------------------------------------
 A_PLAY, A_DISCARD = 0, 1
@@ -147,7 +153,6 @@ def _shared_block(state: balatroEnvState) -> jax.Array:
         jax.nn.one_hot(jnp.clip(state.ante, 1, WIN_ANTE) - 1, WIN_ANTE),
         jax.nn.one_hot(state.blind_index, 3),
         jnp.stack([blind, shop, state.target_scale]),
-        (jax.nn.one_hot(state.jokers, N_JOKERS) * held[:, None]).ravel(),   # -1 -> all zero
         v / 10.0,
         state.joker_sell_value / 10.0,
         todo.ravel(), loyal,
@@ -164,10 +169,58 @@ def _shared_block(state: balatroEnvState) -> jax.Array:
     return shared
 
 
+# --- the shared joker embedding ---------------------------------------------------
+J_SLOTS = MAX_JOKERS + MAX_SHOP_SLOTS       # 36 id fields at the front of obs
+JOKER_D = 32                                # embedding width per joker
+
+
+def _joker_feats():
+    """(N_JOKERS, F) fixed features from the compiled rows: what each joker IS
+    (trigger, condition, effect, source, query, state, rarity, magnitudes), so
+    jokers of one kind start near each other. COND_PARAM (masks / ids) is left
+    to the learned part of the embedding."""
+    t = {f: np.asarray(getattr(JOKERS, f)) for f in JOKERS._fields}
+    oh = lambda x: np.eye(int(x.max()) + 1, dtype=np.float32)[x]
+    upd = t["UPD_TRIGGER"] >= 0
+    cols = [oh(t["TRIGGER"]), oh(t["CONDITION"]), oh(t["EFFECT"]), oh(t["SOURCE"]),
+            oh(t["QUERY"]), oh(t["STATE"]), oh(t["PROB"]), oh(np.asarray(JOKER_RARITY)),
+            oh(t["POOL"]),
+            np.stack([np.log1p(t["VALUE"]) / 3.0, t["VALUE2"] / 4.0, t["COPYABLE"],
+                      np.asarray(JOKER_COST) / 10.0, t["H_SIZE"] / 2.0, t["D_SIZE"] / 3.0,
+                      t["H_PLAYS"], t["HSIZE_V"], t["EXPIRE_ODDS"] > 0,
+                      t["EXPIRE_AT"] > -1e8], axis=1).astype(np.float32),
+            upd.astype(np.float32), (t["UPD_DELTA"] * upd / 5.0).astype(np.float32),
+            oh(t["UPD_MODE"]).reshape(N_JOKERS, -1) * np.repeat(upd, 3, axis=1)]
+    return jnp.asarray(np.concatenate(cols, axis=1))
+
+
+JOKER_FEATS = _joker_feats()
+JOKER_F = int(JOKER_FEATS.shape[1])
+
+
+def joker_ids(obs):
+    """(J_SLOTS,) int32 joker id per held / shop slot, -1 = empty (read back from obs)."""
+    return obs[:J_SLOTS].astype(jnp.int32) - 1
+
+
+def joker_embed(params, obs):
+    """(J_SLOTS, JOKER_D): E[id] + feats[id] @ Wf per slot, zero for an empty slot."""
+    ids = joker_ids(obs)
+    j = jnp.clip(ids, 0, N_JOKERS - 1)
+    e = jnp.asarray(params["E"])[j] + JOKER_FEATS[j] @ params["Wf"]
+    return e * (ids >= 0)[:, None]
+
+
 def observe(state: balatroEnvState) -> jax.Array:
     f32 = jnp.float32
     blind = (state.game_stage == STAGE_BLIND).astype(f32)
     shop = (state.game_stage == STAGE_SHOP).astype(f32)
+
+    # JOKER IDS (id + 1, 0 = empty; the shop ids only in the shop)
+    held_id = jnp.where(state.jokers != J_EMPTY, state.jokers + 1, 0)
+    offer_id = jnp.where((state.shop_slots >= 0) & (state.game_stage == STAGE_SHOP),
+                         state.shop_slots + 1, 0)
+    ids = jnp.concatenate([held_id, offer_id]).astype(f32)
 
     # SHARED
     shared = _shared_block(state)
@@ -193,19 +246,18 @@ def observe(state: balatroEnvState) -> jax.Array:
     on = offer >= 0
     cost = JOKER_COST[jnp.clip(offer, 0, N_JOKERS - 1)] * on
     shop_block = jnp.concatenate([
-        (jax.nn.one_hot(offer, N_JOKERS) * on[:, None]).ravel(),
         cost / 10.0,
         (on & (state.money >= cost)).astype(f32),
         jnp.stack([reroll_price(state) / 10.0, (state.money >= reroll_price(state)).astype(f32)]),
     ]).astype(f32) * shop
 
-    return jnp.concatenate([shared, blind_block, shop_block])
+    return jnp.concatenate([ids, shared, blind_block, shop_block])
 
 
 def _obs_dim():
     from fixtures import state as make_state
     s = make_state(hand="2C")
-    return int(observe(s).shape[0]), int(_shared_block(s).shape[0])
+    return int(observe(s).shape[0]), J_SLOTS + int(_shared_block(s).shape[0])
 
 
 def hand_feats(obs) -> jax.Array:
@@ -223,10 +275,13 @@ HIDDEN = 256
 
 def init_params(key, obs_dim=None):
     obs_dim = obs_dim or OBS_DIM
-    k1, k2, k3, k4, k5, k6, k7, k8, k9, k10 = jax.random.split(key, 10)
+    k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13 = jax.random.split(key, 13)
     def dense(k, n_in, n_out, scale):
         return jax.random.normal(k, (n_in, n_out)) * scale / jnp.sqrt(n_in), jnp.zeros(n_out)
-    W1, b1 = dense(k1, obs_dim, HIDDEN, 1.0)
+    W1, b1 = dense(k1, obs_dim - J_SLOTS, HIDDEN, 1.0)   # every obs field but the joker ids
+    E = jax.random.normal(k11, (N_JOKERS, JOKER_D)) * 0.5     # the shared joker embedding
+    Wf, _ = dense(k12, JOKER_F, JOKER_D, 0.5)                 # fixed row features -> embedding
+    W1j, _ = dense(k13, J_SLOTS * JOKER_D, HIDDEN, 1.0)       # one (D, HIDDEN) block per slot
     W2, b2 = dense(k2, HIDDEN, HIDDEN, 1.0)
     Wa, ba = dense(k3, HIDDEN, N_ACTIONS, 0.01)      # small: start near-uniform
     Wq, bq = dense(k4, HIDDEN, 2 * PICK_D, 1.0)        # picker query, one per verb (PLAY, DISCARD)
@@ -236,7 +291,7 @@ def init_params(key, obs_dim=None):
     Wm, bm = dense(k6, HIDDEN, 4 * N_PTR, 0.01)      # joker src, joker dst, card src, card dst
     Pm = jax.random.normal(k7, (2, N_PTR, N_PTR)) * 0.01   # dst bias given src: [kind, src, dst]
     Wv, bv = dense(k5, HIDDEN, 1, 1.0)
-    return {"W1": W1, "b1": b1, "W2": W2, "b2": b2,
+    return {"W1": W1, "b1": b1, "E": E, "Wf": Wf, "W1j": W1j, "W2": W2, "b2": b2,
             "Wa": Wa, "ba": ba, "Wm": Wm, "bm": bm, "Pm": Pm,
             "Wq": Wq, "bq": bq, "Wu": Wu, "bu": bu, "Wc": Wc, "Wn": Wn,
             "vo": jnp.zeros(PICK_D), "vs": jnp.zeros(PICK_D), "bstop": jnp.zeros(1),   # start uniform
@@ -258,7 +313,8 @@ def policy(params, obs, src):
     """obs -> raw (action (42,), picker query (2, PICK_D), pointer (4, 32), value ()).
     The two dst rows are conditioned on src (the joker src for row 1, the card
     src for row 3; one src serves both, only the verb's own pair is read)."""
-    h = jnp.tanh(obs @ params["W1"] + params["b1"])
+    e = joker_embed(params, obs).ravel()
+    h = jnp.tanh(obs[J_SLOTS:] @ params["W1"] + e @ params["W1j"] + params["b1"])
     h = jnp.tanh(h @ params["W2"] + params["b2"])
     ptr = (h @ params["Wm"] + params["bm"]).reshape(4, N_PTR)
     s = jnp.clip(src, 0, N_PTR - 1)

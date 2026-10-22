@@ -52,7 +52,7 @@ from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J
                     ST_LOYALTY)
 from scoring import HAND_NAMES
 from agent import (observe, legal_mask, move_masks, masked_logits, sample_src, sample_dst, sample_picks,
-                   init_params, action_name, is_move, OBS_DIM, N_ACTIONS, ACTION_VERB,
+                   init_params, action_name, is_move, OBS_DIM, J_SLOTS, N_ACTIONS, ACTION_VERB,
                    ACTION_TARGET, A_PLAY, A_DISCARD, A_BUY, A_SELL, A_MOVE_JOKER, A_MOVE_CARD,
                    A_REROLL)
 from train import load_params, PARAMS_PATH, REWARD_SCALE
@@ -194,8 +194,8 @@ def load_model(path):
     """-> (params, label). A missing file gives a random policy, labelled as such."""
     if path and os.path.exists(path):
         params = load_params(path)
-        if (params["W1"].shape[0] != OBS_DIM or params["Wa"].shape[1] != N_ACTIONS
-                or "Wq" not in params):
+        if (params["W1"].shape[0] != OBS_DIM - J_SLOTS or params["Wa"].shape[1] != N_ACTIONS
+                or "Wq" not in params or "E" not in params):
             print(f"{path}: saved for a different obs/action layout; using a random policy")
         else:
             return jax.tree.map(jnp.asarray, params), os.path.basename(path)
