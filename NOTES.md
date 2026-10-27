@@ -168,7 +168,40 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       Run (100k, 2026-10-21): win 20% @10k, 37% @30k, 44% @40k (one-hot: ~65k), 47% @60k,
       ~45-50% @85-100k. Fixed eval (512 runs, scale 1.0): win 49.0% (one-hot 41.0%), $277 / run
       ($239), ante 6.78 (6.41), MOVE 21.6% of actions (30.2%). Hands still pair 46%, high card 23%,
-      two pair 20%, flush 0.1%. Params: node runs/params_run.pkl, local runs/params_embed.pkl.
+      two pair 20%, flush 0.1%. Params: node runs/old_embed_20261021/, local runs/params_embed.pkl.
+- [x] Token encoder (2026-10-27). Why: the agent cannot coordinate 5-card hands (flush 0.1%,
+      straight 0.4%). The old picker scored each card alone (its rank / suit + a query from the
+      trunk + the sum of the cards picked so far): a card never saw the other cards in the hand,
+      so "one of 5 hearts" or "completes 4-5-6-7-8" had to come through one 64-wide query.
+      AGENT (training method, reward and env unchanged; A2C as before):
+      - Tokens: GLOBAL + held jokers + shop offers + hand lanes. Joker token = E[id] + feats @ Wf
+        + slot state (live value, sell value, To Do, Loyalty); offer = the same E / Wf + cost,
+        affordable; card = rank / suit. Each adds a learned POSITION vector (slot / lane) and a
+        TYPE vector: weights are shared across slots, order stays visible (Blueprint, scoring order).
+      - 2 pre-LN self-attention layers (64 wide, 4 heads, FF 128); an empty slot / a hole is never
+        a key. Tokens only where the env can put something: J_TOK 8 held (5 joker slots, packed),
+        C_TOK 16 lanes (8 + the largest hand size bonus); tests_run checks both caps.
+      - Trunk = tanh(GLOBAL feats @ W1 + GLOBAL token @ W1t). W1j (one block per slot) is gone.
+      - BUY / SELL logits add a score per offer / held joker token. MOVE src / dst pointers score
+        the joker / card tokens (dst also from the src token, + the old Pm bias).
+      - Picker: lane query / key / value from the card tokens; each lane also attends over the lanes
+        picked so far (ctx = the sum of the picked tokens, as before).
+      - JOKER_FEATS 117 -> 252: COND_PARAM decoded (suit, rank mask, hand type, count) for the
+        condition and for each update rule, + the update rule's condition one-hot. Droll Joker
+        now says "flush", Greedy "diamonds", Fibonacci "A 2 3 5 8".
+      obs: same fields (1111), regrouped per slot / lane (offsets O_*). Params 393k (725k).
+      Speed on the node (2070S): rollout 0.65 s + grad 1.35 s per update (4 or 8 chunks: same) =
+      ~33k env steps/s, 100k ~ 56 h (embedding run: 130k / s). All 32 tokens per side: 3.5 s.
+      Without jax.checkpoint on the layers the grad pass OOMs. --grad-chunks N (default 8).
+      Run: 100k, --grad-chunks 4, node runs/train_tokens.log (2026-10-27 to 10-30; a Blender job
+      on the node shared the GPU for ~13 h and the run did ~1.1k updates in that time).
+      Curve (mean win over 3k updates): 49% @43k (embedding run: 40%), 51% @50k, 55% @65k,
+      57% @80k, 61% @90k, 65% @97-100k; still rising at the end (embedding run: flat from 60k).
+      Fixed eval (512 runs, scale 1.0): win 67.0% (embedding 49.0%), $306 / run ($277), ante 7.03
+      (6.78); 36 of 512 runs die in ante 1. MOVE 13.2%, DISCARD 7.5%, REROLL 16.0%. Cards per
+      PLAY 4.66 (5: 84%). Hands: pair 41%, high card 32%, two pair 17%, three 5.5%, full house
+      4.0%, straight 0.4%, flush 0.0%. Better play, same hand strategy: no flushes / straights.
+      Params: node runs/params_run.pkl, local runs/params_tokens.pkl (= runs/params_run.pkl).
 - [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
       hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
       fires Green -1. Real Balatro does not allow either. The agent no longer samples an empty

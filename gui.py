@@ -51,8 +51,8 @@ from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J
                     E_NONE, E_SELL_VALUE, E_SELL_VALUE_ALL, E_BURGLAR, S_COUNTER, ST_TODO,
                     ST_LOYALTY)
 from scoring import HAND_NAMES
-from agent import (observe, legal_mask, move_masks, masked_logits, sample_src, sample_dst, sample_picks,
-                   init_params, action_name, is_move, OBS_DIM, J_SLOTS, N_ACTIONS, ACTION_VERB,
+from agent import (observe, encode, legal_mask, move_masks, masked_logits, sample_src, sample_dst, sample_picks,
+                   init_params, action_name, is_move, OBS_DIM, O_GLOB, N_ACTIONS, ACTION_VERB,
                    ACTION_TARGET, A_PLAY, A_DISCARD, A_BUY, A_SELL, A_MOVE_JOKER, A_MOVE_CARD,
                    A_REROLL)
 from train import load_params, PARAMS_PATH, REWARD_SCALE
@@ -167,7 +167,8 @@ def model_view(params, state, key):
     choice, the chance each card is picked (per verb: PLAY, DISCARD; from 256
     sampled pick sequences), the value, and a sampled and a greedy pick."""
     obs, legal, mmask = observe(state), legal_mask(state), move_masks(state)
-    hd = masked_logits(params, obs, legal, state.hand_valid, mmask)
+    enc = encode(params, obs)
+    hd = masked_logits(params, obs, legal, state.hand_valid, mmask, enc=enc)
     pa = jax.nn.softmax(hd.a)
     k1, k2, k3, k4, k5 = jax.random.split(key, 5)
     pick = lambda v, k, greedy=False: sample_picks(params, hd, v, state.hand_valid, k, greedy)[1]
@@ -178,8 +179,8 @@ def model_view(params, state, key):
     # the move pointers: src first, then dst given that src (as act() samples them)
     src_s = sample_src(hd, a_s, k3)
     src_g = jnp.where(a_g == A_MOVE_JOKER, jnp.argmax(hd.ptr[0]), jnp.argmax(hd.ptr[2]))
-    hd_s = masked_logits(params, obs, legal, state.hand_valid, mmask, src_s)
-    hd_g = masked_logits(params, obs, legal, state.hand_valid, mmask, src_g)
+    hd_s = masked_logits(params, obs, legal, state.hand_valid, mmask, src_s, enc)
+    hd_g = masked_logits(params, obs, legal, state.hand_valid, mmask, src_g, enc)
     dst_g = jnp.where(a_g == A_MOVE_JOKER, jnp.argmax(hd_g.ptr[1]), jnp.argmax(hd_g.ptr[3]))
     return {"pa": pa, "ps": ps, "value": hd.value, "legal": legal,
             "a_sample": a_s,
@@ -194,8 +195,8 @@ def load_model(path):
     """-> (params, label). A missing file gives a random policy, labelled as such."""
     if path and os.path.exists(path):
         params = load_params(path)
-        if (params["W1"].shape[0] != OBS_DIM - J_SLOTS or params["Wa"].shape[1] != N_ACTIONS
-                or "Wq" not in params or "E" not in params):
+        if (params["W1"].shape[0] != OBS_DIM - O_GLOB or params["Wa"].shape[1] != N_ACTIONS
+                or "layers" not in params):
             print(f"{path}: saved for a different obs/action layout; using a random policy")
         else:
             return jax.tree.map(jnp.asarray, params), os.path.basename(path)

@@ -698,10 +698,14 @@ def run_picker_test(n_envs=256, seed=11):
 
 
 def run_embed_test(seed=21):
-    """The shared joker embedding: obs carries the ids (shop ids only in the shop);
-    one joker gives the same embedding in every slot and in the shop; slot order
-    still changes the hidden layer; E[j] gets a gradient from any slot j sits in."""
-    from agent import init_params, observe, joker_ids, joker_embed, policy, J_SLOTS
+    """The token encoder: obs carries the ids (shop ids only in the shop); the
+    fixed features carry COND_PARAM (Droll = flush, Greedy = diamonds); one
+    joker has the same embedding held and in the shop; the position vectors make
+    slot order matter; an empty slot or a hole is never a key; E[j] gets a
+    gradient from any slot j sits in; the dst pointer depends on src."""
+    from agent import (init_params, observe, joker_ids, tokens, encode, policy, masked_logits,
+                       legal_mask, move_masks, JOKER_FEATS, CONDITION_NAMES, N_HAND_TYPES,
+                       J_SLOTS, N_TOK, O_SHOP, JS_F, J_TOK, C_TOK)
     from env import STAGE_SHOP, MAX_SHOP_SLOTS
     c = Checks("embed")
     params = init_params(jax.random.key(seed))
@@ -717,24 +721,54 @@ def run_embed_test(seed=21):
     ids = np.asarray(joker_ids(observe(shop)))
     c.eq("shop ids in the shop", ids[MAX_JOKERS:], [JOKER_ID["Bull"], -1, JOKER_ID["Baron"], -1])
 
-    e = np.asarray(joker_embed(params, observe(shop)))
-    c.check("Bull: held slot 0 = shop slot 0", np.allclose(e[0], e[MAX_JOKERS]))
-    c.check("empty slots embed to 0", np.abs(e[3:MAX_JOKERS]).max() == 0.0)
-    c.check("different jokers differ", not np.allclose(e[0], e[1]))
-    moved = s._replace(jokers=s.jokers.at[0].set(s.jokers[5]).at[5].set(s.jokers[0]))
-    em = np.asarray(joker_embed(params, observe(moved)))
-    c.check("Bull in slot 5 = Bull in slot 0", np.allclose(em[5], e[0]))
+    # COND_PARAM bits: after TRIGGER and the CONDITION one-hot come suit 4, rank 13, hand 9, count 1
+    f = np.asarray(JOKER_FEATS)
+    from jokers import TRIGGER_NAMES
+    o = len(TRIGGER_NAMES) + len(CONDITION_NAMES)
+    c.eq("Droll: hand bit = flush", np.nonzero(f[JOKER_ID["Droll Joker"], o + 17:o + 17 + N_HAND_TYPES])[0], [3])
+    c.eq("Greedy: suit bit = diamonds", np.nonzero(f[JOKER_ID["Greedy Joker"], o:o + 4])[0], [1])
+    c.eq("Fibonacci: rank bits A 2 3 5 8", np.nonzero(f[JOKER_ID["Fibonacci"], o + 4:o + 17])[0], [0, 1, 3, 6, 12])
 
-    h = lambda st: policy(params, observe(st), 0)[0]
+    tok, ok = tokens(params, observe(shop))
+    tok, ok = np.asarray(tok), np.asarray(ok)
+    c.eq("N_TOK", tok.shape[0], N_TOK)
+    c.eq("keys: global + 3 held + 2 offers (no cards in the shop)", int(ok.sum()), 6)
+
+    # the token caps cover everything the env can fill
+    from jokers import JOKERS as JK
+    from env import reset as _reset
+    hs = np.asarray(JK.H_SIZE)
+    bonus = np.sort(np.where(np.asarray(JK.HSIZE_V), 5, np.maximum(hs, 0)))[::-1][:5].sum()
+    c.check("max hand size <= C_TOK", 8 + bonus <= C_TOK, 8 + bonus, C_TOK)
+    c.check("joker slots <= J_TOK", int(_reset(jax.random.key(0), 52, 8, 1.0).joker_slots) <= J_TOK)
+    Ty = np.asarray(params["Ty"])
+    bull_held = tok[1] - np.asarray(params["Pj"])[0] - Ty[0] - np.asarray(observe(shop))[J_SLOTS:J_SLOTS + JS_F] @ np.asarray(params["Wjs"])
+    bull_shop = tok[1 + J_TOK] - np.asarray(params["Ps"])[0] - Ty[1] - np.asarray(observe(shop))[O_SHOP:O_SHOP + 2] @ np.asarray(params["Wsh"])
+    c.check("Bull: held embedding = shop embedding", np.allclose(bull_held, bull_shop, atol=1e-5))
+    c.check("blind keys = global + 3 held + 5 cards", int(np.asarray(tokens(params, observe(s))[1]).sum()) == 9)
+
+    h = lambda st: np.asarray(encode(params, observe(st)).h)
     swap = s._replace(jokers=s.jokers.at[0].set(s.jokers[1]).at[1].set(s.jokers[0]))
-    c.check("slot order changes the policy", not np.allclose(h(s), h(swap)))
+    c.check("slot order changes the trunk", not np.allclose(h(s), h(swap)))
+    lanes = s._replace(hand=s.hand.at[0].set(s.hand[1]).at[1].set(s.hand[0]))
+    c.check("lane order changes the trunk", not np.allclose(h(s), h(lanes)))
+    holed = s._replace(hand_valid=s.hand_valid.at[4].set(False))
+    other = holed._replace(hand=holed.hand.at[4].set(holed.hand[0]))
+    c.check("a hole's card has no effect", np.allclose(h(holed), h(other), atol=1e-6))
 
     bull = JOKER_ID["Bull"]
+    moved = s._replace(jokers=s.jokers.at[0].set(s.jokers[5]).at[5].set(s.jokers[0]))
     for name, st in (("held slot 5", moved), ("shop only", shop._replace(jokers=jnp.full_like(s.jokers, J_EMPTY)))):
         g = jax.grad(lambda p: policy(p, observe(st), 0)[3])(params)["E"]
         g = np.abs(np.asarray(g))
         c.check(f"E[Bull] has a gradient ({name})", g[bull].max() > 0, g[bull].max())
         c.check(f"E of an absent joker has none ({name})", g[JOKER_ID["Scholar"]].max() == 0)
+
+    p2 = dict(params, Wp=params["Wp"] * 100, Rp=params["Rp"] * 100)
+    o_, l_, m_ = observe(s), legal_mask(s), move_masks(s)
+    d0 = np.asarray(masked_logits(p2, o_, l_, s.hand_valid, m_, 0).ptr[3])
+    d1 = np.asarray(masked_logits(p2, o_, l_, s.hand_valid, m_, 1).ptr[3])
+    c.check("card dst depends on src", not np.allclose(d0[2:5], d1[2:5]))
     return c.done()
 
 

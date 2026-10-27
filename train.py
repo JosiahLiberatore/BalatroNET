@@ -5,6 +5,7 @@
     python train.py --curriculum     use the target-scale curriculum (off by default)
     python train.py --steps 100000   number of updates (default 20000)
     python train.py --move-alpha 0.5 --move-beta 1.0   the MOVE streak penalty
+    python train.py --grad-chunks 8  split the grad pass (GPU memory only)
 
 EPISODE  = one full run (8 antes, the shop included). Envs AUTO-RESET: each
            update steps every env T more steps and a finished run restarts at
@@ -154,7 +155,7 @@ def loss_fn(params, batch):
     return loss, {"pg_loss": pg_loss, "v_loss": v_loss, "entropy": entropy}
 
 
-GRAD_CHUNKS = 2   # equal slices of the batch; the mean of their grads = the full-batch grad
+GRAD_CHUNKS = 8   # equal slices of the batch; the mean of their grads = the full-batch grad (--grad-chunks)
 
 
 def batch_grads(params, batch):
@@ -295,7 +296,10 @@ if __name__ == "__main__":
                     help="MOVE streak decay: the k-th move in a row costs beta * (1 - alpha^(k-1))")
     ap.add_argument("--move-beta", type=float, default=MOVE_BETA,
                     help="MOVE streak penalty at full strength, in $ (0 = moves are free)")
+    ap.add_argument("--grad-chunks", type=int, default=GRAD_CHUNKS,
+                    help="split the grad pass into this many equal chunks (GPU memory only; same grad)")
     args = ap.parse_args()
+    GRAD_CHUNKS = args.grad_chunks   # read when train_step traces
     curriculum = args.curriculum
     MOVE_ALPHA, MOVE_BETA = args.move_alpha, args.move_beta   # read when train_step traces
     move_cfg = (MOVE_ALPHA, MOVE_BETA)
