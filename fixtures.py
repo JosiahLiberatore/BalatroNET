@@ -24,6 +24,9 @@ import jax
 import jax.numpy as jnp
 
 from env import balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_CONSUMABLES, MAX_SHOP_SLOTS
+from env import standard_cards, STAGE_PACK, CONS_SELL, run_fields, BASE_JOKER_SLOTS
+from items import (N_HAND_TYPES, CONS_ID, PACK_SLOTS, MAX_PACK, ED_NEG, MAX_JOKER_SLOTS, BOSS_ID,
+                   TAG_ID, VOUCHER_ID, MAX_TAGS, MAX_SHOP_VOUCHERS, V_ANTIMATTER, HAND_NAMES)
 # the card-name convention has ONE definition, in env (show() prints with it)
 from env import RANK_CHARS, SUIT_CHARS
 from jokers import JOKER_COST
@@ -185,7 +188,7 @@ def play_cards(rank, suit, valid, names=(), *, money=0, discards=3, deck_left=0,
     stencils = int((ids == J_STENCIL).sum())
     ctx = query_ctx(money=money, discards=discards, deck_left=deck_left, jokers=held,
                     empty_slots=max(joker_slots - held + stencils, 0))
-    z9 = jnp.zeros(9, jnp.int32)
+    z9 = jnp.zeros(N_HAND_TYPES, jnp.int32)
     p = PlayIn(jnp.asarray(rank), jnp.asarray(suit), jnp.asarray(valid, bool),
                jnp.zeros(1, jnp.int32), jnp.zeros(1, jnp.int32), jnp.zeros(1, bool),
                ids, joker_value, jnp.zeros(MAX_JOKERS, jnp.int32), ctx, jnp.float32(money),
@@ -206,7 +209,14 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           shop_size=2, reroll_cost=5, last_cashout=0, target_scale=1.0,
           base_hand_size=None, base_hands=None, base_discards=None, discards_used=0,
           hand_played=(), hand_round=(), idol_card=51, mail_rank=12, ancient_suit=3,
-          castle_suit=3, free_rerolls=0, gros_extinct=False):
+          castle_suit=3, free_rerolls=0, gros_extinct=False, cards_mod=None, joker_ed=(),
+          hand_level=(), last_hand=-1, last_cons=-1, tarots_used=0, planets_used=(),
+          shop_kind=(), shop_ed=(), pack_slots=(EMPTY, EMPTY), buffoon_given=True, cons_sell=None,
+          boss=-1, boss_disabled=False, vouchers=(), tags=(), tag_hand=(), blind_tags=(EMPTY, EMPTY),
+          skips=0, played_ante=(), forced_card=None, hand_down=(), joker_debuff=(), ante_voucher=-1,
+          shop_vouchers=(), cons_ed=(), ecto_minus=1, boss_hand=-1, ox_hand=None, unused_discards=0,
+          round_hand_bonus=0, pack_return=None, shop_free=(), pack_free=(), shop_rank=(), shop_suit=(),
+          shop_enh=(), bosses_used=(), boss_rerolled=False, boss_sub=0, orbital_hands=(11, 11)):
     """Author a balatroEnvState from the fields the scenario is actually about.
 
     hand        card-name string, or a list of ids. '.' is an empty lane.
@@ -223,6 +233,17 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
     base_hands / base_discards default to handcount / discardcount
     hand_played / hand_round  per hand type counts (HAND_NAMES order), default 0
     idol_card / mail_rank / ancient_suit / castle_suit  the round targets
+    hand_played / hand_round / hand_level / planets_used: 12 entries (items.HAND_NAMES
+                order), or the old 9 (straight flush .. high card), which map to the last 9
+    cards_mod   {instance or card name: dict(enh=, ed=, seal=, bonus=, rank=, suit=)} — the card
+                modifiers (instances 0..51 are the standard deck: card id = instance)
+    consumables Tarot / Planet / Spectral names
+    cons_sell   $ each consumable sells for; defaults to $1 each (what a new one sells for)
+    boss        the ante's Boss Blind (a name); -1 (the default) is a boss with no ability
+    vouchers    redeemed voucher names; tags: held tag names (tag_hand: an Orbital Tag's hand)
+    played_ante card names played this ante (The Pillar); forced_card: Cerulean Bell's card
+    hand_down / joker_debuff  lanes / slots (0/1 lists): face down / disabled by Crimson Heart
+    shop_vouchers voucher names in the shop; ante_voucher: this ante's voucher (a name or -1)
     """
     ids = cards(hand)
     jids = joker_ids(jokers)
@@ -251,13 +272,83 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         add = jnp.where(held, rows.H_SIZE + jnp.where(rows.HSIZE_V, joker_value, 0).astype(jnp.int32), 0).sum()
         base_hand_size = int(hand_size) - int(add)
 
+    def per_hand(vals, fill=0, dtype=jnp.int32):
+        vals = list(vals)
+        if len(vals) == 9:
+            vals = [fill] * (N_HAND_TYPES - 9) + vals
+        return lanes(vals, N_HAND_TYPES, fill, dtype)
+
+    cards_ = standard_cards(deck_size)
+    for k, mod in (cards_mod or {}).items():
+        i = card_id(k)
+        for f, name in (("enh", "card_enh"), ("ed", "card_ed"), ("seal", "card_seal"),
+                        ("rank", "card_rank"), ("suit", "card_suit")):
+            if f in mod:
+                cards_[name] = cards_[name].at[i].set(mod[f])
+        if "bonus" in mod:
+            cards_["card_bonus"] = cards_["card_bonus"].at[i].set(mod["bonus"])
+    jed = lanes(joker_ed, MAX_JOKERS, 0, jnp.int32)
+    neg = int(((jed == ED_NEG) & held).sum())
+    vids = [VOUCHER_ID[v] if isinstance(v, str) else int(v) for v in vouchers]
+    if joker_slots == 5 and (neg or V_ANTIMATTER in vids):
+        joker_slots = min(5 + neg + (V_ANTIMATTER in vids), MAX_JOKER_SLOTS)
+    cons_ids = [CONS_ID[c] if isinstance(c, str) else int(c) for c in consumables]
+    if cons_sell is None:
+        cons_sell = [CONS_SELL] * len(cons_ids)
+
+    named = lambda table, v: table[v] if isinstance(v, str) else int(v)
+    rf = run_fields()
+    rf.update(
+        boss=jnp.int32(named(BOSS_ID, boss)), boss_disabled=jnp.bool_(boss_disabled),
+        vouchers=jnp.zeros(len(VOUCHER_ID), bool).at[jnp.array(vids, jnp.int32)].set(True) if vids
+        else rf["vouchers"],
+        tags=lanes([named(TAG_ID, t) for t in tags], MAX_TAGS),
+        tag_hand=lanes([HAND_NAMES.index(h) if isinstance(h, str) else int(h) for h in tag_hand], MAX_TAGS, 0),
+        blind_tags=lanes([named(TAG_ID, t) for t in blind_tags], 2),
+        orbital_hands=lanes([HAND_NAMES.index(h) if isinstance(h, str) else int(h) for h in orbital_hands], 2, 11),
+        skips=jnp.int32(skips),
+        card_played_ante=jnp.zeros(MAX_DECK_SIZE, bool).at[jnp.array(cards(played_ante), jnp.int32)].set(True)
+        if played_ante else rf["card_played_ante"],
+        forced_card=jnp.int32(-1 if forced_card is None else card_id(forced_card)),
+        hand_down=mask_lanes(hand_down), joker_debuff=mask_lanes(joker_debuff, MAX_JOKERS),
+        ante_voucher=jnp.int32(named(VOUCHER_ID, ante_voucher)),
+        shop_vouchers=lanes([named(VOUCHER_ID, v) for v in shop_vouchers], MAX_SHOP_VOUCHERS),
+        cons_ed=lanes(list(cons_ed), MAX_CONSUMABLES, 0), ecto_minus=jnp.int32(ecto_minus),
+        boss_hand=jnp.int32(boss_hand),
+        ox_hand=jnp.int32(N_HAND_TYPES - 1 if ox_hand is None else
+                          (HAND_NAMES.index(ox_hand) if isinstance(ox_hand, str) else ox_hand)),
+        unused_discards=jnp.int32(unused_discards), round_hand_bonus=jnp.int32(round_hand_bonus),
+        pack_return=jnp.int32(1 if pack_return is None else pack_return),
+        shop_free=mask_lanes(shop_free, MAX_SHOP_SLOTS), pack_free=mask_lanes(pack_free, PACK_SLOTS),
+        shop_rank=lanes(list(shop_rank), MAX_SHOP_SLOTS, 0), shop_suit=lanes(list(shop_suit), MAX_SHOP_SLOTS, 0),
+        shop_enh=lanes(list(shop_enh), MAX_SHOP_SLOTS, 0),
+        bosses_used=lanes(list(bosses_used), len(BOSS_ID), 0) if bosses_used else rf["bosses_used"],
+        boss_rerolled=jnp.bool_(boss_rerolled), boss_sub=jnp.int32(boss_sub),
+    )
+
     return balatroEnvState(
+        **cards_,
+        joker_ed=jed,
+        hand_level=per_hand(hand_level, 1),
+        last_hand=jnp.int32(last_hand),
+        last_cons=jnp.int32(last_cons),
+        tarots_used=jnp.int32(tarots_used),
+        planets_used=per_hand(planets_used, False, bool),
+        shop_kind=lanes(shop_kind, MAX_SHOP_SLOTS, 0, jnp.int32),
+        shop_ed=lanes(shop_ed, MAX_SHOP_SLOTS, 0, jnp.int32),
+        pack_slots=lanes(pack_slots, PACK_SLOTS, EMPTY, jnp.int32),
+        buffoon_given=jnp.bool_(buffoon_given),
+        pack_id=jnp.int32(-1), pack_left=jnp.int32(0),
+        pack_items=jnp.full(MAX_PACK, -1, jnp.int32), pack_ed=jnp.zeros(MAX_PACK, jnp.int32),
+        pack_rank=jnp.zeros(MAX_PACK, jnp.int32), pack_suit=jnp.zeros(MAX_PACK, jnp.int32),
+        pack_enh=jnp.zeros(MAX_PACK, jnp.int32), pack_seal=jnp.zeros(MAX_PACK, jnp.int32),
         jokers=jids,
         joker_value=joker_value,
         joker_state=lanes(joker_state, MAX_JOKERS, 0, jnp.int32),
         joker_sell_value=joker_sell_value,
         joker_slots=jnp.int32(joker_slots),
-        consumables=lanes(cards(consumables), MAX_CONSUMABLES),
+        consumables=lanes(cons_ids, MAX_CONSUMABLES),
+        cons_sell=lanes(list(cons_sell), MAX_CONSUMABLES, 0),
         consumable_slots=jnp.int32(consumable_slots),
         hand=lanes(ids),
         hand_size=jnp.int32(hand_size),
@@ -286,12 +377,13 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         base_hands=jnp.int32(handcount if base_hands is None else base_hands),
         base_discards=jnp.int32(discardcount if base_discards is None else base_discards),
         discards_used=jnp.int32(discards_used),
-        hand_played=lanes(hand_played, 9, 0, jnp.int32),
-        hand_round=lanes(hand_round, 9, 0, jnp.int32),
+        hand_played=per_hand(hand_played),
+        hand_round=per_hand(hand_round),
         idol_card=jnp.int32(idol_card), mail_rank=jnp.int32(mail_rank),
         ancient_suit=jnp.int32(ancient_suit), castle_suit=jnp.int32(castle_suit),
         free_rerolls=jnp.int32(free_rerolls),
         gros_extinct=jnp.bool_(gros_extinct),
+        **rf,
     )
 
 

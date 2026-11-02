@@ -202,6 +202,156 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       PLAY 4.66 (5: 84%). Hands: pair 41%, high card 32%, two pair 17%, three 5.5%, full house
       4.0%, straight 0.4%, flush 0.0%. Better play, same hand strategy: no flushes / straights.
       Params: node runs/params_run.pkl, local runs/params_tokens.pkl (= runs/params_run.pkl).
+- [x] Card modifiers, consumables, hand levels, packs, copied cards (2026-11-01). Rules from the
+      1.0.1o Lua (card.lua get_chip_* / is_suit / use_consumeable / open, state_events.lua
+      evaluate_play / end_round, common_events.lua create_card / poll_edition / get_pack,
+      UI_definitions.lua create_card_for_shop, game.lua P_CENTERS / G.GAME.hands). New items.py.
+      ENV RULES (all new):
+      - Card instances (the pinned migration): card_rank / suit / enh / ed / seal / bonus / live,
+        (128,) each; deck and hand hold instance slots; deck[:deck_size] = the live cards. A copy
+        takes a free slot (add_card), a destroyed card frees it (remove_cards). Instances 0..51 =
+        the standard deck, so card id == instance in the fixtures.
+      - Enhancements: Bonus +30, Mult +4, Wild (every suit), Glass X2 + 1 in 4 to break, Steel X1.5
+        held, Stone (+50, no rank / suit, always scores), Gold $3 held at round end, Lucky (1 in 5
+        +20 Mult, 1 in 15 $20). Editions on cards and jokers: Foil +50, Holo +10, Poly X1.5;
+        Negative jokers +1 slot. Seals: Gold $3 when scored, Red retrigger (held too, if the card
+        did something), Blue a Planet of the last hand at round end, Purple a Tarot on discard.
+        Scoring order per card / rep: chips, Mult/Lucky mult, Gold Seal/Lucky $, Glass X, edition,
+        then the jokers; jokers: edition chips/mult, main effect, Baseball, Polychrome.
+      - 12 hand types (Flush Five, Flush House, Five of a Kind first) and hand levels
+        (s + l x (level - 1)); HAND_NAMES / H_* indices shifted by 3.
+      - Consumables: 22 Tarots + 12 Planets, 2 slots. Verbs USE (target slot, select = the cards a
+        Tarot acts on, its [lo, hi]) and SELL_CONS ($1). Shop slots roll joker 20 / Tarot 4 /
+        Planet 4; secret Planets only after the hand was played; nothing that exists already
+        (unless Showman). Buying a Tarot / Planet puts it in a slot (no "buy and use").
+      - Packs: 2 pack slots per shop (the first shop's first one a Buffoon Pack), weights / sizes /
+        costs of Arcana, Celestial, Standard, Buffoon (normal / jumbo / mega). OPEN -> STAGE_PACK
+        (an Arcana pack deals a hand from the shuffled deck); PICK (a Tarot / Planet is used at
+        once, a playing card goes into the deck, a joker into a slot); SKIP. Astronomer: Planets
+        and Celestial packs free.
+      - 26 new jokers (group D): Marble, 8 Ball, Steel, Space, DNA, Constellation, Hiker,
+        Superposition, Red Card, Vampire, Hologram, Vagabond, Midas Mask, Hallucination, Fortune
+        Teller, Stone, Lucky Cat, Golden Ticket, Certificate, Glass Joker, Driver's License,
+        Cartomancer, Astronomer, Burnt Joker, Satellite, Trading Card (135 jokers). Steel / Stone /
+        Lucky Cat / Golden Ticket / Glass Joker only in the shop with that enhancement in the deck.
+      - End of round: the hand goes back to the deck when the shop opens (gold / blue counted on the
+        hand as the last hand left it, before any refill).
+      - Seeing Double / Flower Pot: Wild cards fill the empty suits after the plain cards (Lua order).
+      - floor(chips x mult) with a few float32 ulps of slack (15 x 12.6 = 189, not 188).
+      DIVERGENCES (new): joker slots stop at 8 (5 + 3 Negatives; agent J_TOK); To Do List never picks
+      a secret hand; no Spectral cards / The Soul / Black Hole / vouchers / tags / boss blinds; packs
+      only in the shop.
+      CONSUMABLE SELL VALUE (state cons_sell, per slot): a Tarot / Planet sells for $1, and Gift Card
+      adds $1 to every held one at the end of the round, before the held cards act (end_round), so
+      a Blue Seal's new Planet misses that round; Blueprint does not copy Gift Card.
+      RULE FIXES (found by the fuzz test and the Lua): Seeing Double / Flower Pot / Superposition read
+      the cards after Midas Mask and Vampire (a Wild card stripped by Vampire is no longer every suit);
+      Campfire also gains when a Tarot / Planet is sold (G.FUNCS.sell_card); Vagabond reads the money
+      before the hand (G.GAME.dollars; the hand's own $ is paid later), Bull / Bootstraps still add it;
+      The Fool becomes the last card used (set_consumeable_usage), so a 2nd Fool cannot copy again;
+      a card a Vampire took stays marked until the hand ends (v.vampired), so a later Vampire skips
+      it, even after a Midas Mask makes it Gold again (two Vampires need Showman); the BEFORE step
+      goes one joker at a time, so Ride the Bus and DNA see the cards as the Midas Masks / Vampires
+      to their left left them (a Vampire left of Ride the Bus can make a Stone King a face card).
+      AGENT: N_ACTIONS 42 -> 54 (OPEN x2, USE x2, SELL_CONS x2, PICK x5, SKIP). The picker serves
+      PLAY / DISCARD / USE / PICK with a query per verb + the token of the card used, and a count
+      range [lo, hi] per action (pick_bounds; 0..0 = STOP at once, logp 0). Tokens 29 -> 42: + shop
+      cards of any kind, 2 pack slots, 5 pack cards, 2 consumables; C_TOK 16 -> 20. One item id
+      space (jokers, then Tarots / Planets) with fixed item features (ITEM_FEATS: the joker
+      features + what a consumable does). Card tokens: rank, suit, enhancement, edition, seal,
+      perma chips. Global: hand levels, Planets / Tarots used, the undealt deck by card and by
+      enhancement, the pack stage. obs 1111 -> 2301; params 393k -> 534k. Old params do not load.
+      TESTS: ref_balatro extended (Card objects, 12 hands, levels, modifiers, joker editions, new
+      jokers); tests_jokers check_step models every verb (USE / OPEN / PICK / SKIP included, the
+      card instances, the consumables); soak 64 x 600 steps: 1.55M checks pass. New spec cases for
+      every new joker and modifier. GUI: card modifiers, consumables (Use / $1), Tarot / Planet
+      shop cards, pack slots, the pack screen, hand levels (L), Add Card dev dropdown.
+      SCENARIO TESTS (scenarios.py): a start state, a few env_step actions and the game's values
+      written by hand with the rule in words, for every joker, Tarot, Planet, pack, enhancement,
+      edition and seal, plus the cash out / shop / blind rules (177 scenarios) and the 305 SPEC rows
+      as the "Scoring" group. Each step also goes through check_step. A coverage check fails when an
+      item has no scenario (a SPEC row counts only when its joker changes the score). tests.py runs
+      it. GUI test mode (T): the test panel shows the rule, the steps and the checks; the board
+      shows the state after each step (Left / Right), Up / Down change the test, F the next failure,
+      Find test searches. A test runs when it is shown (T opens at once); a thread runs the rest
+      for the pass count (10 s). GUI fixes: the pack screen layout (5 cards + Skip), a card past the hand
+      size (Certificate) shows, new effect labels (adds a card, makes a Tarot, levels up ...).
+      tests.py is env only now: each suite prints its time, 4.6 min in all (the soak 79 s is the
+      longest). The agent tests (legal mask, picker, embed: eager JAX, the slow part) are out of
+      the default run: python tests_run.py agent.
+- [x] The rest of Balatro (2026-11-02): the blind select, skips and tags, the 28 boss blinds, the
+      32 vouchers, the 18 Spectral cards and 3 Spectral packs, the last 15 jokers (150 in all).
+      Rules from the 1.0.1o Lua (blind.lua, tag.lua, card.lua apply_to_run / use_consumeable /
+      calculate_joker, button_callbacks.lua select_blind / skip_blind / reroll_boss / cash_out,
+      state_events.lua end_round, common_events.lua get_new_boss / create_card / poll_edition).
+      ENV RULES (all new):
+      - Flow: reset -> STAGE_SELECT (5). At the blind select NEXT plays the blind on deck, SKIP
+        (Small / Big Blind) takes its tag, REROLL rerolls the boss (Director's Cut once per ante,
+        Retcon any time, $10); SELL, SELL_CONS, USE and MOVE_JOKER work there too. NEXT in the shop
+        goes to the blind select (Perkeo acts first). The cash out of a boss starts the next ante:
+        a new boss (the least used of the eligible ones), 2 new tags (an Orbital Tag's hand too) and
+        the ante's voucher. The win (the ante 8 boss) ends the run: no new ante, no shop.
+      - Bosses (BOSS_TABLE: min ante, x mult, $; the 5 showdown bosses only at ante 8): The Hook,
+        Ox, House, Wall, Wheel, Arm, Club, Fish, Psychic, Goad, Water, Window, Manacle, Eye, Mouth,
+        Plant, Serpent, Pillar, Needle, Head, Tooth, Flint, Mark, Amber Acorn, Verdant Leaf, Violet
+        Vessel, Crimson Heart, Cerulean Bell. A debuffed card gives no chips, mult, edition, seal or
+        retrigger, no per-card joker effect, and is no face card; a debuffed hand (Psychic, Eye,
+        Mouth) scores 0 and only Matador pays. New state: boss, bosses_used, boss_disabled,
+        hand_down (face-down lanes), joker_down (Amber Acorn), joker_debuff (Crimson Heart: the
+        joker acts as absent), forced_card (Cerulean Bell), card_played_ante (The Pillar),
+        boss_hand (The Mouth), ox_hand. Chicot (at the blind start), a sold Luchador and a sold
+        joker under Verdant Leaf disable the boss: its effects end (The Wall / Violet Vessel go to
+        x2; The Water, The Needle and The Manacle give their hands / discards / hand size back).
+      - Tags (24): the immediate ones at the blind select (Top-up, Skip, Garbage, Handy, Economy,
+        Orbital); new_blind_choice (Boss Tag rerolls the boss; Standard / Charm / Meteor / Buffoon /
+        Ethereal open a free pack, which closes back to the blind select, then the next tag acts);
+        the shop ones (Uncommon / Rare: a free joker; Foil / Holographic / Polychrome / Negative: the
+        edition and free; Voucher: one more voucher; Coupon: the first cards and packs free; D6:
+        rerolls from $0); Investment ($25 at a boss cash out); Juggle (+3 hand size for 1 round);
+        Double (copies the next tag). Held tags: state tags (MAX_TAGS 8).
+      - Vouchers (32, $10; the second of a pair needs the first): verb REDEEM (13). The shop shows
+        this ante's voucher until it is redeemed (Voucher Tags add more). Shop slots, Clearance Sale
+        / Liquidation (prices and sell values), Hone / Glow Up, Reroll Surplus / Glut, Crystal Ball,
+        Omen Globe, Telescope, Observatory (X1.5 per held Planet of the hand), Grabber / Nacho Tong,
+        Wasteful / Recyclomancy, Tarot / Planet Merchant and Tycoon, Seed Money / Money Tree,
+        Blank / Antimatter, Magic Trick / Illusion (playing cards in the shop), Hieroglyph /
+        Petroglyph (ante -1; ante 0 needs 100 chips), Director's Cut / Retcon, Paint Brush / Palette.
+      - Spectral cards (18, $4) and Spectral packs (normal / jumbo / mega): USE and PICK as for
+        Tarots (a Spectral pack deals a hand). The Soul / Black Hole: 0.3% per card of an Arcana /
+        Spectral / Celestial pack. A Negative consumable (Perkeo's copy) takes no slot.
+      - 15 jokers: Ceremonial Dagger, Sixth Sense, Madness, Seance, Riff-raff, Luchador, Diet Cola,
+        Mr. Bones, Throwback, Matador, Invisible Joker, Canio, Yorick, Chicot, Perkeo.
+      - Reward unchanged: the cash out $ of a cleared blind (the Investment Tag's $ is part of it);
+        a skip gives 0. Mr. Bones: the blind pays $0, the hands left and the interest still pay.
+      DIVERGENCES (new): The Ox breaks a tie for the most played hand by the better hand (the game
+      uses its table order); at most 8 held tags; joker slots still stop at 8; a lost run keeps the
+      boss's face-down / debuff state (nothing reads it).
+      RULE FIXES: the BEFORE step goes one joker at a time (Ride the Bus, DNA: see above).
+      COMPILE: env_step ~36 s (trace 6.5 s + compile 30 s; it was ~120 s while building): the tags
+      of the blind select act in one post-step, fori_loop for each repeated part, one switch
+      branch for PLAY / DISCARD and one for USE / PICK.
+      COMPILE CACHE: env.py sets a persistent compile cache (.jax_cache, git-ignored; every jit
+      over 1 s of compile; past 1 GB the oldest entries go). GUI start ~70 s -> ~28 s (tracing
+      ~11 s and ~500 small compiles stay; the env_step entry loads in ~5 s); tests.py 7.8 -> 4.3 min.
+      JAX puts the cache path string in every key (xla_gpu_per_fusion_autotune_cache_dir), so
+      env.py takes the realpath: "python d:\...\gui.py" and "D:\..." share the entries. Before
+      this milestone the GUI started in ~23 s with no cache (env_step 22k ops; now 53k).
+      TESTS: check_step models the blind select, skips, tags, bosses (debuffs, face down, the hand
+      rules), vouchers, Spectral cards and the new jokers; the soak plays them all (redeems, skips,
+      boss rerolls). 343 scenarios (the coverage check now also needs every boss, tag and voucher):
+      groups Bosses, Tags, Vouchers, Spectrals; rates checked over 8000 shops / 4000 packs.
+      GUI: the blind select screen (3 blinds: target, reward, tag, the boss's ability; Play / Skip /
+      Reroll Boss), the boss / tags / vouchers in the sidebar, the vouchers in the shop (click to
+      redeem), card backs for face-down cards and jokers, a red cross on debuffed cards and the
+      disabled joker, Cerulean Bell's forced card, Spectral cards and packs, playing cards in the
+      shop, Negative consumables. Test menu (Find test): a sub menu per kind (Jokers, Enhancements,
+      Editions, Seals, Tarots, Planets, Spectrals, Vouchers, Packs, Tags, Bosses, Rules; a Scoring
+      row goes to its joker / modifier, gui.test_place); the test list is in that order, so
+      < Test / Test > go through a sub menu; typed text searches every test.
+      AGENT (not changed; it only imports again: 2 feature widths now follow the tables): it has no
+      REDEEM action, its legal mask has no blind select (there NEXT is its only choice: it never
+      skips or rerolls the boss), and its obs shows no boss, tags, vouchers, face-down or debuffed
+      flags. Old params do not load (150 jokers, new item features).
 - [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
       hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
       fires Green -1. Real Balatro does not allow either. The agent no longer samples an empty
@@ -234,7 +384,13 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - joker slots capped at 32, consumable slots capped at 16 — Negative jokers/consumables can exceed
   these in real Balatro (unbounded consumables are possible); overflow is clamped and counted, same
   SHAPE-is-capacity / count-is-DATA rule as hand/deck
-- face-down cards (boss blinds): not implemented for now. When added: state keeps true rank/suit
+- joker slots stop at 8 (5 + 3 Negatives): a 4th Negative gives no slot (agent J_TOK = 8)
+- To Do List never picks a secret hand (Flush Five / Flush House / Five of a Kind)
+- a bought Tarot / Planet goes to a slot (no "buy and use")
+- The Ox: a tie for the most played hand goes to the better hand (the game: its table order)
+- at most 8 held tags (MAX_TAGS)
+- face-down cards and jokers (boss blinds): in the env state (hand_down, joker_down) since
+  2026-11-02, but the obs does not hide them yet (agent work). The plan: state keeps true rank/suit
   (env must score them), obs gets a face_down flag and zeroes that card's rank/suit lanes -> POMDP.
   The sort-inference trick is faithful FOR FREE: SORT reorders using ground truth, obs shows lane
   order, so a hidden card's position between visible cards leaks the same rank interval the

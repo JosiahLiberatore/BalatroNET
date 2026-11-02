@@ -28,7 +28,10 @@ import numpy as np
 from env import reset, env_step, explain_play, _card_name, STAGE_BLIND, STAGE_WON, STAGE_LOST
 from env import BLIND_NAMES
 from agent import (init_params, act, action_name, masked_logits, legal_mask, move_masks, observe,
-                   is_move, A_PLAY, A_DISCARD, A_MOVE_CARD, N_ACTIONS)
+                   is_move, A_PLAY, A_DISCARD, A_MOVE_CARD, A_BUY, A_SELL, A_OPEN, A_USE, A_SELL_CONS,
+                   N_ACTIONS)
+from env import STAGE_PACK, card_id
+from items import CONS_NAMES, PACK_NAMES
 from jokers import JOKER_NAMES
 from scoring import HAND_NAMES
 from train import load_params, PARAMS_PATH, DECK, HAND
@@ -65,15 +68,17 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
     total = 0
     for step in range(max_steps):
         key, sk = jax.random.split(key)
-        action, (a, sel, picks, src, dst, *_r, value, logp) = _act(params, state, sk)
+        action, st = _act(params, state, sk)
+        a, sel, src, dst, value = st.a, st.sel, st.src, st.dst, st.value
         p, _ = _probs(params, state)
         a = int(a)
         where = (f"A{int(state.ante)} {BLIND_NAMES[int(state.blind_index)][:5]}"
-                 if int(state.game_stage) == STAGE_BLIND else f"A{int(state.ante)} shop ")
+                 if int(state.game_stage) == STAGE_BLIND else
+                 f"A{int(state.ante)} {'pack ' if int(state.game_stage) == STAGE_PACK else 'shop '}")
         name = action_name(a, src, dst) if is_move(a) else action_name(a)
         line = f" {step:3d} {where}  ${int(state.money):3d}  {name:12s} p={float(p[a]):.2f}"
         if a in (A_PLAY, A_DISCARD):
-            cards = " ".join(_card(state.hand[i]) + ("*" if bool(sel[i]) else " ")
+            cards = " ".join(_card(card_id(state, state.hand[i])) + ("*" if bool(sel[i]) else " ")
                              for i in range(int(state.hand_size)) if bool(state.hand_valid[i]))
             line += f"  {cards}"
             if a == A_PLAY:
@@ -81,11 +86,15 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
                 line += f"  {HAND_NAMES[int(res.handtype)]} {int(res.score)}" \
                         f"  ({int(state.chips_scored) + int(res.score)}/{int(state.blind_target)})"
         elif a == A_MOVE_CARD:
-            line += f"  moves {_card(state.hand[int(src)])}"
-        elif a < N_ACTIONS - 2 and a >= 2:
-            shop = [JOKER_NAMES[int(j)] if int(j) >= 0 else "-" for j in state.shop_slots]
-            held = [JOKER_NAMES[int(j)] for j in state.jokers if int(j) >= 0]
-            line += f"  shop {shop}  held {held}"
+            line += f"  moves {_card(card_id(state, state.hand[int(src)]))}"
+        elif A_USE <= a < A_SELL_CONS:
+            line += f"  {CONS_NAMES[int(state.consumables[a - A_USE])]}"
+        elif A_BUY <= a < A_SELL:
+            i = a - A_BUY
+            it = int(state.shop_slots[i])
+            line += f"  {(JOKER_NAMES if int(state.shop_kind[i]) == 0 else CONS_NAMES)[it]}"
+        elif A_OPEN <= a < A_USE:
+            line += f"  {PACK_NAMES[int(state.pack_slots[a - A_OPEN])]}"
         state, reward, done = _step(state, action)
         total += int(reward)
         if int(reward):
@@ -104,7 +113,8 @@ def _run_batch(params, keys, scale, max_steps):
         state = reset(key, DECK, HAND, scale)
         def step(c, k):
             s, done = c
-            action, (a, sel, *_rest) = act(params, s, k)
+            action, st = act(params, s, k)
+            a, sel = st.a, st.sel
             res = explain_play(s, sel)
             nxt, r, d = env_step(s, action)
             live = ~done

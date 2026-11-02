@@ -13,7 +13,12 @@ from scoring import scoreHand, HAND_NAMES
 from env import balatroAction, deal, env_step, explain_play
 from jokers import update, MAX_JOKERS, T_ONCE_MAIN, T_ON_DISCARD, T_END_OF_ROUND
 from fixtures import (state, select, hand_lanes, mask_lanes, rotated_deck,
-                      loadout, query_ctx, diff_states, report, play_cards)
+                      loadout, query_ctx, diff_states, report, play_cards, cards)
+
+
+def played(pre, names):
+    """card_played_ante after a PLAY of these cards (The Pillar's memory)."""
+    return pre.card_played_ante.at[jnp.array(cards(names))].set(True)
 
 
 class Case(NamedTuple):
@@ -222,8 +227,10 @@ def run_env_step_test():
         deck_ptr=jnp.int32(12),
         hands=jnp.int32(2),
         chips_scored=jnp.int32(168),
-        hand_played=pre.hand_played.at[6].set(1),   # two pair, this run and this round
-        hand_round=pre.hand_round.at[6].set(1),
+        hand_played=pre.hand_played.at[9].set(1),   # two pair, this run and this round
+        hand_round=pre.hand_round.at[9].set(1),
+        last_hand=jnp.int32(9),
+        card_played_ante=played(pre, "KD KC 7C 7S"),
         key=jax.random.split(pre.key)[0],             # a PLAY or DISCARD moves the key on
     )
     expected_reward = 0
@@ -287,8 +294,10 @@ def run_env_step_green_test():
         hands=jnp.int32(2),
         chips_scored=jnp.int32(222),
         joker_value=pre.joker_value.at[0].set(1.0),
-        hand_played=pre.hand_played.at[6].set(1),   # two pair, this run and this round
-        hand_round=pre.hand_round.at[6].set(1),
+        hand_played=pre.hand_played.at[9].set(1),   # two pair, this run and this round
+        hand_round=pre.hand_round.at[9].set(1),
+        last_hand=jnp.int32(9),
+        card_played_ante=played(pre, "KD KC 7C 7S"),
         key=jax.random.split(pre.key)[0],             # a PLAY or DISCARD moves the key on
     )
     got, reward, _ = env_step(pre, action)
@@ -372,15 +381,22 @@ def run_joker_env_test():
 
 
 if __name__ == "__main__":
+    import time
+    t_all = time.time()
     run_tests()
     run_deal_test()
     run_env_step_test()
     run_update_test()
     run_env_step_green_test()
     run_joker_env_test()
+    print(f"basic env tests: {time.time() - t_all:.0f} s")
 
     import tests_run
     tests_run.run_all()
 
     import tests_jokers
     tests_jokers.run_all()
+
+    import scenarios
+    scenarios.run_scenario_test()
+    print(f"all tests: {(time.time() - t_all) / 60:.1f} min")

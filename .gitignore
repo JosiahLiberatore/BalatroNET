@@ -24,6 +24,7 @@ wandb/
 *.orbax-checkpoint/
 *.msgpack
 *.npz
+.jax_cache/
 
 # Editors / OS
 tempCodeRunnerFile.py

@@ -32,7 +32,8 @@ import jax.numpy as jnp
 
 from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP
 from agent import (init_params, act, masked_logits, log_prob_entropy, is_move, OBS_DIM,
-                   A_PLAY, A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, N_ACTIONS)
+                   A_PLAY, A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, A_OPEN, A_USE, A_SELL_CONS,
+                   A_PICK, A_SKIP, N_ACTIONS)
 
 # --- config -----------------------------------------------------------------------
 N_ENVS        = 1024
@@ -85,7 +86,8 @@ def env_step_auto(params, state, run, key, scale):
     """One policy step on one env; a finished run resets in place.
     run = the per-env running stats (ret, buys, steps, streak, pen)."""
     k_act, k_reset = jax.random.split(key)
-    action, (a, sel, picks, src, dst, obs, legal, mmask, value, logp) = act(params, state, k_act)
+    action, st = act(params, state, k_act)
+    a, sel = st.a, st.sel
     nxt, reward, done = env_step(state, action)
     reward = reward.astype(jnp.float32)
 
@@ -101,13 +103,14 @@ def env_step_auto(params, state, run, key, scale):
                 "in_shop": state.game_stage == STAGE_SHOP,
                 "sell": (a >= A_SELL) & (a < A_MOVE_JOKER), "move": moved,   # joker + card moves
                 "streak": streak, "reroll": a == A_REROLL,
+                "use": (a >= A_USE) & (a < A_SELL_CONS), "pack": (a == A_OPEN) | (a == A_OPEN + 1),
                 "play": a == A_PLAY, "play_cards": sel.sum() * (a == A_PLAY)}
     fresh = reset(k_reset, DECK, HAND, scale)
     nxt = tree_where(done, fresh, nxt)
     keep = ~done
-    traj = {"obs": obs, "legal": legal, "hand_valid": state.hand_valid, "mmask": mmask,
-            "a": a, "picks": picks, "src": src, "dst": dst,
-            "reward": (reward + pen) * REWARD_SCALE, "done": done, "value": value}
+    traj = {"obs": st.obs, "legal": st.legal, "hand_valid": state.hand_valid, "mmask": st.mmask,
+            "a": a, "picks": st.picks, "src": st.src, "dst": st.dst, "lo": st.lo, "hi": st.hi,
+            "reward": (reward + pen) * REWARD_SCALE, "done": done, "value": st.value}
     return nxt, jax.tree.map(lambda x: x * keep, run), traj, finished
 
 
@@ -121,8 +124,8 @@ def rollout(params, carry, key, scale):
         return {"state": s, **run}, (traj, fin)
 
     carry, (traj, fin) = jax.lax.scan(step, carry, jax.random.split(key, T))
-    _, (*_, last_value, _) = jax.vmap(act, in_axes=(None, 0, 0))(
-        params, carry["state"], jax.random.split(key, N_ENVS))
+    _, last = jax.vmap(act, in_axes=(None, 0, 0))(params, carry["state"], jax.random.split(key, N_ENVS))
+    last_value = last.value
     return carry, traj, fin, last_value
 
 
@@ -144,8 +147,9 @@ def gae(reward, value, done, last_value):
 def loss_fn(params, batch):
     hd = jax.vmap(masked_logits, in_axes=(None, 0, 0, 0, 0, 0))(
         params, batch["obs"], batch["legal"], batch["hand_valid"], batch["mmask"], batch["src"])
-    logp, ent = jax.vmap(log_prob_entropy, in_axes=(None, 0, 0, 0, 0, 0, 0))(
-        params, hd, batch["a"], batch["picks"], batch["src"], batch["dst"], batch["hand_valid"])
+    logp, ent = jax.vmap(log_prob_entropy, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0))(
+        params, hd, batch["a"], batch["picks"], batch["src"], batch["dst"], batch["hand_valid"],
+        batch["lo"], batch["hi"])
     value = hd.value
     adv = batch["adv"]               # normalized over the full batch in batch_grads
     pg_loss = -(logp * adv).mean()
@@ -186,7 +190,8 @@ def train_step(params, m, v, t, carry, key, scale):
     carry, traj, fin, last_value = rollout(params, carry, key, scale)
     adv, ret = gae(traj["reward"], traj["value"], traj["done"], last_value)
     flat = lambda x: x.reshape((T * N_ENVS,) + x.shape[2:])
-    batch = {k: flat(traj[k]) for k in ("obs", "legal", "hand_valid", "mmask", "a", "picks", "src", "dst")}
+    batch = {k: flat(traj[k]) for k in ("obs", "legal", "hand_valid", "mmask", "a", "picks", "src", "dst",
+                                         "lo", "hi")}
     batch["adv"], batch["ret"] = flat(adv), flat(ret)
 
     (loss, aux), grads = batch_grads(params, batch)
@@ -225,6 +230,8 @@ def train_step(params, m, v, t, carry, key, scale):
         "sell_frac": fin["sell"].mean(),
         "move_frac": fin["move"].mean(),
         "reroll_frac": fin["reroll"].mean(),
+        "use_frac": fin["use"].mean(),                    # USE a Tarot / Planet
+        "open_frac": fin["pack"].mean(),                  # OPEN a pack
         "play_cards": fin["play_cards"].sum() / jnp.maximum(fin["play"].sum(), 1),   # cards per PLAY
     }
     return params, m, v, t, carry, metrics
@@ -365,7 +372,8 @@ if __name__ == "__main__":
                       f"buys {metrics['run_buys']:4.1f}  ent {metrics['entropy']:5.2f}  "
                       f"ev {metrics['explained_var']:5.2f}  move {metrics['move_frac']:4.0%} "
                       f"cards {metrics['play_cards']:3.1f} "
-                      f"pen {metrics['run_move_penalty']:5.1f}  {rate / 1e3:5.0f}k st/s")
+                      f"pen {metrics['run_move_penalty']:5.1f}  use {metrics['use_frac']:4.1%} "
+                      f"open {metrics['open_frac']:4.1%}  {rate / 1e3:5.0f}k st/s")
             if completed % CKPT_EVERY == 0:
                 save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum, move_cfg)
                 save_params(params)

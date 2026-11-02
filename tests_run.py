@@ -6,16 +6,18 @@ Staging lives in fixtures.py. Run: python tests_run.py (tests.py also runs it).
 """
 
 import itertools
+import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from env import (balatroAction, env_step, deal, reset, explain_play, preview, acquire, roll_shop,
+from env import (balatroAction, env_step, deal, reset, explain_play, preview, acquire, roll_shop, roll_joker,
                  invariant_errors, blind_target, MAX_HAND_SIZE, MAX_SHOP_SLOTS,
                  V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD,
-                 STAGE_BLIND, STAGE_SHOP, STAGE_LOST, STAGE_WON,
+                 STAGE_BLIND, STAGE_SHOP, STAGE_LOST, STAGE_WON, STAGE_SELECT, STAGE_NAMES, N_VERBS,
                  BLIND_SMALL, BLIND_BIG, BLIND_BOSS)
+from items import BOSS_MIN_ANTE, BOSS_SHOWDOWN, TAG_MIN_ANTE
 from jokers import JOKER_ID, J_EMPTY, MAX_JOKERS, N_JOKERS
 from fixtures import state, select, mask_lanes, diff_states, report
 
@@ -37,6 +39,7 @@ class Checks:
     """Collect failures for one suite. check() records a line when ok is False."""
     def __init__(self, label):
         self.label, self.failures, self.n = label, [], 0
+        self.t0 = time.time()
 
     def check(self, name, ok, got=None, want=None):
         self.n += 1
@@ -54,7 +57,8 @@ class Checks:
         self.n += 1
 
     def done(self):
-        return report(self.label, self.failures, f"{self.label}: all {self.n} checks passed")
+        t = f" ({time.time() - self.t0:.0f} s)"                 # the suite's time, its jit compiles included
+        return report(self.label + t, self.failures, f"{self.label}: all {self.n} checks passed{t}")
 
 
 # ---------------------------------------------------------------------------
@@ -161,21 +165,19 @@ def run_blind_end_test():
     seen = set()
     for k in range(20):
         got, _, _ = env_step(held._replace(key=jax.random.key(k)), act(V_PLAY, "11000000"))
-        seen |= {int(s) for s in got.shop_slots[:2]}
+        seen |= {int(s) for s, k in zip(got.shop_slots[:2], got.shop_kind[:2]) if int(k) == 0}
     c.check("held jokers never rolled", not (seen & {int(j) for j in trio}), sorted(seen))
 
-    # the table can hold more jokers than MAX_JOKERS, so the pool tests call
-    # roll_shop with a long `held` list. Pool of one: slot 0 = the last joker,
-    # slot 1 falls back to a Joker.
+    # the table holds more jokers than MAX_JOKERS, so the pool tests pass a
+    # `taken` mask. Pool of one: the last joker; an empty pool: a Joker.
     greedy = JOKER_ID["Greedy Joker"]
-    all_but = jnp.array([j for j in range(N_JOKERS) if j != greedy], jnp.int32)
-    got = roll_shop(jax.random.key(0), all_but, jnp.int32(2))
-    c.eq("pool of one: slot 0", got[0], greedy)
-    c.eq("pool of one: slot 1 = fallback Joker", got[1], J_JOKER)
-
-    # every joker held: both unlocked slots fall back, the locked ones stay empty
-    got = roll_shop(jax.random.key(0), jnp.arange(N_JOKERS, dtype=jnp.int32), jnp.int32(2))
-    c.eq("empty pool: Joker, Joker, -, -", got, jnp.array([J_JOKER, J_JOKER, -1, -1]))
+    all_but = jnp.arange(N_JOKERS) != greedy
+    jid, _ = roll_joker(jax.random.key(0), pre, jax.random.key(1), all_but)
+    c.eq("pool of one", jid, greedy)
+    jid, _ = roll_joker(jax.random.key(0), pre, jax.random.key(1), jnp.ones(N_JOKERS, bool))
+    c.eq("empty pool: fallback Joker", jid, J_JOKER)
+    roll = roll_shop(jax.random.key(0), pre)
+    c.eq("locked shop slots stay empty", roll.ids[2:], jnp.array([-1, -1]))
 
     # fail: last hand, not enough chips. 2C high card = 5 + 2 = 7.
     pre = state(hand="2C 4H 6S 8D TC 3S 9D QH", hands=1, money=7)
@@ -197,6 +199,26 @@ def run_blind_end_test():
     c.eq("ante-8 boss clear -> WON", got.game_stage, STAGE_WON)
     c.eq("win: done, reward = the boss cashout", (int(r), bool(d)), (7, True))
     c.eq("boss cashout $5 + 2 hands left", got.last_cashout, 5 + 2)   # fixture hands=3, one spent
+    c.eq("win: the ante stays 8", got.ante, 8)
+
+    # a beaten blind puts the next one on deck; a beaten boss starts the next ante: its boss
+    # (eligible, the least used), its two tags (by min ante), its voucher
+    pre = state(hand="KD KC 2C 4H 6S 8D TC 3S", chips_scored=290, blind_index=BLIND_SMALL)
+    got, _, _ = env_step(pre, act(V_PLAY, "11000000"))
+    c.eq("small beaten: the big blind is on deck", (int(got.ante), int(got.blind_index)), (1, BLIND_BIG))
+    for k in range(6):
+        pre = state(hand="KD KC 2C 4H 6S 8D TC 3S", chips_scored=290, blind_index=BLIND_BOSS, ante=1,
+                    key=k)
+        got, _, _ = env_step(pre, act(V_PLAY, "11000000"))
+        b = int(got.boss)
+        c.eq(f"boss {k} beaten: ante 2, the small blind on deck", (int(got.ante), int(got.blind_index)),
+             (2, BLIND_SMALL))
+        c.check(f"boss {k}: the new boss fits ante 2", int(BOSS_MIN_ANTE[b]) <= 2 and not bool(BOSS_SHOWDOWN[b]), b)
+        c.eq(f"boss {k}: counted as used", got.bosses_used[b], 1)
+        c.check(f"boss {k}: the tags fit ante 2",
+                all(0 <= int(t) < len(TAG_MIN_ANTE) and int(TAG_MIN_ANTE[int(t)]) <= 2 for t in got.blind_tags),
+                got.blind_tags)
+        c.check(f"boss {k}: a voucher in the shop", int(got.shop_vouchers[0]) >= 0, got.shop_vouchers)
     return c.done()
 
 
@@ -321,11 +343,16 @@ def run_shop_test():
     got, _, _ = env_step(poor, act(V_REROLL))
     c.same_state("reroll blocked: too poor", got, poor)
 
-    # next: small -> big, budget restored, fresh deal, Green keeps its value
+    # next: the shop -> the blind select of the blind on deck (the big one); NEXT there plays
+    # it: budget restored, fresh deal, Green keeps its value
     pre = state(hand="4C KD 9H KC 7C 9S 7S 3H", game_stage=STAGE_SHOP, hands=1, discards=0,
-                chips_scored=350, round=1, ante=1, blind_index=BLIND_SMALL,
+                chips_scored=350, round=1, ante=1, blind_index=BLIND_BIG,
                 jokers=("Green Joker",), joker_value=(3.0,), shop_slots=("Joker",))
-    got, r, d = env_step(pre, act(V_NEXT))
+    sel, r, d = env_step(pre, act(V_NEXT))
+    c.eq("next: the blind select", sel.game_stage, STAGE_SELECT)
+    c.eq("next: the shop is cleared", sel.shop_slots, jnp.full(MAX_SHOP_SLOTS, -1))
+    c.eq("next: reward 0, not done", (int(r), bool(d)), (0, False))
+    got, r, d = env_step(sel, act(V_NEXT))
     c.eq("next: big blind", got.blind_index, BLIND_BIG)
     c.eq("next: target 300 * 1.5", got.blind_target, 450)
     c.eq("next: hands restored", got.hands, 4)
@@ -341,10 +368,8 @@ def run_shop_test():
     c.check("next: invariants", not invariant_errors(got), invariant_errors(got))
 
     boss = pre._replace(blind_index=jnp.int32(BLIND_BOSS))
-    got, _, _ = env_step(boss, act(V_NEXT))
-    c.eq("after the boss: ante 2", got.ante, 2)
-    c.eq("after the boss: small blind", got.blind_index, BLIND_SMALL)
-    c.eq("after the boss: target 800", got.blind_target, 800)
+    got, _, _ = env_step(env_step(boss, act(V_NEXT))[0], act(V_NEXT))
+    c.eq("the boss blind: ante 1, target 300 x 2", (int(got.ante), int(got.blind_target)), (1, 600))
     return c.done()
 
 
@@ -359,8 +384,8 @@ def run_targets_test():
     c.eq("scale 0.1: ante 1 small = 30", reset(jax.random.key(0), 52, 8, 0.1).blind_target, 30)
     c.eq("scale 0.0: floor of 1 chip", blind_target(jnp.int32(1), 0, 0.0), 1)
     c.eq("scale 0.5: ante 8 boss = 50000", blind_target(jnp.int32(8), BLIND_BOSS, 0.5), 50000)
-    shop = state(hand="4C KD", game_stage=STAGE_SHOP, target_scale=0.1)
-    got, _, _ = env_step(shop, act(V_NEXT))
+    shop = state(hand="4C KD", game_stage=STAGE_SHOP, target_scale=0.1, blind_index=BLIND_BIG)
+    got, _, _ = env_step(env_step(shop, act(V_NEXT))[0], act(V_NEXT))
     c.eq("NEXT uses the state's scale: big = 45", got.blind_target, 45)
     return c.done()
 
@@ -403,20 +428,24 @@ _batch_explain = jax.jit(jax.vmap(explain_play, in_axes=(None, 0)))
 
 
 def run_full_run_test():
-    """Drive a whole run. Test staging: each blind's target is cut to 1 chip,
-    so every blind clears on its first play and the run must reach WON.
+    """Drive a whole run. Test staging: each blind's target is cut to 1 chip and the
+    bosses have no ability, so every blind clears on its first play and the run must
+    reach WON.
 
-    Policy: on odd rounds discard 2 cards first, then play the best hand.
-    Model: Green +1 per play, -1 per discard, floor 0 — checked every step.
+    Policy: play every blind (no skip); on odd rounds discard 2 cards first, then play
+    the best hand. Model: Green +1 per play, -1 per discard, floor 0 — checked every step.
     """
     c = Checks("full run")
     s = reset(jax.random.key(7), 52, 8)
-    s = s._replace(blind_target=jnp.int32(1))
     green = None          # model of Green's value; None until bought
     clears, steps = 0, 0
-    while int(s.game_stage) in (STAGE_BLIND, STAGE_SHOP) and steps < 400:
+    while int(s.game_stage) in (STAGE_BLIND, STAGE_SHOP, STAGE_SELECT) and steps < 400:
         steps += 1
-        if int(s.game_stage) == STAGE_SHOP:
+        if int(s.game_stage) == STAGE_SELECT:
+            s, _, _ = env_step(s._replace(boss=jnp.int32(-1)), act(V_NEXT))
+            c.eq("the blind starts", s.game_stage, STAGE_BLIND)
+            s = s._replace(blind_target=jnp.int32(1))
+        elif int(s.game_stage) == STAGE_SHOP:
             if green is None:
                 # stage the shop so Green is for sale, and afford it
                 s = s._replace(shop_slots=s.shop_slots.at[0].set(J_GREEN),
@@ -427,7 +456,7 @@ def run_full_run_test():
             money = int(s.money)
             s, _, _ = env_step(s, act(V_NEXT))
             c.eq("NEXT spends no money", s.money, money)
-            s = s._replace(blind_target=jnp.int32(1))
+            c.eq("NEXT goes to the blind select", s.game_stage, STAGE_SELECT)
         else:
             if int(s.round) % 2 == 1 and int(s.discards) == int(s.discardcount):
                 s, r, _ = env_step(s, act(V_DISCARD, "11"))
@@ -475,10 +504,10 @@ def run_fuzz_test(n_envs=128, n_steps=120, seed=0):
                              money=jnp.where(easy, 40, states.money))
     step = jax.jit(jax.vmap(env_step))
     akey = jax.random.key(seed + 1)
-    seen_stage = np.zeros(4, int)
+    seen_stage = np.zeros(len(STAGE_NAMES), int)
     for t in range(n_steps):
         akey, k1, k2, k3, k4 = jax.random.split(akey, 5)
-        verb = jax.random.randint(k1, (n_envs,), -1, 9)            # includes illegal verbs
+        verb = jax.random.randint(k1, (n_envs,), -1, N_VERBS + 1)  # includes illegal verbs
         sel = jax.random.bernoulli(k2, 0.3, (n_envs, MAX_HAND_SIZE))
         target = jax.random.randint(k3, (n_envs,), -2, 34)
         dest = jax.random.randint(k4, (n_envs,), -2, 10)
@@ -495,7 +524,7 @@ def run_fuzz_test(n_envs=128, n_steps=120, seed=0):
         c.check(f"step {t}: reward >= 0", bool((r >= 0).all()), r)
     c.check("the fuzz reached the shop", seen_stage[STAGE_SHOP] > 0, seen_stage)
     c.check("the fuzz reached LOST", seen_stage[STAGE_LOST] > 0, seen_stage)
-    print(f"  fuzz stage visits (BLIND, SHOP, LOST, WON): {seen_stage.tolist()}")
+    print(f"  fuzz stage visits {dict(zip(STAGE_NAMES, seen_stage.tolist()))}")
     return c.done()
 
 
@@ -511,8 +540,8 @@ def run_vmap_determinism_test():
         one, r1, d1 = env_step(s, a_)
         c.same_state(f"vmap lane {i} == single step", jax.tree.map(lambda x: x[i], got), one)
         c.eq(f"vmap lane {i} reward", r[i], r1)
-    s1 = reset(jax.random.key(3), 52, 8)
-    s2 = reset(jax.random.key(3), 52, 8)
+    s1 = env_step(reset(jax.random.key(3), 52, 8), act(V_NEXT))[0]
+    s2 = env_step(reset(jax.random.key(3), 52, 8), act(V_NEXT))[0]
     for _ in range(5):
         s1, _, _ = env_step(s1, act(V_DISCARD, "111"))
         s2, _, _ = env_step(s2, act(V_DISCARD, "111"))
@@ -532,8 +561,11 @@ def run_legal_mask_test(n_envs=64, n_steps=60, seed=5):
     NP = 10
     c = Checks("legal mask")
     states = jax.vmap(lambda k: reset(k, 52, 8, 0.05))(jax.random.split(jax.random.key(seed), n_envs))
-    states = states._replace(money=jnp.full(n_envs, 12, jnp.int32))
-    sel = jnp.zeros(MAX_HAND_SIZE, bool).at[:2].set(True)
+    cons = jnp.asarray(np.random.default_rng(seed).integers(-1, 34, (n_envs, 2)), jnp.int32)
+    cons = jnp.where(cons[:, :1] < 0, -1, cons)              # compact: no card after an empty slot
+    states = states._replace(money=jnp.full(n_envs, 12, jnp.int32),
+                             consumables=states.consumables.at[:, :2].set(cons),
+                             cons_sell=states.cons_sell.at[:, :2].set(jnp.where(cons >= 0, 1, 0)))
 
     def changed(a, b):
         return jnp.any(jnp.stack([jnp.any(x != y) for x, y in
@@ -544,6 +576,9 @@ def run_legal_mask_test(n_envs=64, n_steps=60, seed=5):
 
     @jax.jit
     def probe(s):
+        from arrays import first_n
+        sel = first_n(s.hand_valid, 2)                     # two cards: fits every card Tarot
+
         def one(a):
             nxt, _, _ = env_step(s, decode(a, sel))
             return changed(nxt, s)
@@ -570,7 +605,8 @@ def run_legal_mask_test(n_envs=64, n_steps=60, seed=5):
         row = jnp.where(a == A_MOVE_JOKER, 0, 2)
         src = jax.random.categorical(k2, jnp.where(mm[row], 0.0, -1e9))
         dst = jax.random.categorical(k3, jnp.where(dst_mask(mm[row + 1], src), 0.0, -1e9))
-        nxt, _, _ = env_step(s, decode(a, sel, src, dst))
+        from arrays import first_n
+        nxt, _, _ = env_step(s, decode(a, first_n(s.hand_valid, 2), src, dst))
         over = (nxt.game_stage == STAGE_LOST) | (nxt.game_stage == STAGE_WON)
         return jax.tree.map(lambda x, y: jnp.where(over, x, y), s, nxt)   # stay live
 
@@ -632,10 +668,13 @@ def run_move_reach_test(n_perms=40, seed=3):
 
 def run_picker_test(n_envs=256, seed=11):
     """The card picker: hand_feats reads the hand back from obs; the probabilities
-    of every pick sequence sum to 1; a sampled pick is 1..5 distinct valid lanes,
-    its sel mask matches, and its sampled logp equals the teacher-forced one."""
+    of every pick sequence sum to 1 (PLAY 1..5 and a Tarot's own range); a
+    sampled pick fits its [lo, hi], has distinct valid lanes, its sel mask
+    matches, and its sampled logp equals the teacher-forced one; an action that
+    takes no cards STOPs at once with logp 0."""
     from agent import (init_params, observe, legal_mask, move_masks, masked_logits, hand_feats,
-                       sample_picks, pick_logp_entropy, act, MAX_PICK, STOP)
+                       sample_picks, pick_logp_entropy, pick_query, pick_bounds, act, MAX_PICK, STOP,
+                       A_PLAY, A_DISCARD, A_USE, uses_picker)
     c = Checks("picker")
     params = init_params(jax.random.key(seed))
     k1, k2, k3 = jax.random.split(jax.random.key(seed + 1), 3)
@@ -643,56 +682,65 @@ def run_picker_test(n_envs=256, seed=11):
     params["vs"] = jax.random.normal(k2, params["vs"].shape)
     params["bstop"] = jnp.array([0.3])
 
-    s = state(hand="4C KD 9H KC 7C 9S 7S 3H")
+    s = state(hand="4C KD 9H KC 7C 9S 7S 3H", consumables=("The Star", "Death"))
     x = hand_feats(observe(s))
     c.eq("hand_feats rank", jnp.argmax(x[:8, :13], 1), s.hand[:8] % 13)
-    c.eq("hand_feats suit", jnp.argmax(x[:8, 13:], 1), s.hand[:8] // 13)
+    c.eq("hand_feats suit", jnp.argmax(x[:8, 13:17], 1), s.hand[:8] // 13)
     c.eq("hand_feats holes are zero", x[8:].sum(), 0.0)
 
-    holed = s._replace(hand_valid=s.hand_valid.at[3:].set(False))      # 3 cards: lanes 0..2
+    holed = s._replace(hand_valid=s.hand_valid.at[4:].set(False))      # 4 cards: lanes 0..3
     hd = masked_logits(params, observe(holed), legal_mask(holed), holed.hand_valid, move_masks(holed))
-    for v in (0, 1):
+    for a in (A_PLAY, A_DISCARD, A_USE, A_USE + 1):                     # The Star 1..3, Death 2..2
+        lo, hi = pick_bounds(holed, jnp.int32(a))
+        qv = pick_query(hd, jnp.int32(a))
         total = 0.0
-        for k in range(1, 4):
-            for seq in itertools.permutations(range(3), k):
+        for k in range(0, 5):
+            for seq in itertools.permutations(range(4), k):
                 picks = jnp.array(list(seq) + [STOP] * (MAX_PICK - k), jnp.int32)
-                lp, _ = pick_logp_entropy(params, hd, v, holed.hand_valid, picks)
+                lp, _ = pick_logp_entropy(params, hd, qv, lo, hi, holed.hand_valid, picks)
                 total += float(jnp.exp(lp))
-        c.check(f"verb {v}: all pick sequences sum to 1", abs(total - 1.0) < 1e-4, total, 1.0)
+                if not int(lo) <= k <= int(hi):
+                    c.check(f"action {a}: {k} cards impossible", float(jnp.exp(lp)) == 0.0, float(jnp.exp(lp)))
+        c.check(f"action {a} [{int(lo)}, {int(hi)}]: all pick sequences sum to 1", abs(total - 1.0) < 1e-4, total, 1.0)
+    lp, ent = pick_logp_entropy(params, hd, pick_query(hd, jnp.int32(2)), 0, 0, holed.hand_valid,
+                                jnp.full(MAX_PICK, STOP, jnp.int32))
+    c.check("no cards: logp 0, entropy 0", abs(float(lp)) < 1e-6 and abs(float(ent)) < 1e-6, float(lp), float(ent))
 
     states = jax.vmap(lambda k: reset(k, 52, 8, 0.05))(jax.random.split(k3, n_envs))
-    _, (a, sel, picks, *_r, logp) = jax.jit(jax.vmap(act, in_axes=(None, 0, 0)))(
+    cons = jnp.asarray(np.random.default_rng(seed).integers(0, 22, (n_envs, 2)), jnp.int32)
+    states = states._replace(consumables=states.consumables.at[:, :2].set(cons),
+                             cons_sell=states.cons_sell.at[:, :2].set(1))
+    _, st = jax.jit(jax.vmap(act, in_axes=(None, 0, 0)))(
         params, states, jax.random.split(jax.random.key(seed + 2), n_envs))
 
-    def again(st, a, picks):
-        hd = masked_logits(params, observe(st), legal_mask(st), st.hand_valid, move_masks(st))
-        lp, _ = pick_logp_entropy(params, hd, (a == 1).astype(jnp.int32), st.hand_valid, picks)
+    def again(s, a, picks, lo, hi):
+        hd = masked_logits(params, observe(s), legal_mask(s), s.hand_valid, move_masks(s))
+        lp, _ = pick_logp_entropy(params, hd, pick_query(hd, a), lo, hi, s.hand_valid, picks)
         return lp
-    lp_tf = jax.vmap(again)(states, a, picks)
-    a, sel, picks, valid = jax.device_get((a, sel, picks, states.hand_valid))
-    counts = []
+    lp_tf = jax.vmap(again)(states, st.a, st.picks, st.lo, st.hi)
+    a, sel, picks, valid, lo, hi = jax.device_get((st.a, st.sel, st.picks, states.hand_valid, st.lo, st.hi))
     for i in range(n_envs):
         lanes = [int(p) for p in picks[i] if p != STOP]
         after_stop = list(picks[i][len(lanes):])
-        counts.append(len(lanes))
-        c.check(f"env {i}: 1..5 picks", 1 <= len(lanes) <= MAX_PICK, len(lanes))
+        c.check(f"env {i}: {lo[i]}..{hi[i]} picks", lo[i] <= len(lanes) <= hi[i], len(lanes))
         c.check(f"env {i}: STOP only at the end", all(p == STOP for p in after_stop), picks[i])
         c.check(f"env {i}: distinct", len(set(lanes)) == len(lanes), lanes)
         c.check(f"env {i}: valid lanes", all(valid[i][l] for l in lanes), lanes)
         c.eq(f"env {i}: sel = picks", np.nonzero(sel[i])[0], sorted(lanes))
-    _, (_, _, picks0, *_r) = jax.jit(jax.vmap(act, in_axes=(None, 0, 0)))(     # fresh params
+    _, st0 = jax.jit(jax.vmap(act, in_axes=(None, 0, 0)))(     # fresh params
         init_params(jax.random.key(seed)), states, jax.random.split(jax.random.key(seed + 3), n_envs))
-    counts0 = set(int(n) for n in (np.asarray(picks0) != STOP).sum(1))
-    c.check("fresh params: every count 1..5 is sampled", counts0 == set(range(1, 6)), sorted(counts0))
+    play = np.asarray(st0.a) == A_PLAY
+    counts0 = set(int(n) for n in (np.asarray(st0.picks)[play] != STOP).sum(1))
+    c.check("fresh params: every PLAY count 1..5 is sampled", counts0 == set(range(1, 6)), sorted(counts0))
 
-    # the action logp = verb + picks for PLAY/DISCARD; check the picks part
-    from agent import masked_logits as _ml
-    hd = jax.vmap(lambda st: _ml(params, observe(st), legal_mask(st), st.hand_valid,
-                                 move_masks(st)))(states)
+    # the action logp = verb + picks for the picker actions; check the picks part
+    hd = jax.vmap(lambda s: masked_logits(params, observe(s), legal_mask(s), s.hand_valid,
+                                          move_masks(s)))(states)
     lp_a = jax.vmap(lambda l, a: jax.nn.log_softmax(l)[a])(hd.a, jnp.asarray(a))
-    uses = np.isin(a, (0, 1))
-    diff = np.abs(np.asarray(logp) - np.asarray(lp_a) - np.asarray(lp_tf))[uses]
-    c.check("some PLAY / DISCARD sampled", uses.sum() > 20, uses.sum())
+    uses = np.asarray(jax.vmap(uses_picker)(jnp.asarray(a)))
+    diff = np.abs(np.asarray(st.logp) - np.asarray(lp_a) - np.asarray(lp_tf))[uses]
+    c.check("some picker actions sampled", uses.sum() > 20, uses.sum())
+    c.check("some USE sampled", ((a >= A_USE) & (a < A_USE + 2)).sum() > 3, ((a >= A_USE) & (a < A_USE + 2)).sum())
     c.check("sampled logp = teacher-forced logp", diff.max() < 1e-4, diff.max())
     return c.done()
 
@@ -700,52 +748,61 @@ def run_picker_test(n_envs=256, seed=11):
 def run_embed_test(seed=21):
     """The token encoder: obs carries the ids (shop ids only in the shop); the
     fixed features carry COND_PARAM (Droll = flush, Greedy = diamonds); one
-    joker has the same embedding held and in the shop; the position vectors make
-    slot order matter; an empty slot or a hole is never a key; E[j] gets a
-    gradient from any slot j sits in; the dst pointer depends on src."""
+    joker has the same item embedding held and in the shop, and a Tarot in a
+    consumable slot and in the shop; the position vectors make slot order
+    matter; an empty slot or a hole is never a key; the token caps cover the env;
+    E[j] gets a gradient from any slot j sits in; the dst pointer depends on src."""
     from agent import (init_params, observe, joker_ids, tokens, encode, policy, masked_logits,
-                       legal_mask, move_masks, JOKER_FEATS, CONDITION_NAMES, N_HAND_TYPES,
-                       J_SLOTS, N_TOK, O_SHOP, JS_F, J_TOK, C_TOK)
+                       legal_mask, move_masks, JOKER_FEATS, CONDITION_NAMES, N_TOK, O_SHOP, O_JS,
+                       JS_F, J_TOK, C_TOK, I_SHOP, I_CONS, ID_N, _item_emb, N_ITEMS)
     from env import STAGE_SHOP, MAX_SHOP_SLOTS
+    from items import N_HAND_TYPES, CONS_ID, MAX_JOKER_SLOTS
+    from jokers import N_JOKERS
     c = Checks("embed")
     params = init_params(jax.random.key(seed))
     names = ("Bull", "Blueprint", "Green Joker")
-    s = state(hand="4C KD 9H KC 7C", jokers=names, joker_value=(0.0, 0.0, 2.0))
+    s = state(hand="4C KD 9H KC 7C", jokers=names, joker_value=(0.0, 0.0, 2.0), consumables=("The Star",))
     held = [JOKER_ID[n] for n in names]
     ids = np.asarray(joker_ids(observe(s)))
     c.eq("held ids", ids[:3], held)
     c.eq("empty held slots = -1", ids[3:MAX_JOKERS], [-1] * (MAX_JOKERS - 3))
     c.eq("no shop ids in a blind", ids[MAX_JOKERS:], [-1] * MAX_SHOP_SLOTS)
     shop = s._replace(game_stage=jnp.int32(STAGE_SHOP),
-                      shop_slots=jnp.array([JOKER_ID["Bull"], -1, JOKER_ID["Baron"], -1], jnp.int32))
+                      shop_slots=jnp.array([JOKER_ID["Bull"], -1, JOKER_ID["Baron"], CONS_ID["The Star"]], jnp.int32),
+                      shop_kind=jnp.array([0, 0, 0, 1], jnp.int32), shop_size=jnp.int32(4),
+                      hand_valid=jnp.zeros_like(s.hand_valid))         # the hand is back in the deck
     ids = np.asarray(joker_ids(observe(shop)))
-    c.eq("shop ids in the shop", ids[MAX_JOKERS:], [JOKER_ID["Bull"], -1, JOKER_ID["Baron"], -1])
+    c.eq("shop ids in the shop", ids[MAX_JOKERS:],
+         [JOKER_ID["Bull"], -1, JOKER_ID["Baron"], N_JOKERS + CONS_ID["The Star"]])
+    all_ids = np.asarray(observe(shop)[:ID_N]).astype(int) - 1
+    c.eq("the Tarot held = the Tarot in the shop (one id space)", all_ids[I_CONS], all_ids[I_SHOP + 3])
 
-    # COND_PARAM bits: after TRIGGER and the CONDITION one-hot come suit 4, rank 13, hand 9, count 1
+    # COND_PARAM bits: after TRIGGER and the CONDITION one-hot come suit 4, rank 13, hand 12, count 1
     f = np.asarray(JOKER_FEATS)
     from jokers import TRIGGER_NAMES
-    o = len(TRIGGER_NAMES) + len(CONDITION_NAMES)
-    c.eq("Droll: hand bit = flush", np.nonzero(f[JOKER_ID["Droll Joker"], o + 17:o + 17 + N_HAND_TYPES])[0], [3])
+    from jokers import JOKERS as _JK
+    o = int(_JK.TRIGGER.max()) + 1 + len(CONDITION_NAMES)
+    c.eq("Droll: hand bit = flush", np.nonzero(f[JOKER_ID["Droll Joker"], o + 17:o + 17 + N_HAND_TYPES])[0], [6])
     c.eq("Greedy: suit bit = diamonds", np.nonzero(f[JOKER_ID["Greedy Joker"], o:o + 4])[0], [1])
     c.eq("Fibonacci: rank bits A 2 3 5 8", np.nonzero(f[JOKER_ID["Fibonacci"], o + 4:o + 17])[0], [0, 1, 3, 6, 12])
 
     tok, ok = tokens(params, observe(shop))
     tok, ok = np.asarray(tok), np.asarray(ok)
     c.eq("N_TOK", tok.shape[0], N_TOK)
-    c.eq("keys: global + 3 held + 2 offers (no cards in the shop)", int(ok.sum()), 6)
+    c.eq("keys: global + 3 held + 3 shop + 1 consumable (no cards, no packs)", int(ok.sum()), 8)
+    c.check("blind keys = global + 3 held + 1 consumable + 5 cards",
+            int(np.asarray(tokens(params, observe(s))[1]).sum()) == 10)
+    e = np.asarray(_item_emb(params, jnp.array([JOKER_ID["Bull"], N_JOKERS + CONS_ID["The Star"], -1])))
+    c.check("an empty slot embeds to 0", np.abs(e[2]).max() == 0.0)
+    c.check("a joker and a Tarot differ", not np.allclose(e[0], e[1]))
 
     # the token caps cover everything the env can fill
     from jokers import JOKERS as JK
     from env import reset as _reset
     hs = np.asarray(JK.H_SIZE)
     bonus = np.sort(np.where(np.asarray(JK.HSIZE_V), 5, np.maximum(hs, 0)))[::-1][:5].sum()
-    c.check("max hand size <= C_TOK", 8 + bonus <= C_TOK, 8 + bonus, C_TOK)
-    c.check("joker slots <= J_TOK", int(_reset(jax.random.key(0), 52, 8, 1.0).joker_slots) <= J_TOK)
-    Ty = np.asarray(params["Ty"])
-    bull_held = tok[1] - np.asarray(params["Pj"])[0] - Ty[0] - np.asarray(observe(shop))[J_SLOTS:J_SLOTS + JS_F] @ np.asarray(params["Wjs"])
-    bull_shop = tok[1 + J_TOK] - np.asarray(params["Ps"])[0] - Ty[1] - np.asarray(observe(shop))[O_SHOP:O_SHOP + 2] @ np.asarray(params["Wsh"])
-    c.check("Bull: held embedding = shop embedding", np.allclose(bull_held, bull_shop, atol=1e-5))
-    c.check("blind keys = global + 3 held + 5 cards", int(np.asarray(tokens(params, observe(s))[1]).sum()) == 9)
+    c.check("max hand size + 4 added cards <= C_TOK", 8 + bonus + 4 <= C_TOK, 8 + bonus + 4, C_TOK)
+    c.check("joker slots <= J_TOK", MAX_JOKER_SLOTS <= J_TOK)
 
     h = lambda st: np.asarray(encode(params, observe(st)).h)
     swap = s._replace(jokers=s.jokers.at[0].set(s.jokers[1]).at[1].set(s.jokers[0]))
@@ -755,6 +812,8 @@ def run_embed_test(seed=21):
     holed = s._replace(hand_valid=s.hand_valid.at[4].set(False))
     other = holed._replace(hand=holed.hand.at[4].set(holed.hand[0]))
     c.check("a hole's card has no effect", np.allclose(h(holed), h(other), atol=1e-6))
+    glass = s._replace(card_enh=s.card_enh.at[int(s.hand[0])].set(4))
+    c.check("an enhancement changes the trunk", not np.allclose(h(s), h(glass)))
 
     bull = JOKER_ID["Bull"]
     moved = s._replace(jokers=s.jokers.at[0].set(s.jokers[5]).at[5].set(s.jokers[0]))
@@ -774,7 +833,9 @@ def run_embed_test(seed=21):
 
 ALL = [run_repair_test, run_deal_empty_test, run_blind_end_test, run_targets_test,
        run_shop_test, run_explain_test, run_vmap_determinism_test, run_full_run_test,
-       run_move_reach_test, run_fuzz_test, run_legal_mask_test, run_picker_test, run_embed_test]
+       run_move_reach_test, run_fuzz_test]
+# the agent tests are not in the default run (env work); python tests_run.py agent runs them
+AGENT = [run_legal_mask_test, run_picker_test, run_embed_test]
 
 
 def run_all():
@@ -782,4 +843,8 @@ def run_all():
 
 
 if __name__ == "__main__":
-    run_all()
+    import sys
+    if sys.argv[1:] == ["agent"]:
+        all([f() for f in AGENT])
+    else:
+        run_all()

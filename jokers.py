@@ -4,8 +4,9 @@ A joker is one row over independent axes. One generic evaluator reads the rows.
 To add a joker, add a row. Do not add a branch to the scoring pipeline.
 
 Import direction (acyclic):
-    arrays.py / jokers.py    no project imports
-    scoring.py               imports jokers
+    arrays.py / items.py     no project imports
+    jokers.py                imports items (the hand types, the enhancements)
+    scoring.py               imports jokers, items
     env.py                   imports both
 
 Static data and live data are different axes:
@@ -29,6 +30,8 @@ import jax.numpy as jnp
 import jax
 from typing import NamedTuple
 
+from items import N_HAND_TYPES, ENH_STEEL, ENH_STONE, ENH_LUCKY, ENH_GOLD, ENH_GLASS
+
 # region AXES
 # ---------------------------------------------------------------------------
 # AXIS 1 — TRIGGER : when the row fires
@@ -43,9 +46,9 @@ T_ONCE_MAIN       = 2    # once per hand, slot order. As an UPDATE event it is
 T_END_OF_ROUND    = 3    # after a blind is beaten, before the cashout
 T_ON_DISCARD      = 4    # once per DISCARD action (Green Joker, Faceless Joker)
 T_ON_SHOP_ENTER   = 5    # (unused)
-T_ON_SHOP_EXIT    = 6    # Perkeo (not authored)
-T_ON_BLIND_SELECT = 7    # NEXT starts a blind (Burglar)
-T_ON_SOLD         = 8    # the sold joker itself (not authored yet)
+T_ON_SHOP_EXIT    = 6    # leaving the shop (Perkeo)
+T_ON_BLIND_SELECT = 7    # a blind is selected (Burglar, Riff-raff, Chicot, ...)
+T_ON_SOLD         = 8    # the sold joker itself (Luchador, Diet Cola, Invisible Joker)
 T_ON_PACK_OPEN    = 9    # Hallucination (not authored)
 T_ON_PACK_SKIP    = 10   # Red Card (not authored)
 T_ON_BOSS         = 11   # Chicot, Luchador, Matador (not authored)
@@ -53,8 +56,13 @@ T_BEFORE          = 12   # once per PLAY, before any card scores (To Do List $)
 T_AFTER           = 13   # once per PLAY, after the score (Ice Cream, Seltzer)
 T_ON_DISCARD_CARD = 14   # per discarded card, lane order (Castle, Mail-In Rebate)
 T_ON_REROLL       = 15   # a shop reroll (Flash Card)
-T_ON_SELL_OTHER   = 16   # another joker is sold (Campfire)
+T_ON_SELL_OTHER   = 16   # another card is sold: a joker, a Tarot or a Planet (Campfire)
 T_PASSIVE         = 17   # no event: a budget, rule or copy joker
+T_ON_PLANET       = 18   # a Planet card is used (Constellation)
+T_ON_CARD_ADDED   = 19   # playing cards are added to the deck (Hologram; n = the cards)
+T_ON_GLASS        = 20   # Glass cards are destroyed (Glass Joker; n = the cards)
+T_SPECIAL         = 21   # never emitted: the pipeline applies the rule itself (Vampire, Ceremonial Dagger, Madness)
+T_ON_FACE_DESTROYED = 22 # face cards are destroyed (Canio; n = the face cards)
 T_NONE            = -1   # padding for an unused update rule. No event is -1,
                          # so the rule never fires.
 
@@ -62,7 +70,8 @@ TRIGGER_NAMES = ["PER_SCORED", "PER_HELD", "ONCE_MAIN", "END_OF_ROUND",
                  "ON_DISCARD", "ON_SHOP_ENTER", "ON_SHOP_EXIT",
                  "ON_BLIND_SELECT", "ON_SOLD", "ON_PACK_OPEN", "ON_PACK_SKIP",
                  "ON_BOSS", "BEFORE", "AFTER", "ON_DISCARD_CARD", "ON_REROLL",
-                 "ON_SELL_OTHER", "PASSIVE"]
+                 "ON_SELL_OTHER", "PASSIVE", "ON_PLANET", "ON_CARD_ADDED", "ON_GLASS",
+                 "SPECIAL", "ON_FACE_DESTROYED"]
 
 
 # ---------------------------------------------------------------------------
@@ -97,14 +106,21 @@ C_COUNT_EQ       = 21   # gate: cards played == param (Square Joker)
 C_SCORING_FACE   = 22   # gate: a scored card is a face card (Ride the Bus)
 C_MOST_PLAYED    = 23   # gate: the hand type is now played more than every other (Obelisk)
 C_BOSS           = 24   # gate: the blind is a Boss Blind (Campfire, Rocket)
+C_ENH            = 25   # card: its enhancement is param (Golden Ticket: Gold)
+C_LUCKY_HIT      = 26   # card: a Lucky Card that triggered (Lucky Cat; counts each trigger)
+C_ACE_STRAIGHT   = 27   # gate: a scored Ace and the hand contains a Straight (Superposition)
+C_MONEY_LE       = 28   # gate: $ <= param (Vagabond)
+C_NOT_BOSS       = 29   # gate: the blind is a Small or Big Blind (Madness)
+C_BOSS_TRIGGERED = 30   # gate: the hand triggered the Boss Blind's ability (Matador)
 
 CONDITION_NAMES = ["NONE", "SUIT", "RANK_IN", "IS_FACE", "HAND_HAS",
                    "COUNT_CMP", "RANK_SUIT", "POSITION", "FIRST_FACE", "ANCIENT_SUIT",
                    "LOWEST_HELD", "MAIL_RANK", "CASTLE_SUIT", "FACES_GE", "LAST_HAND",
                    "HAND_REPEAT", "SEEING_DOUBLE", "FLOWER_POT", "HELD_ALL_BLACK",
-                   "LOYALTY", "TODO_HAND", "COUNT_EQ", "SCORING_FACE", "MOST_PLAYED", "BOSS"]
+                   "LOYALTY", "TODO_HAND", "COUNT_EQ", "SCORING_FACE", "MOST_PLAYED", "BOSS",
+                   "ENH", "LUCKY_HIT", "ACE_STRAIGHT", "MONEY_LE", "NOT_BOSS", "BOSS_TRIGGERED"]
 PER_CARD_CONDS = (C_SUIT, C_RANK_IN, C_IS_FACE, C_RANK_SUIT, C_POSITION, C_FIRST_FACE,
-                  C_ANCIENT_SUIT, C_LOWEST_HELD, C_MAIL_RANK, C_CASTLE_SUIT)
+                  C_ANCIENT_SUIT, C_LOWEST_HELD, C_MAIL_RANK, C_CASTLE_SUIT, C_ENH, C_LUCKY_HIT)
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +135,9 @@ E_RETRIGGER         = 3    # extra repetitions of the card (a COUNTER row: VALUE
 # Family B — STATE: a side effect applied after scoring.
 E_ADD_MONEY         = 4
 E_TRANSFORM_CARD    = 5    # Midas Mask (not authored)
-E_DESTROY_CARD      = 6    # Sixth Sense (not authored)
-E_SPAWN_CARD        = 7    # DNA (not authored)
-E_SPAWN_CONSUMABLE  = 8    # 8 Ball, Seance, Vagabond (not authored)
+E_DESTROY_CARD      = 6    # the first hand's single 6 is destroyed, a Spectral card made (Sixth Sense)
+E_SPAWN_CARD        = 7    # Marble Joker, Certificate, DNA (the env adds the card)
+E_SPAWN_CONSUMABLE  = 8    # a Tarot: 8 Ball, Superposition, Vagabond, Cartomancer, Hallucination
 E_SELL_VALUE        = 9    # Egg — the joker's own sell value, not money
 
 # Family C — BUDGET: round scalars. Budget jokers use the H_SIZE / D_SIZE /
@@ -141,13 +157,27 @@ E_MULT_RANDOM       = 18   # +randint(0, VALUE) mult (Misprint)
 E_XMULT_UNCOMMON    = 19   # X v after each Uncommon joker's main effect (Baseball Card)
 E_SELL_VALUE_ALL    = 20   # +v sell value to every held joker (Gift Card)
 E_BURGLAR           = 21   # +v hands, discards = 0 (Burglar)
+E_PERMA_CHIPS       = 22   # the scored card keeps +VALUE chips for good (Hiker)
+E_LEVEL_UP          = 23   # BEFORE: the played hand gains a level (Space Joker); 1st discard (Burnt Joker)
+E_MIDAS             = 24   # BEFORE: scored face cards become Gold (Midas Mask)
+E_VAMPIRE           = 25   # (unused: Vampire is an XMULT counter; scoring strips the cards by J_VAMPIRE)
+E_DESTROY_DISCARD   = 26   # the 1st discard of 1 card is destroyed, +$VALUE (Trading Card)
+E_SPAWN_SPECTRAL    = 27   # a Spectral card (Seance)
+E_SPAWN_JOKER       = 28   # up to VALUE Common jokers (Riff-raff)
+E_DISABLE_BOSS      = 29   # disables the Boss Blind (Chicot at blind select, Luchador when sold)
+E_ADD_TAG           = 30   # a Double Tag (Diet Cola, when sold)
+E_SAVE              = 31   # a lost round with >= VALUE of the target is saved; destroyed (Mr. Bones)
+E_DUPLICATE         = 32   # sold after VALUE2 rounds: copies a random other joker (Invisible Joker)
+E_NEGATIVE_COPY     = 33   # leaving the shop: a Negative copy of a random consumable (Perkeo)
 
 EFFECT_NAMES = ["ADD_MULT", "ADD_CHIPS", "XMULT", "RETRIGGER", "ADD_MONEY",
                 "TRANSFORM_CARD", "DESTROY_CARD", "SPAWN_CARD",
                 "SPAWN_CONSUMABLE", "SELL_VALUE", "ADD_HAND", "ADD_DISCARD",
                 "SET_DISCARD", "ADD_HANDSIZE", "ADD_REROLL", "NONE", "CHIPS_MULT",
                 "MULT_NOMINAL", "MULT_RANDOM", "XMULT_UNCOMMON", "SELL_VALUE_ALL",
-                "BURGLAR"]
+                "BURGLAR", "PERMA_CHIPS", "LEVEL_UP", "MIDAS", "VAMPIRE", "DESTROY_DISCARD",
+                "SPAWN_SPECTRAL", "SPAWN_JOKER", "DISABLE_BOSS", "ADD_TAG", "SAVE", "DUPLICATE",
+                "NEGATIVE_COPY"]
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +185,7 @@ EFFECT_NAMES = ["ADD_MULT", "ADD_CHIPS", "XMULT", "RETRIGGER", "ADD_MONEY",
 # ---------------------------------------------------------------------------
 S_CONSTANT = 0    # v = VALUE                                  (Joker, Duo)
 S_COUNTER  = 1    # v = joker_value, evolved by update()       (Green, Obelisk)
-S_QUERY    = 2    # v = VALUE * a count from global state      (Bootstraps)
+S_QUERY    = 2    # v = QBASE + VALUE * a count from global state (Bootstraps; Steel Joker 1 + 0.2 n)
 
 SOURCE_NAMES = ["CONSTANT", "COUNTER", "QUERY"]
 
@@ -165,8 +195,8 @@ Q_NONE              = 0
 Q_MONEY_DIV_5       = 1    # Bootstraps
 Q_EMPTY_JOKER_SLOTS = 2    # Joker Stencil. A held Stencil counts as empty
                            # ("Joker Stencil included"), so the count is >= 1.
-Q_DECK_STEEL_COUNT  = 3    # Steel Joker (not authored)
-Q_DECK_STONE_COUNT  = 4    # Stone Joker (not authored)
+Q_DECK_STEEL_COUNT  = 3    # Steel Joker - Steel cards in the full deck
+Q_DECK_STONE_COUNT  = 4    # Stone Joker - Stone cards in the full deck
 Q_DECK_NINE_COUNT   = 5    # Cloud 9 - 9s in the FULL deck, not the undealt part
 Q_UNCOMMON_JOKERS   = 6    # (unused: Baseball Card is E_XMULT_UNCOMMON)
 Q_DISCARDS_LEFT     = 7    # Banner
@@ -178,7 +208,11 @@ Q_OTHER_SELL        = 12   # Swashbuckler - sell value of the other held jokers
 Q_HAND_PLAYED       = 13   # Supernova - times this hand type was played this run
 Q_DECK_LOST         = 14   # Erosion - cards below the starting 52
 Q_DELAYED_GRAT      = 15   # Delayed Gratification - discards left if none was used
-N_QUERY_KINDS       = 16   # length of ctx
+Q_TAROTS_USED       = 16   # Fortune Teller - Tarot cards used this run
+Q_UNIQUE_PLANETS    = 17   # Satellite - different Planet cards used this run
+Q_DRIVER            = 18   # Driver's License - 1 if 16 or more Enhanced cards in the full deck
+Q_SKIPS             = 19   # Throwback - blinds skipped this run
+N_QUERY_KINDS       = 20   # length of ctx
 
 # A buy or sell during a blind changes a query result. resolve() runs on each
 # hand and its result is never cached.
@@ -214,9 +248,11 @@ STATE_NAMES = ["NONE", "SCALE_COUNTER", "ROTATE_GLOBAL", "ROTATE_FROM_DECK", "TO
 #   M_ADD             v += delta * n                      (Castle: +3 per card)
 #   M_RESET           if n > 0: v = seed                  (Hit the Road at round end)
 #   M_RESET_ELSE_ADD  if n > 0: v = seed, else v += delta (Ride the Bus, Obelisk)
+#   M_EVERY           every param-th count: v += delta; joker_state keeps the count since
+#                     the last one (Yorick: every 23 cards discarded)
 # A rule that fires floors v at 0.
 N_UPDATE_RULES = 2
-M_ADD, M_RESET, M_RESET_ELSE_ADD = 0, 1, 2
+M_ADD, M_RESET, M_RESET_ELSE_ADD, M_EVERY = 0, 1, 2, 3
 
 # POOL : when the shop may offer the joker
 P_ALWAYS, P_NOT_EXTINCT, P_EXTINCT = 0, 1, 2     # Gros Michel / Cavendish
@@ -254,6 +290,8 @@ class Joker(NamedTuple):
     D_SIZE     : jnp.ndarray   # int32   — discards per round while held
     H_PLAYS    : jnp.ndarray   # int32   — hands per round while held
     HSIZE_V    : jnp.ndarray   # bool    — hand size += v (Turtle Bean)
+    QBASE      : jnp.ndarray   # float32 — S_QUERY: v = QBASE + VALUE * count
+    GATE_ENH   : jnp.ndarray   # int32   — the shop offers it only with a card of this enhancement (-1 = always)
 
 # ---------------------------------------------------------------------------
 # AUTHORING RECORD — one joker per line. Compiled to columns below.
@@ -265,11 +303,10 @@ COMMON, UNCOMMON, RARE, LEGENDARY = 1, 2, 3, 4
 # Suits, for COND_PARAM (scoring.py: 0=clubs 1=diamonds 2=hearts 3=spades).
 CLUBS, DIAMONDS, HEARTS, SPADES = 0, 1, 2, 3
 
-# Hand types, for C_HAND_HAS. Index-aligned with scoring.HAND_NAMES (jokers.py
-# imports nothing from the project, so the indices are written here).
-H_STRAIGHT_FLUSH, H_FOUR, H_FULL_HOUSE, H_FLUSH, H_STRAIGHT = 0, 1, 2, 3, 4
-H_THREE, H_TWO_PAIR, H_PAIR, H_HIGH = 5, 6, 7, 8
-N_HAND_TYPES = 9
+# Hand types, for C_HAND_HAS. Index-aligned with items.HAND_NAMES.
+H_FLUSH_FIVE, H_FLUSH_HOUSE, H_FIVE = 0, 1, 2
+H_STRAIGHT_FLUSH, H_FOUR, H_FULL_HOUSE, H_FLUSH, H_STRAIGHT = 3, 4, 5, 6, 7
+H_THREE, H_TWO_PAIR, H_PAIR, H_HIGH = 8, 9, 10, 11
 
 
 def _ranks(names):
@@ -303,14 +340,16 @@ class JokerDef(NamedTuple):
     d_size  : int = 0
     h_plays : int = 0
     hsize_v : bool = False
+    qbase   : float = 0.0
+    gate_enh: int = -1
 
 # ---------------------------------------------------------------------------
 # THE TABLE — one joker per line. The id is the row index.
 # ---------------------------------------------------------------------------
 # Rows can be reordered. Ids are valid within one training run only. Nothing
 # hardcodes an id: J_* constants resolve by name through JOKER_ID.
-# Not authored yet: jokers that need card enhancements, consumables, hand
-# levels, packs, skips/tags, boss blinds or joker creation/destruction.
+# Every joker of the game is here (150). Some rows only name the joker: the env
+# applies those rules itself, by name (Vampire, Ceremonial Dagger, Madness ...).
 #
 #        name                     cost  rarity     trigger              effect                value    optional axes
 TABLE = [
@@ -493,7 +532,7 @@ TABLE = [
     JokerDef("Egg",                  4, COMMON,    T_END_OF_ROUND,      E_SELL_VALUE,         3.0,
              desc="Gains $3 of sell value at end of round"),
     JokerDef("Gift Card",            6, UNCOMMON,  T_END_OF_ROUND,      E_SELL_VALUE_ALL,     1.0, copyable=False,
-             desc="Add $1 of sell value to every Joker at end of round"),
+             desc="Add $1 of sell value to every Joker and Consumable card at end of round"),
     JokerDef("Credit Card",          1, COMMON,    T_PASSIVE,           E_NONE,               0.0, copyable=False,
              desc="Go up to -$20 in debt"),
     JokerDef("To the Moon",          5, UNCOMMON,  T_PASSIVE,           E_NONE,               0.0, copyable=False,
@@ -574,6 +613,105 @@ TABLE = [
              desc="Copies ability of Joker to the right"),
     JokerDef("Brainstorm",          10, RARE,      T_PASSIVE,           E_NONE,               0.0,
              desc="Copies the ability of leftmost Joker"),
+
+    # ======================================================================
+    # GROUP D — card modifiers, consumables, hand levels, packs, added cards
+    # ======================================================================
+    JokerDef("Marble Joker",         6, UNCOMMON,  T_ON_BLIND_SELECT,   E_SPAWN_CARD,         1.0,
+             desc="Adds one Stone card to deck when Blind is selected"),
+    JokerDef("8 Ball",               5, COMMON,    T_PER_SCORED,        E_SPAWN_CONSUMABLE,   1.0, cond=C_RANK_IN, param=_ranks("8"), prob=4,
+             desc="1 in 4 chance for each played 8 to create a Tarot card when scored (Must have room)"),
+    JokerDef("Steel Joker",          7, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              0.2, source=S_QUERY, query=Q_DECK_STEEL_COUNT,
+             qbase=1.0, gate_enh=ENH_STEEL, desc="Gives X0.2 Mult for each Steel Card in your full deck"),
+    JokerDef("Space Joker",          5, UNCOMMON,  T_BEFORE,            E_LEVEL_UP,           1.0, prob=4,
+             desc="1 in 4 chance to upgrade level of played poker hand"),
+    JokerDef("DNA",                  8, RARE,      T_BEFORE,            E_SPAWN_CARD,         1.0, cond=C_COUNT_EQ, param=1,
+             desc="If first hand of round has only 1 card, add a permanent copy to deck and draw it to hand"),
+    JokerDef("Constellation",        6, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              1.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_ON_PLANET, +0.1),), desc="This Joker gains X0.1 Mult every time a Planet card is used"),
+    JokerDef("Hiker",                5, UNCOMMON,  T_PER_SCORED,        E_PERMA_CHIPS,        5.0,
+             desc="Every played card permanently gains +5 Chips when scored"),
+    JokerDef("Superposition",        4, COMMON,    T_ONCE_MAIN,         E_SPAWN_CONSUMABLE,   1.0, cond=C_ACE_STRAIGHT,
+             desc="Create a Tarot card if poker hand contains an Ace and a Straight (Must have room)"),
+    JokerDef("Red Card",             5, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           0.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_ON_PACK_SKIP, +3.0),), desc="This Joker gains +3 Mult when any Booster Pack is skipped"),
+    JokerDef("Vampire",              7, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              1.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_SPECIAL, +0.1),),
+             desc="This Joker gains X0.1 Mult per scoring Enhanced card played, removes card Enhancement"),
+    JokerDef("Hologram",             7, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              1.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_ON_CARD_ADDED, +0.25),),
+             desc="This Joker gains X0.25 Mult every time a playing card is added to your deck"),
+    JokerDef("Vagabond",             8, RARE,      T_ONCE_MAIN,         E_SPAWN_CONSUMABLE,   1.0, cond=C_MONEY_LE, param=4,
+             desc="Create a Tarot card if hand is played with $4 or less"),
+    JokerDef("Midas Mask",           7, UNCOMMON,  T_BEFORE,            E_MIDAS,              0.0, copyable=False,
+             desc="All played face cards become Gold cards when scored"),
+    JokerDef("Hallucination",        4, COMMON,    T_ON_PACK_OPEN,      E_SPAWN_CONSUMABLE,   1.0, prob=2,
+             desc="1 in 2 chance to create a Tarot card when any Booster Pack is opened (Must have room)"),
+    JokerDef("Fortune Teller",       6, COMMON,    T_ONCE_MAIN,         E_ADD_MULT,           1.0, source=S_QUERY, query=Q_TAROTS_USED,
+             desc="+1 Mult per Tarot card used this run"),
+    JokerDef("Stone Joker",          6, UNCOMMON,  T_ONCE_MAIN,         E_ADD_CHIPS,         25.0, source=S_QUERY, query=Q_DECK_STONE_COUNT,
+             gate_enh=ENH_STONE, desc="Gives +25 Chips for each Stone Card in your full deck"),
+    JokerDef("Lucky Cat",            6, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              1.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_PER_SCORED, +0.25, C_LUCKY_HIT),), gate_enh=ENH_LUCKY,
+             desc="This Joker gains X0.25 Mult every time a Lucky card successfully triggers"),
+    JokerDef("Golden Ticket",        5, COMMON,    T_PER_SCORED,        E_ADD_MONEY,          4.0, cond=C_ENH, param=ENH_GOLD,
+             gate_enh=ENH_GOLD, desc="Played Gold cards earn $4 when scored"),
+    JokerDef("Certificate",          6, UNCOMMON,  T_ON_BLIND_SELECT,   E_SPAWN_CARD,         1.0,
+             desc="When round begins, add a random playing card with a random seal to your hand"),
+    JokerDef("Glass Joker",          6, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              1.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_ON_GLASS, +0.75),), gate_enh=ENH_GLASS,
+             desc="This Joker gains X0.75 Mult for every Glass Card that is destroyed"),
+    JokerDef("Driver's License",     7, RARE,      T_ONCE_MAIN,         E_XMULT,              2.0, source=S_QUERY, query=Q_DRIVER,
+             qbase=1.0, desc="X3 Mult if you have at least 16 Enhanced cards in your full deck"),
+    JokerDef("Cartomancer",          6, UNCOMMON,  T_ON_BLIND_SELECT,   E_SPAWN_CONSUMABLE,   1.0,
+             desc="Create a Tarot card when Blind is selected (Must have room)"),
+    JokerDef("Astronomer",           8, UNCOMMON,  T_PASSIVE,           E_NONE,               0.0, copyable=False,
+             desc="All Planet cards and Celestial Packs in the shop are free"),
+    JokerDef("Burnt Joker",          8, RARE,      T_ON_DISCARD,        E_LEVEL_UP,           1.0,
+             desc="Upgrade the level of the first discarded poker hand each round"),
+    JokerDef("Satellite",            6, UNCOMMON,  T_END_OF_ROUND,      E_ADD_MONEY,          1.0, source=S_QUERY, query=Q_UNIQUE_PLANETS,
+             copyable=False, desc="Earn $1 at end of round per unique Planet card used this run"),
+    JokerDef("Trading Card",         6, UNCOMMON,  T_ON_DISCARD,        E_DESTROY_DISCARD,    3.0, copyable=False,
+             desc="If first discard of round has only 1 card, destroy it and earn $3"),
+
+    # ======================================================================
+    # GROUP E — skips, boss blinds, Spectral cards, joker destruction, legendaries
+    # ======================================================================
+    JokerDef("Ceremonial Dagger",    6, UNCOMMON,  T_ONCE_MAIN,         E_ADD_MULT,           0.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_SPECIAL, 2.0),),
+             desc="When Blind is selected, destroy Joker to the right and permanently add double its sell value to this Mult"),
+    JokerDef("Sixth Sense",          6, UNCOMMON,  T_AFTER,             E_DESTROY_CARD,       1.0, cond=C_COUNT_EQ, param=1, copyable=False,
+             desc="If first hand of round is a single 6, destroy it and create a Spectral card (Must have room)"),
+    JokerDef("Madness",              7, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              1.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_SPECIAL, 0.5),),
+             desc="When Small Blind or Big Blind is selected, gain X0.5 Mult and destroy a random Joker"),
+    JokerDef("Seance",               6, UNCOMMON,  T_ONCE_MAIN,         E_SPAWN_SPECTRAL,     1.0, cond=C_HAND_HAS, param=H_STRAIGHT_FLUSH,
+             desc="If poker hand is a Straight Flush, create a random Spectral card (Must have room)"),
+    JokerDef("Riff-raff",            6, COMMON,    T_ON_BLIND_SELECT,   E_SPAWN_JOKER,        2.0,
+             desc="When Blind is selected, create 2 Common Jokers (Must have room)"),
+    JokerDef("Luchador",             5, UNCOMMON,  T_ON_SOLD,           E_DISABLE_BOSS,       0.0,
+             desc="Sell this card to disable the current Boss Blind"),
+    JokerDef("Diet Cola",            6, UNCOMMON,  T_ON_SOLD,           E_ADD_TAG,            1.0,
+             desc="Sell this card to create a free Double Tag"),
+    JokerDef("Mr. Bones",            5, UNCOMMON,  T_END_OF_ROUND,      E_SAVE,               0.25, copyable=False,
+             desc="Prevents Death if chips scored are at least 25% of required chips, self destructs"),
+    JokerDef("Throwback",            6, UNCOMMON,  T_ONCE_MAIN,         E_XMULT,              0.25, source=S_QUERY, query=Q_SKIPS, qbase=1.0,
+             desc="X0.25 Mult for each Blind skipped this run"),
+    JokerDef("Matador",              7, UNCOMMON,  T_ONCE_MAIN,         E_ADD_MONEY,          8.0, cond=C_BOSS_TRIGGERED,
+             desc="Earn $8 if played hand triggers the Boss Blind ability"),
+    JokerDef("Invisible Joker",      8, RARE,      T_ON_SOLD,           E_DUPLICATE,          0.0, value2=2.0, source=S_COUNTER,
+             state=ST_SCALE_COUNTER, updates=((T_END_OF_ROUND, +1.0),), copyable=False,
+             desc="After 2 rounds, sell this card to Duplicate a random Joker (Removes Negative from copy)"),
+    JokerDef("Canio",               20, LEGENDARY, T_ONCE_MAIN,         E_XMULT,              1.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_ON_FACE_DESTROYED, +1.0),),
+             desc="This Joker gains X1 Mult when a face card is destroyed"),
+    JokerDef("Yorick",              20, LEGENDARY, T_ONCE_MAIN,         E_XMULT,              1.0, source=S_COUNTER, state=ST_SCALE_COUNTER,
+             updates=((T_ON_DISCARD_CARD, +1.0, C_NONE, 23, M_EVERY),),
+             desc="This Joker gains X1 Mult every 23 cards discarded"),
+    JokerDef("Chicot",              20, LEGENDARY, T_ON_BLIND_SELECT,   E_DISABLE_BOSS,       0.0, copyable=False,
+             desc="Disables effect of every Boss Blind"),
+    JokerDef("Perkeo",              20, LEGENDARY, T_ON_SHOP_EXIT,      E_NEGATIVE_COPY,      1.0,
+             desc="Creates a Negative copy of 1 random consumable card in your possession at the end of the shop"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -619,7 +757,7 @@ def _validate(table):
             t, _, c, _, m = _upd(u)
             if not (0 <= t < len(TRIGGER_NAMES)):
                 raise ValueError(f"{d.name}: update trigger {t} is not a T_* event")
-            if not (0 <= c < len(CONDITION_NAMES)) or m not in (M_ADD, M_RESET, M_RESET_ELSE_ADD):
+            if not (0 <= c < len(CONDITION_NAMES)) or m not in (M_ADD, M_RESET, M_RESET_ELSE_ADD, M_EVERY):
                 raise ValueError(f"{d.name}: update rule {u} has a bad cond or mode")
         if d.effect == E_RETRIGGER and d.source == S_COUNTER and d.value2 <= 0:
             raise ValueError(f"{d.name}: a COUNTER retrigger needs VALUE2 = its repetitions")
@@ -655,6 +793,8 @@ def _compile(table):
         D_SIZE     = col("d_size",  jnp.int32),
         H_PLAYS    = col("h_plays", jnp.int32),
         HSIZE_V    = col("hsize_v", jnp.bool_),
+        QBASE      = col("qbase",   jnp.float32),
+        GATE_ENH   = col("gate_enh", jnp.int32),
     )
 
 
@@ -689,6 +829,20 @@ J_BRAINSTORM = JOKER_ID["Brainstorm"]
 J_CHAOS     = JOKER_ID["Chaos the Clown"]
 J_CREDIT    = JOKER_ID["Credit Card"]
 J_MOON      = JOKER_ID["To the Moon"]
+J_MARBLE    = JOKER_ID["Marble Joker"]
+J_CERTIFICATE = JOKER_ID["Certificate"]
+J_DNA       = JOKER_ID["DNA"]
+J_ASTRONOMER = JOKER_ID["Astronomer"]
+J_BURNT     = JOKER_ID["Burnt Joker"]
+J_TRADING   = JOKER_ID["Trading Card"]
+J_VAMPIRE   = JOKER_ID["Vampire"]
+J_DAGGER    = JOKER_ID["Ceremonial Dagger"]
+J_MADNESS   = JOKER_ID["Madness"]
+J_SIXTH     = JOKER_ID["Sixth Sense"]
+J_INVISIBLE = JOKER_ID["Invisible Joker"]
+J_CHICOT    = JOKER_ID["Chicot"]
+J_MATADOR   = JOKER_ID["Matador"]
+J_MR_BONES  = JOKER_ID["Mr. Bones"]
 
 
 class RuleMods(NamedTuple):
@@ -730,12 +884,12 @@ def resolve(rows: Joker, active, joker_value, ctx):
     """Produce the live value v per slot, before scoring. -> (MAX_JOKERS,) float32
         CONSTANT : v = VALUE
         COUNTER  : v = joker_value  (update() has already evolved it)
-        QUERY    : v = VALUE * ctx[QUERY]
+        QUERY    : v = QBASE + VALUE * ctx[QUERY]
 
     ctx : (N_QUERY_KINDS,) float32 — query results, ctx[k] = count for kind k;
           built by env from live state (money, slots, deck) on each hand.
     """
-    query_v = rows.VALUE * ctx[rows.QUERY]
+    query_v = rows.QBASE + rows.VALUE * ctx[rows.QUERY]
     v = jnp.select(
         [rows.SOURCE == S_CONSTANT, rows.SOURCE == S_COUNTER, rows.SOURCE == S_QUERY],
         [rows.VALUE, joker_value, query_v],
@@ -785,13 +939,17 @@ def update_ex(rows: Joker, active, joker_value, joker_state, trigger, counts=Non
     hit = (rows.UPD_TRIGGER == trigger) & active[:, None]
     n = jnp.ones(hit.shape, jnp.float32) if counts is None else counts
     v = joker_value
+    s = joker_state
     for k in range(rows.UPD_TRIGGER.shape[1]):     # static, N_UPDATE_RULES, rule order
         mode, d, nk = rows.UPD_MODE[:, k], rows.UPD_DELTA[:, k], n[:, k]
-        nv = jnp.select([mode == M_ADD, nk > 0],
-                        [v + d * nk, rows.VALUE],                  # reset to the seed
+        period = jnp.maximum(rows.UPD_PARAM[:, k], 1)
+        total = s + nk.astype(jnp.int32)                            # M_EVERY: counts since the last one
+        nv = jnp.select([mode == M_ADD, mode == M_EVERY, nk > 0],
+                        [v + d * nk, v + d * (total // period), rows.VALUE],   # reset to the seed
                         default=jnp.where(mode == M_RESET_ELSE_ADD, v + d, v))
         v = jnp.where(hit[:, k], jnp.maximum(nv, 0.0), v)
-    return v, joker_state, hit.any(axis=1)
+        s = jnp.where(hit[:, k] & (mode == M_EVERY), total % period, s)
+    return v, s, hit.any(axis=1)
 
 
 def update(rows: Joker, active, joker_value, joker_state, trigger, ctx=None, counts=None):
