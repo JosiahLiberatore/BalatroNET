@@ -632,7 +632,7 @@ def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
     w.f["reroll_cost"] = 5 - 2 * ("Reroll Surplus" in v) - 2 * ("Reroll Glut" in v)
     if is_boss:
         played = np.array(p.hand_played) if played is None else played   # this hand counted
-        w.f["ox_hand"] = int(np.argmax(played))         # the first max: the better hand on a tie
+        w.f["ox_hand"] = R.ox_hand(played)
         w.cards["card_played_ante"][:] = False
         if not won:
             w.f["ante"] += 1
@@ -775,7 +775,7 @@ def _enter_select(c, tag, p, q, J, w):
 
 def w_slots(J, w):
     neg = sum(1 for x in J if x["ed"] == 4)
-    return min(5 + ("Antimatter" in w.vouchers) + neg, 8)
+    return min(5 + ("Antimatter" in w.vouchers) + neg, R.SLOT_CAP)
 
 
 def _reroll_boss_ref(c, tag, w, q, free=False, n=1):
@@ -990,6 +990,8 @@ def check_step(c, tag, p, a, q, reward, out=None):
     if verb == V_DISCARD and int(p.discards) <= 0:
         verb = V_PLAY                                       # DISCARD at 0 left is a PLAY
     legal = 0 <= verb < N_VERBS and LEGAL_NP[min(max(stage, 0), STAGES - 1), verb]
+    if verb in (V_PLAY, V_DISCARD) and not played_lanes(p, sel):
+        legal = False                                       # no card selected: the buttons stay off
 
     errs = invariant_errors(q)
     c.check(f"{tag}: invariants", not errs, errs)
@@ -1129,7 +1131,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
         astro = "Astronomer" in R.acting_names(J)
         if kind == IK_JOKER:
             cost = R.cost(int(JOKER_COST[item]) + int(ED_COST[ed]), w.disc) if item >= 0 else 0
-            room = n < int(p.joker_slots) + (ed == 4 and int(p.joker_slots) < 8)
+            room = n < int(p.joker_slots) + (ed == 4 and int(p.joker_slots) < R.SLOT_CAP)
         elif kind == IK_CARD:
             cost = R.cost(1 + int(ED_COST[ed]), w.disc)
             room = not np.asarray(p.card_live).all()
@@ -1312,7 +1314,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
             ok = _can_use(p, J, w, item, sel, False)
         elif ok and kind == PK_BUFFOON:
             ed = int(p.pack_ed[t])
-            ok = n < int(p.joker_slots) + (ed == 4 and int(p.joker_slots) < 8)
+            ok = n < int(p.joker_slots) + (ed == 4 and int(p.joker_slots) < R.SLOT_CAP)
         elif ok and kind == PK_STANDARD:
             ok = not np.asarray(p.card_live).all()
         if ok:
@@ -1355,11 +1357,13 @@ def check_step(c, tag, p, a, q, reward, out=None):
         _check_shop(c, tag, q, w, fresh=True)
     if w.f["game_stage"] != STAGE_PACK:
         w.f.update(pack_id=-1, pack_left=0)
-    # To Do List: a new hand is random; it must be a hand (not a secret one), and never the old one at a round end
+    # To Do List: a new hand is random; it must be a visible hand (a secret one once played), and
+    # never the old one at a round end
     qs = [int(x) for x in q.joker_state]
     for i in observe_state:
         if i < len(J):
-            c.check(f"{tag}: To Do List hand in range", 3 <= qs[i] < N_HAND_TYPES, qs[i])
+            c.check(f"{tag}: To Do List hand visible", 0 <= qs[i] < N_HAND_TYPES
+                    and R.HAND_ORDER[qs[i]] in R.visible_hands(q.hand_played), qs[i])
             if verb == V_PLAY:
                 c.check(f"{tag}: To Do List hand changes", qs[i] != J[i]["st"], qs[i], J[i]["st"])
             J[i]["st"] = qs[i]

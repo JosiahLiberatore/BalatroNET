@@ -34,6 +34,30 @@ HAND_BASE = {"flush_five": (160, 16, 50, 3), "flush_house": (140, 14, 40, 4),
              "pair": (10, 2, 15, 1), "high_card": (5, 1, 10, 1)}
 BLIND_PAY = [3, 4, 5]
 WIN_ANTE = 8
+SLOT_CAP = 16     # the env's divergence: Negative jokers add slots only up to 16
+SECRET = ("flush_five", "flush_house", "five_kind")     # visible = false until played
+# pairs(G.GAME.hands) on a new run: LuaJIT 2.0.5 (the game's lua51.dll) walks the game.lua
+# constructor's 12 keys in this order
+PAIRS_ORDER = ["flush_house", "full_house", "flush", "pair", "high_card", "straight_flush",
+               "straight", "two_pair", "flush_five", "five_kind", "three_kind", "four_kind"]
+
+
+def visible_hands(played):
+    """The hands To Do List may pick: every hand but a secret one not yet played (evaluate_play
+    sets visible)."""
+    return [h for i, h in enumerate(HAND_ORDER) if h not in SECRET or played[i] > 0]
+
+
+def ox_hand(played):
+    """end_round after a boss: G.GAME.current_round.most_played_poker_hand. The loop keeps a hand
+    when v.played > _played or (v.played == _played and _order > v.order); _order stays 100, so
+    a tie goes to the later hand in pairs() order. -> its HAND_ORDER index."""
+    best, n = "high_card", -1
+    for h in PAIRS_ORDER:
+        k = int(played[HAND_ORDER.index(h)])
+        if k > n or k == n:
+            best, n = h, k
+    return HAND_ORDER.index(best)
 
 # P_CENTERS m_* / e_* / seals
 NONE_, BONUS, MULT, WILD, GLASS, STEEL, STONE, GOLD, LUCKY = range(9)
@@ -850,7 +874,7 @@ def ref_budget(J, base_hand, base_hands, base_discards, hand_extra=0, slots_extr
         + sum(int(x["v"]) for x in act if x["name"] == "Turtle Bean")
     neg = sum(1 for x in J if x.get("ed", 0) == NEGATIVE)
     return (min(max(h, 0), 32), max(base_hands + sum(H_PLAYS.get(x["name"], 0) for x in act), 1),
-            max(base_discards + sum(D_SIZE.get(x["name"], 0) for x in act), 0), min(5 + slots_extra + neg, 8))
+            max(base_discards + sum(D_SIZE.get(x["name"], 0) for x in act), 0), min(5 + slots_extra + neg, SLOT_CAP))
 
 
 # ---------------------------------------------------------------------------

@@ -342,6 +342,13 @@ def fit(fonts, s, width):
     return fonts.bold if fonts.bold.size(s)[0] <= width else fonts.body
 
 
+def clip(font, s, width):
+    """s cut from the right until it fits width (a narrow card: up to 16 jokers in the row)."""
+    while s and font.size(s)[0] > width:
+        s = s[:-1]
+    return s
+
+
 def wrap(font, s, width):
     words, lines, cur = s.split(), [], ""
     for w in words:
@@ -1584,7 +1591,8 @@ class App:
             box(s, r, PANEL, 10, SEL_EDGE if i in (self.joker_sel, held_slot) else RARITY_C[int(JOKER_RARITY[jid])], 3)
             if ed:
                 pygame.draw.rect(s, ED_EDGE[ed], r.inflate(-6, -6), 2, border_radius=8)
-                text(s, f.small, ED_NAMES[ed], ED_EDGE[ed] if ed != 4 else DIM, (r.centerx, r.bottom - 48), "midtop")
+                text(s, f.small, clip(f.small, ED_NAMES[ed], r.w - 8), ED_EDGE[ed] if ed != 4 else DIM,
+                     (r.centerx, r.bottom - 48), "midtop")
             text(s, fit(f, name, r.w - 10), name, TEXT, (r.centerx, r.y + 8), "midtop")
             yy = r.y + 36
             for line in wrap(f.small, joker_text(jid, h, i), r.w - 14)[:4]:
@@ -1594,7 +1602,11 @@ class App:
             if bool(h.joker_debuff[i]):                     # Crimson Heart
                 self.mark_debuffed(r)
                 label, col = "disabled", DEBUFF_C
-            text(s, f.bold, f"now {label}", col, (r.centerx, r.bottom - 30), "midtop")
+            if f.bold.size(f"now {label}")[0] <= r.w - 4:
+                text(s, f.bold, f"now {label}", col, (r.centerx, r.bottom - 30), "midtop")
+            else:                                           # a narrow card: the label alone, 2 lines
+                for k, line in enumerate(wrap(f.small, label, r.w - 4)[:2]):
+                    text(s, f.small, clip(f.small, line, r.w - 4), col, (r.centerx, r.bottom - 31 + 14 * k), "midtop")
 
     def draw_item(self, r, name, desc, edge, price=None, ok=True, ed=0, tag=None):
         """One shop / pack card: name, text, price."""

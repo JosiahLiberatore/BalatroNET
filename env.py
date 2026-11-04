@@ -52,7 +52,7 @@ from jax import jit
 from typing import NamedTuple
 from scoring import (play as _play, discard as _discard, detect, PlayIn, Targets, no_info,
                      rule_counts, Cards, effective, has_rank, _odds, face as is_face_card, suit_is)
-from items import (HAND_NAMES, N_HAND_TYPES, SECRET_HANDS, N_CONS, CONS_KIND, CONS_USE, CONS_PARAM,
+from items import (HAND_NAMES, N_HAND_TYPES, SECRET_HANDS, OX_PAIRS_POS, N_CONS, CONS_KIND, CONS_USE, CONS_PARAM,
                    CONS_LO, CONS_HI, CONS_NEED, CONS_RANKS, CONS_BASE_COST, CONS_COST, CONS_EMPTY,
                    C_FOOL, C_SOUL, C_BLACK_HOLE, CK_TAROT, CK_PLANET, CK_SPECTRAL, TAROTS, PLANETS,
                    SPECTRALS, SPECTRAL_POOL, SOUL_ODDS, PLANET_OF_HAND, U_ENHANCE, U_SUIT, U_STRENGTH,
@@ -711,6 +711,7 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
       - MOVE_CARD unless target != dest, both < hand_size, and lane target holds a card -> no-op
       - SKIP at the blind select of a Boss Blind; REROLL there without Director's Cut /
         Retcon (once per ante for Director's Cut) or $10 -> no-op
+      - PLAY / DISCARD with no card selected        -> no-op (the game's buttons stay off)
       - more than 5 cards selected                  -> the first 5 valid lanes
         (Cerulean Bell: its forced card is always one of them)
     """
@@ -719,6 +720,8 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     in_range = (verb >= 0) & (verb < N_VERBS)
     stage = jnp.clip(state.game_stage, 0, LEGAL.shape[0] - 1)
     legal = in_range & LEGAL[stage, jnp.clip(verb, 0, N_VERBS - 1)]
+    no_cards = ((verb == V_PLAY) | (verb == V_DISCARD)) & ~fix_select(state, action.select, 5).any()
+    legal = legal & ~no_cards
     branch = jnp.where(legal, verb, V_NOOP)
     # one branch each for PLAY / DISCARD and USE / PICK (they share their heavy parts)
     branch = jnp.where(branch == V_DISCARD, V_PLAY, jnp.where(branch == V_PICK, V_USE, branch))
@@ -1563,10 +1566,8 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
     sell = state.joker_sell_value + jnp.where(active & (rows.TRIGGER == T_END_OF_ROUND)
                                               & (rows.EFFECT == E_SELL_VALUE), rows.VALUE, 0).astype(jnp.int32)
     sell = jnp.where(state.jokers != J_EMPTY, sell + gift, 0)
-    # To Do List: a new hand (never a secret one), never the same one
-    lo = SECRET_HANDS
-    r = jax.random.randint(k_todo, (MAX_JOKERS,), lo, N_HAND_TYPES - 1)
-    todo = jnp.where(r >= jstate, r + 1, r)
+    # To Do List: a new hand (a secret one once played), never the same one
+    todo = todo_pick(k_todo, state.hand_played, jstate)
     jstate = jnp.where(active & (rows.STATE == ST_TODO), todo, jstate)
 
     money_eor = joker_money(state, value)                 # the acting jokers' cashout $ (before they go)
@@ -1582,9 +1583,10 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
                + money_eor + INVESTMENT_DOLLARS * invest.sum())
     won = is_boss & (state.ante >= WIN_ANTE)
 
-    # the boss is beaten: The Ox's hand (the most played; a tie: the better hand), a new ante,
-    # The Pillar forgets, this ante's voucher; at the cash out the next boss and tags
-    most = jnp.argmax(state.hand_played).astype(jnp.int32)
+    # the boss is beaten: The Ox's hand (the most played; a tie: the last in pairs() order,
+    # items.OX_PAIRS_POS), a new ante, The Pillar forgets, this ante's voucher; at the cash out
+    # the next boss and tags
+    most = jnp.argmax(state.hand_played * N_HAND_TYPES + OX_PAIRS_POS).astype(jnp.int32)
     ante = state.ante + (is_boss & ~won)                   # the win keeps ante 8
     nxt = jnp.where(is_boss, BLIND_SMALL, state.blind_index + 1)
     tg = new_targets(k_tg, state)
@@ -1677,7 +1679,7 @@ def acquire(state: balatroEnvState, jid, ed=ED_NONE) -> tuple[balatroEnvState, j
     neg = (ed == ED_NEG) & (state.joker_slots < MAX_JOKER_SLOTS)
     ok = (jid >= 0) & (jid < N_JOKERS) & (held < state.joker_slots + neg)
     kind = JOKERS.STATE[safe]
-    todo = jax.random.randint(jax.random.fold_in(state.key, K_ACQUIRE), (), SECRET_HANDS, N_HAND_TYPES)
+    todo = todo_pick(jax.random.fold_in(state.key, K_ACQUIRE), state.hand_played, jnp.int32(-1))
     start = jnp.select([kind == ST_TODO, kind == ST_LOYALTY], [todo, state.hand_played.sum()], 0)
 
     dest = held   # jokers are compact, so the first free slot is the count
@@ -2135,6 +2137,15 @@ def new_boss(key, state):
 def visible_hands(state):
     """The hands the game shows: the 9 plain ones, and a secret one once it was played."""
     return (jnp.arange(N_HAND_TYPES) >= SECRET_HANDS) | (state.hand_played > 0)
+
+
+def todo_pick(key, hand_played, old):
+    """To Do List's new hand (card.lua set_ability / end of round): a random visible hand (a
+    secret one once played), never old. old: the hand now (-1 at the buy); an (n,) old gives
+    n picks."""
+    ok = (jnp.arange(N_HAND_TYPES) >= SECRET_HANDS) | (hand_played > 0)
+    ok = ok & (jnp.arange(N_HAND_TYPES) != jnp.asarray(old)[..., None])
+    return jax.random.categorical(key, jnp.where(ok, 0.0, -jnp.inf), shape=jnp.shape(old)).astype(jnp.int32)
 
 
 def new_ante_rolls(key, state):

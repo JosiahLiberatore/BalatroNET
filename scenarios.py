@@ -27,7 +27,7 @@ import numpy as np
 from env import (balatroAction, env_step, explain_play, roll_shop, roll_pack_cards, _clear_blind, MAX_HAND_SIZE,
                  STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT, STAGE_NAMES, VERB_NAMES, V_PLAY, V_DISCARD,
                  V_BUY, V_SELL, V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, V_USE, V_SELL_CONS,
-                 V_OPEN, V_PICK, V_SKIP, V_REDEEM, _hooked, _hook_discard, score_play)
+                 V_OPEN, V_PICK, V_SKIP, V_REDEEM, _hooked, _hook_discard, score_play, fix_select)
 from items import (CONS_ID, CONS_NAMES, CONS_KIND, CK_TAROT, CK_PLANET, PACK_NAMES, PACK_KIND,
                    PACK_CHOOSE, PK_ARCANA, PK_CELESTIAL, PK_STANDARD, PK_BUFFOON, MAX_PACK, ENH_NAMES,
                    ED_NAMES, SEAL_NAMES, HAND_NAMES, N_HAND_TYPES, IK_JOKER, IK_PLANET, IK_TAROT, IK_CARD,
@@ -168,6 +168,11 @@ def blind(hand=H8, clear=False, **kw):
     base = dict(hand=hand, blind_target=300 if clear else BIG, chips_scored=299 if clear else 0)
     base.update(kw)
     return base
+
+
+def _counts(**kw):
+    """Per hand type values (HAND_NAMES order) from names: _counts(pair=2)."""
+    return [kw.get(h, 0) for h in HAND_NAMES]
 
 
 def shop(**kw):
@@ -506,7 +511,8 @@ class Run:
                 sel[_lanes(h, st.cards)] = True
                 a = balatroAction(verb=jnp.int32(st.verb), select=jnp.asarray(sel),
                                   target=jnp.int32(st.target), dest=jnp.int32(st.dest))
-                scores = st.verb == V_PLAY or (st.verb == V_DISCARD and int(h.discards) <= 0)
+                scores = ((st.verb == V_PLAY or (st.verb == V_DISCARD and int(h.discards) <= 0))
+                          and bool(fix_select(s, a.select, 5).any()))     # no card: a no-op
                 self.plays.append(jax.device_get(explain_play(s, a.select)) if scores else None)
                 s, r, _ = env_step(s, a)
                 self.actions.append(a)
@@ -794,11 +800,35 @@ JOKERS = [
       [C("money", lambda r: r[1].money, 4)]),
     S("Jokers", "To Do List", "a new hand at the end of the round",
       """At the end of the round To Do List picks a new poker hand, never the same one and never
-      a secret hand (Flush Five, Flush House, Five of a Kind).""",
+      a secret hand (Flush Five, Flush House, Five of a Kind) that was not played this run.""",
       blind(clear=True, jokers=("To Do List",), joker_state=(10,)),
       [play("KD KC")],
       [C("the new hand", lambda r: HAND_NAMES[int(r[1].h.joker_state[0])],
-         OneOf(tuple(n for n in HAND_NAMES[3:] if n != "pair")))]),
+         OneOf(tuple(n for n in HAND_NAMES[3:] if n != "pair"))),
+       C("share of Flush Five picks (4000 rolls)", lambda r: _todo_share(r.raw[1].hand_played, 10, "flush_five"), 0.0)]),
+    S("Jokers", "To Do List", "a secret hand once it was played",
+      """A secret hand becomes visible when it is played (evaluate_play), and To Do List can then
+      pick it. Flush Five was played once: the new hand is one of the 9 plain hands or Flush Five,
+      not Pair (the old one), so Flush Five comes up 1 time in 9. Flush House and Five of a Kind
+      were not played and never come up. (4000 rolls.)""",
+      blind(clear=True, jokers=("To Do List",), joker_state=(10,), hand_played=_counts(flush_five=1)),
+      [play("KD KC")],
+      [C("the new hand", lambda r: HAND_NAMES[int(r[1].h.joker_state[0])],
+         OneOf(tuple(n for n in HAND_NAMES if n not in ("pair", "flush_house", "five_kind")))),
+       C("share of Flush Five picks", lambda r: _todo_share(r.raw[1].hand_played, 10, "flush_five"),
+         Between(0.09, 0.133)),
+       C("share of Flush House picks", lambda r: _todo_share(r.raw[1].hand_played, 10, "flush_house"), 0.0),
+       C("share of Five of a Kind picks", lambda r: _todo_share(r.raw[1].hand_played, 10, "five_kind"), 0.0)]),
+    S("Jokers", "To Do List", "a bought To Do List can pick a played secret hand",
+      """A new To Do List picks its hand from every visible hand (no old hand to skip). Five of a
+      Kind was played: 10 hands, so Five of a Kind comes up 1 time in 10. (4000 rolls.)""",
+      shop(shop_slots=("To Do List",), hand_played=_counts(five_kind=1)),
+      [buy(0)],
+      [C("its hand", lambda r: HAND_NAMES[int(r[1].h.joker_state[0])],
+         OneOf(tuple(n for n in HAND_NAMES if n not in ("flush_five", "flush_house")))),
+       C("share of Five of a Kind picks", lambda r: _todo_share(r.raw[0].hand_played, -1, "five_kind"),
+         Between(0.08, 0.12)),
+       C("share of Flush Five picks", lambda r: _todo_share(r.raw[0].hand_played, -1, "flush_five"), 0.0)]),
     S("Jokers", "Mail-In Rebate", "$5 per discarded card of the round's rank",
       """Mail-In Rebate earns $5 per discarded card of the round's rank (Ace here). Discard
       AS AH 2C: two Aces, +$10.""",
@@ -1546,6 +1576,20 @@ CARDS = [
       shop(jokers=("Joker",) * 5, joker_ed=(4,), shop_slots=("Bull",)),
       [buy(0)],
       [C("joker slots", lambda r: r[0].joker_slots, 6), C("jokers held", lambda r: len(r[1].jokers), 6)]),
+    S("Cards", "Negative", "Negative jokers add slots up to 16",
+      """Each Negative joker adds a joker slot. With 15 jokers (11 of them Negative) there are
+      5 + 11 = 16 slots, so a 16th joker can be bought.""",
+      shop(jokers=("Joker",) * 15, joker_ed=(4,) * 11, shop_slots=("Bull",)),
+      [buy(0)],
+      [C("joker slots", lambda r: r[0].joker_slots, 16), C("jokers held", lambda r: len(r[1].jokers), 16)]),
+    S("Cards", "Negative", "no slot past 16 (divergence)",
+      """The env stops at 16 joker slots. With 16 jokers (11 Negative) in 16 slots, a Negative
+      Bull cannot be bought: the money stays $20. (The game gives a 17th slot: a deliberate
+      divergence, the env holds at most 16 jokers.)""",
+      shop(jokers=("Joker",) * 16, joker_ed=(4,) * 11, shop_slots=("Bull",), shop_ed=(4,), money=20),
+      [buy(0)],
+      [C("joker slots", lambda r: r[1].joker_slots, 16), C("jokers held", lambda r: len(r[1].jokers), 16),
+       C("money", lambda r: r[1].money, 20)]),
     S("Cards", "Foil", "an edition costs more",
       """A joker's edition adds to its price: Foil +$2, Holographic +$3, Polychrome +$5, Negative
       +$5. A Foil Joker costs $2 + $2 = $4 and sells for $2.""",
@@ -1575,7 +1619,41 @@ CARDS = [
       [C("Tarots held", lambda r: r[1].n_cons(CK_TAROT), 1)]),
 ]
 
+def _changed(r):
+    """The state fields that differ between the start and the end (none after a no-op)."""
+    a, b = r[0].h, r[-1].h
+    return tuple(f for f in a._fields if not np.array_equal(np.asarray(getattr(a, f)), np.asarray(getattr(b, f))))
+
+
+def _todo_share(hand_played, old, hand, n=4000):
+    """The share of n To Do List picks (env.todo_pick, old = its hand now) that are hand."""
+    from env import todo_pick
+    keys = jax.random.split(jax.random.key(3), n)
+    got = jax.vmap(lambda k: todo_pick(k, jnp.asarray(hand_played, jnp.int32), jnp.int32(old)))(keys)
+    return float((np.asarray(got) == HAND_NAMES.index(hand)).mean())
+
+
 RULES = [
+    S("Rules", "Play", "Play needs a card",
+      """The game turns the Play Hand button off when no card is selected. In the env a PLAY with
+      no card is a no-op: no hand is used, nothing scores, the state stays the same.""",
+      blind(jokers=("Joker",)),
+      [play("")],
+      [C("hands left", lambda r: r[1].hands, 3), C("chips scored", lambda r: r[1].chips_scored, 0),
+       C("changed fields", _changed, ())]),
+    S("Rules", "Discard", "Discard needs a card",
+      """The Discard button is off when no card is selected. A DISCARD with no card is a no-op: no
+      discard is used and Green Joker keeps its Mult.""",
+      blind(jokers=("Green Joker",), joker_value=(3.0,)),
+      [discard("")],
+      [C("discards left", lambda r: r[1].discards, 2), C("Green Joker", lambda r: r[1].jv(0), 3.0),
+       C("changed fields", _changed, ())]),
+    S("Rules", "Discard", "Discard with none left needs a card too",
+      """A DISCARD with 0 discards left acts as a PLAY, and a PLAY needs a card: with no card it is
+      a no-op.""",
+      blind(discards=0),
+      [discard("")],
+      [C("hands left", lambda r: r[1].hands, 3), C("changed fields", _changed, ())]),
     S("Rules", "Cash out", "blind reward + $1 per hand left + interest",
       """Beating the Small Blind pays $3, +$1 per hand left, +$1 interest per $5 held (at most
       $5). With $12 and 2 hands left: $3 + $2 + $2 = $7, money $19.""",
@@ -1692,11 +1770,6 @@ def boss_select(name, **kw):
     return select(boss=name, blind_index=2, **kw)
 
 
-def _counts(**kw):
-    """Per hand type values (HAND_NAMES order) from names: _counts(pair=2)."""
-    return [kw.get(h, 0) for h in HAND_NAMES]
-
-
 def _levels(**kw):
     return [kw.get(h, 1) for h in HAND_NAMES]
 
@@ -1755,6 +1828,22 @@ BOSSES = [
       boss("The Ox", ox_hand="flush", money=20),
       [play("KD KC")],
       [C("money", lambda r: r[1].money, 20)]),
+    S("Bosses", "The Ox", "a tie: the last hand in the game's table order",
+      """When a Boss Blind is beaten, the game sets The Ox's hand to the most played hand of the run.
+      Its loop (state_events.lua end_round) never updates _order, so on a tie the hand it reads
+      last in pairs() order wins, not the better hand. That order (LuaJIT 2.0.5, a new run):
+      Flush House, Full House, Flush, Pair, High Card, Straight Flush, Straight, Two Pair, Flush
+      Five, Five of a Kind, Three of a Kind, Four of a Kind. Beat a boss with a Pair: Pair 2,
+      High Card 2. High Card comes later, so it is The Ox's hand.""",
+      boss("The Hook", clear=True, hand_played=_counts(pair=1, high_card=2)),
+      [play("KD KC")],
+      [C("The Ox's hand", lambda r: HAND_NAMES[int(r[1].h.ox_hand)], "high_card")]),
+    S("Bosses", "The Ox", "a four-way tie",
+      """Flush, Straight, Full House and Pair all played 2 times after the Pair: in pairs() order
+      (Full House, Flush, Pair, ..., Straight) Straight comes last, so it is The Ox's hand.""",
+      boss("The Hook", clear=True, hand_played=_counts(flush=2, straight=2, full_house=2, pair=1)),
+      [play("KD KC")],
+      [C("The Ox's hand", lambda r: HAND_NAMES[int(r[1].h.ox_hand)], "straight")]),
     S("Bosses", "The House", "the first hand is drawn face down",
       """The House: every card of the first hand drawn this round is face down. A card face down
       plays as normal; only the player cannot see it. After a hand, the new cards are face up:

@@ -42,7 +42,7 @@ N_ED = 5
 ED_NAMES = ["", "Foil", "Holographic", "Polychrome", "Negative"]
 FOIL_CHIPS, HOLO_MULT, POLY_X = 50, 10, 1.5
 ED_COST = jnp.array([0, 2, 3, 5, 5], jnp.int32)       # set_cost: extra $ on a card with this edition
-MAX_JOKER_SLOTS = 8   # divergence: Negative jokers add a slot only up to 8 in all (agent J_TOK)
+MAX_JOKER_SLOTS = 16  # divergence: Negative jokers add a slot only up to 16 in all (agent J_TOK)
 
 # --- seals -----------------------------------------------------------------------------
 SEAL_NONE, SEAL_GOLD, SEAL_RED, SEAL_BLUE, SEAL_PURPLE = range(5)
@@ -60,6 +60,11 @@ HAND_MULT  = jnp.array([ 16,  14,  12,   8,   7,   4,    4,    4,   3,   2,   2,
 LEVEL_CHIPS = jnp.array([50,  40,  35,  40,  30,  25,   15,   30,  20,  20,  15, 10], jnp.int32)
 LEVEL_MULT  = jnp.array([ 3,   4,   3,   4,   3,   2,    2,    3,   2,   1,   1,  1], jnp.int32)
 SECRET_HANDS = 3          # the first three: hidden until played (To Do List skips them, planets soft-locked)
+# The Ox on a tie for the most played hand (state_events.lua end_round): the loop over
+# pairs(G.GAME.hands) never updates _order, so the LAST tied hand in pairs() order wins. That
+# order is LuaJIT 2.0.5's hash order of the game.lua constructor (read from the game's lua51.dll);
+# a saved and continued run rebuilds the table in another order (divergence). Position per hand:
+OX_PAIRS_POS = jnp.array([8, 0, 9, 5, 11, 1, 2, 6, 10, 7, 3, 4], jnp.int32)
 
 
 def hand_chips_mult(level):

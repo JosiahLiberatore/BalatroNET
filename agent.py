@@ -451,7 +451,7 @@ N_LAYERS = 2
 FF_D = 128                                  # the feed-forward width in each layer
 # Tokens only for the slots the env can fill (held jokers are packed, lanes <
 # hand_size); the obs and the action layout keep all 32. tests_run checks the caps.
-J_TOK = 8                                   # held joker tokens (5 joker slots + up to 3 Negatives)
+J_TOK = 16                                  # held joker tokens (items.MAX_JOKER_SLOTS: 5 slots + Antimatter + Negatives)
 C_TOK = 20                                  # hand lane tokens (8 + the largest hand size bonus + added cards)
 N_TOK = 1 + J_TOK + MAX_SHOP_SLOTS + PACK_SLOTS + MAX_PACK + K_CONS + C_TOK
 T_HELD, T_SHOP, T_PSLOT, T_PACK, T_CONS, T_CARD, T_GLOB = range(7)   # rows of the TYPE table

@@ -352,10 +352,25 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       REDEEM action, its legal mask has no blind select (there NEXT is its only choice: it never
       skips or rerolls the boss), and its obs shows no boss, tags, vouchers, face-down or debuffed
       flags. Old params do not load (150 jokers, new item features).
-- [ ] open: PLAY / DISCARD with no valid card selected is NOT a no-op today — an empty PLAY uses a
-      hand and scores the empty high card (5 x 1, plus jokers); an empty DISCARD uses a discard and
-      fires Green -1. Real Balatro does not allow either. The agent no longer samples an empty
-      select (the picker needs >= 1 card); a human in the GUI still can.
+- [x] Rule fixes (2026-11-04), rules from the 1.0.1o Lua:
+      - PLAY / DISCARD with no card selected (after the repair: valid lanes, Cerulean Bell's card)
+        is a no-op, as the game's buttons stay off (was: an empty PLAY used a hand and scored a
+        High Card; an empty DISCARD used a discard). The agent never sampled one (the picker needs
+        >= 1 card); the empty hand + empty deck case still ends the round in _settle.
+      - Joker slots stop at 16 (was 8): items.MAX_JOKER_SLOTS; agent J_TOK 8 -> 16 (tokens
+        42 -> 50, so a training step costs more; old params do not load anyway).
+      - To Do List picks from the visible hands (env.todo_pick): the 9 plain ones, and a secret
+        one once it was played (evaluate_play sets visible); at the round end never the old one.
+        Secret hands themselves were already in (scoring, levels; Planet X / Ceres / Eris only in
+        the shop and packs after the hand was played).
+      - The Ox on a tie (state_events.lua end_round): the loop never updates _order, so the last
+        tied hand in pairs(G.GAME.hands) order wins (was: the better hand). The game's lua51.dll
+        is LuaJIT 2.0.5 (no hash seed), so the order of a new run is fixed: Flush House, Full
+        House, Flush, Pair, High Card, Straight Flush, Straight, Two Pair, Flush Five, Five of a
+        Kind, Three of a Kind, Four of a Kind (the last wins). items.OX_PAIRS_POS;
+        ref_balatro.PAIRS_ORDER. A continued run (save + load) rebuilds the table in another order.
+      Scenarios: Play / Discard with no card (Rules), 16 slots and the cap (Negative), To Do List
+      secret hands with pick rates, two Ox ties.
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -384,10 +399,9 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - joker slots capped at 32, consumable slots capped at 16 — Negative jokers/consumables can exceed
   these in real Balatro (unbounded consumables are possible); overflow is clamped and counted, same
   SHAPE-is-capacity / count-is-DATA rule as hand/deck
-- joker slots stop at 8 (5 + 3 Negatives): a 4th Negative gives no slot (agent J_TOK = 8)
-- To Do List never picks a secret hand (Flush Five / Flush House / Five of a Kind)
-- a bought Tarot / Planet goes to a slot (no "buy and use")
-- The Ox: a tie for the most played hand goes to the better hand (the game: its table order)
+- joker slots stop at 16: a Negative past 16 slots gives no slot (agent J_TOK = 16)
+- a bought Tarot / Planet goes to a slot (no "buy and use"; a human convenience, kept out)
+- The Ox: a tie uses the pairs() order of a new run; after a save + continue the game uses another
 - at most 8 held tags (MAX_TAGS)
 - face-down cards and jokers (boss blinds): in the env state (hand_down, joker_down) since
   2026-11-02, but the obs does not hide them yet (agent work). The plan: state keeps true rank/suit
