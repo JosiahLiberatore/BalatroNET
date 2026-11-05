@@ -62,7 +62,7 @@ import numpy as np
 from env import (balatroAction, balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_SHOP_SLOTS,
                  STAGE_BLIND, STAGE_SHOP, STAGE_PACK, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL,
                  V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, V_USE, V_SELL_CONS, V_OPEN, V_PICK, V_SKIP,
-                 WIN_ANTE, live_v, bankrupt_at, reroll_price, item_cost, pack_cost, cons_room,
+                 WIN_ANTE, live_v, bankrupt_at, reroll_price, pack_cost, cons_room,
                  can_use_base, pick_ok, deck_counts, affordable, shop_item_cost, card_lanes)
 from items import (N_HAND_TYPES, N_CONS, CONS_KIND, CONS_USE, CONS_PARAM, CONS_LO, CONS_HI, N_ENH,
                    N_ED, N_SEAL, N_PACKS, PACK_KIND, PACK_SLOTS, MAX_PACK, PK_ARCANA, IK_JOKER,
@@ -325,15 +325,16 @@ def observe(state: balatroEnvState) -> jax.Array:
     cards = _card_feats(state.card_rank[i], state.card_suit[i], state.card_enh[i], state.card_ed[i],
                         state.card_seal[i], state.card_bonus[i], state.hand_valid)
 
-    # SHOP SLOT / PACK SLOT (in the shop)
+    # SHOP SLOT / PACK SLOT (in the shop): the price BUY / OPEN charge (a couponed card or pack $0)
+    # and whether it can be paid now (the legal mask's test: $0 always, Credit Card below $0)
     on = state.shop_slots >= 0
-    cost = item_cost(state, state.shop_kind, state.shop_slots, state.shop_ed) * on
-    shop_slot = jnp.concatenate([jnp.stack([cost / 10.0, (on & (state.money >= cost)).astype(f32)], axis=1),
+    cost = jax.vmap(lambda k: shop_item_cost(state, k))(jnp.arange(MAX_SHOP_SLOTS)) * on
+    shop_slot = jnp.concatenate([jnp.stack([cost / 10.0, (on & affordable(state, cost)).astype(f32)], axis=1),
                                  jax.nn.one_hot(state.shop_kind, 3) * on[:, None],
                                  jax.nn.one_hot(state.shop_ed, N_ED) * on[:, None]], axis=1) * shop
     pon = state.pack_slots >= 0
-    pcost = jax.vmap(lambda p: pack_cost(state, p))(state.pack_slots) * pon
-    pack_slot = jnp.stack([pcost / 10.0, (pon & (state.money >= pcost)).astype(f32)], axis=1) * shop
+    pcost = jax.vmap(lambda p, f: pack_cost(state, p, f))(state.pack_slots, state.pack_free) * pon
+    pack_slot = jnp.stack([pcost / 10.0, (pon & affordable(state, pcost)).astype(f32)], axis=1) * shop
 
     # PACK CARD (a pack open)
     present = open_ & (items >= 0)
@@ -352,7 +353,7 @@ def observe(state: balatroEnvState) -> jax.Array:
                          jnp.clip(state.chips_scored / state.blind_target, 0.0, 2.0),
                          jnp.log10(state.blind_target.astype(f32)) / 6.0]) * blind
     shop_g = jnp.stack([reroll_price(state) / 10.0,
-                        (state.money >= reroll_price(state)).astype(f32)]) * shop
+                        affordable(state, reroll_price(state)).astype(f32)]) * shop
 
     return jnp.concatenate([ids, _joker_slot_block(state).ravel(), cards.ravel(), shop_slot.ravel(),
                             pack_slot.ravel(), pack_card.ravel(), cons_slot.ravel(),

@@ -414,10 +414,17 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       - Invariants: jokers <= slots + 1 (a charged Negative Invisible Joker sold at full slots),
         consumables <= slots + Negatives + 1 (a Negative Emperor's / Fool's cards).
       AGENT (no training change): the legal mask follows the env ($0 items; a couponed card or pack
-      costs $0 there; MOVE_CARD over env.card_lanes). The obs still shows a couponed card's full price.
+      costs $0 there; MOVE_CARD over env.card_lanes). The obs still showed a couponed card's full
+      price (fixed in the next entry).
       TESTS: 36 new scenarios (Rules: Deck, Draw, Hand size, Move, Chips, Shop; the jokers, Tarots,
       bosses, tags and vouchers above); the reference model (ref_balatro.ref_play, tests_jokers.
       check_step) follows every change.
+- [x] Agent obs prices (2026-11-04). The price of a shop card and a pack in the obs is the price
+      BUY / OPEN charge (env.shop_item_cost; pack_cost with pack_free): a couponed card or pack
+      shows $0. The can-pay flags of the cards, the packs and the reroll use env.affordable, as the
+      legal mask does ($0 always; Credit Card below $0). Was: the full price and money >= price,
+      so the agent saw a free card as a paid one it could not pay for. Obs size unchanged (2301).
+      Agent tests: the same failures as before (the blind select mask, the picker), none new.
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
