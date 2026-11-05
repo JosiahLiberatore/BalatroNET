@@ -67,7 +67,7 @@ from env import (balatroAction, balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, M
                  WIN_ANTE, live_v, bankrupt_at, reroll_price, pack_cost, cons_room,
                  can_use_base, pick_ok, deck_counts, affordable, shop_item_cost, card_lanes, eternal)
 from items import (N_HAND_TYPES, N_CONS, CONS_KIND, CONS_USE, CONS_PARAM, CONS_LO, CONS_HI, N_ENH,
-                   N_ED, N_SEAL, N_PACKS, PACK_KIND, PACK_SLOTS, MAX_PACK, PK_ARCANA, PK_BUFFOON, IK_JOKER,
+                   N_ED, N_SEAL, N_PACKS, PACK_KIND, PACK_SLOTS, MAX_PACK, PK_ARCANA, PK_BUFFOON, IK_JOKER, IK_CARD,
                    MAX_JOKER_SLOTS, ED_NEG, U_ENHANCE, U_SUIT, U_PLANET, MAX_PICK_USE, N_STAKES,
                    STK_ETERNAL, STK_PERISH, STK_RENTAL, PERISH_ROUNDS)
 from jokers import (MAX_JOKERS, N_JOKERS, J_EMPTY, JOKER_COST, JOKERS, JOKER_RARITY, ST_TODO,
@@ -177,7 +177,11 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
     item, kind, ed = state.shop_slots, state.shop_kind, state.shop_ed
     cost = jax.vmap(lambda k: shop_item_cost(state, k))(slots)          # a couponed card is $0
     neg = (ed == ED_NEG) & (state.joker_slots < MAX_JOKER_SLOTS)
-    room = jnp.where(kind == IK_JOKER, held.sum() < state.joker_slots + neg, cons_room(state) > 0)
+    # a Tarot / Planet with the consumable slots full: Buy and Use (env.buy_and_use), if it can be used now
+    use_now = jax.vmap(lambda c: can_use_base(state, c, False))(item)
+    room = jnp.select([kind == IK_JOKER, kind == IK_CARD],
+                      [held.sum() < state.joker_slots + neg, ~state.card_live.all()],
+                      (cons_room(state) > 0) | use_now)
     buy = shop & (slots < state.shop_size) & (item >= 0) & affordable(state, cost) & room
     sell = (blind | shop | pack | cash) & held & ~eternal(state)      # an Eternal joker cannot be sold
     move = (blind | shop | pack | end | cash) & (held.sum() >= 2)

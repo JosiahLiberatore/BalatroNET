@@ -62,7 +62,7 @@ from env import (balatroAction, env_step, reset, explain_play, preview, build_ct
                  V_BUY, V_SELL, V_MOVE_JOKER, V_MOVE_CARD, V_REROLL, V_NEXT, V_USE, V_SELL_CONS, V_OPEN,
                  V_PICK, V_SKIP, V_REDEEM, WIN_ANTE, RANK_CHARS, SUIT_CHARS,
                  live_v, bankrupt_at, reroll_price, item_cost, pack_cost, joker_cost, shop_item_cost,
-                 voucher_cost, blind_target, blind_dollars, card_debuffed)
+                 voucher_cost, blind_target, blind_dollars, card_debuffed, buy_and_use, can_use_base)
 from items import (CONS_NAMES, CONS_DESC, CONS_KIND, CONS_LO, CONS_HI, CK_TAROT, CK_PLANET, PACK_NAMES,
                    PACK_KIND, PACK_CHOOSE, PK_ARCANA, PK_CELESTIAL, PK_STANDARD, PK_BUFFOON, PK_SPECTRAL,
                    ENH_NAMES, ED_NAMES, SEAL_NAMES, IK_JOKER, IK_TAROT, IK_CARD, N_HAND_TYPES, hand_chips_mult,
@@ -618,6 +618,10 @@ class App:
         self.targets = [int(blind_target(st.ante, i, st.target_scale, st.boss, stake=st.stake)) for i in range(3)]
         self.rewards = [int(blind_dollars(i, st.boss, st.stake)) for i in range(3)]
         self.prices = [int(shop_item_cost(st, i)) for i in range(len(h.shop_slots))]
+        # a shop Tarot / Planet with the consumable slots full: BUY is Buy and Use (True), or
+        # nothing when the card cannot be used in the shop (False); None: an ordinary BUY
+        self.buy_use = [bool(can_use_base(st, h.shop_slots[i], False)) if bool(buy_and_use(st, i)) else None
+                        for i in range(len(h.shop_slots))]
         self.pack_prices = [int(pack_cost(st, h.pack_slots[i], h.pack_free[i])) for i in range(len(h.pack_slots))]
         self.v_price = int(voucher_cost(st))
         self.debuff = np.asarray(card_debuffed(st, jnp.arange(MAX_DECK_SIZE)))
@@ -651,6 +655,7 @@ class App:
 
     def step(self, verb, target=0, dest=0, quiet=False):
         pre = self.h
+        cost = self.prices[target] if verb == V_BUY and 0 <= target < len(self.prices) else 0
         self.test_dirty = self.test_mode
         if verb == V_MOVE_CARD:                # the selection follows its cards
             ids = {int(pre.hand[l]) for l in self.selected}
@@ -679,9 +684,12 @@ class App:
             self.say(f"Discarded. {int(h.discards)} discard(s) left.")
         elif verb == V_BUY:
             if not np.array_equal(np.asarray(pre.shop_slots), np.asarray(h.shop_slots)):
-                self.say(f"Bought {self.item_name(pre, target)} for ${int(pre.money) - int(h.money)}.")
+                used = (int(pre.shop_kind[target]) != IK_JOKER and int(pre.shop_kind[target]) != IK_CARD
+                        and np.array_equal(np.asarray(pre.consumables), np.asarray(h.consumables)))
+                self.say(f"Bought and used {self.item_name(pre, target)} for ${cost}." if used else
+                         f"Bought {self.item_name(pre, target)} for ${cost}.")
             else:
-                self.say("Can't buy that (money, or no free slot).")
+                self.say("Can't buy that (money, or no free slot and it can't be used here).")
         elif verb == V_OPEN:
             if int(h.game_stage) == STAGE_PACK:
                 pid = int(h.pack_id)
@@ -1722,8 +1730,9 @@ class App:
                 self.draw_card(cr, card)
                 text(s, f.big, f"${cost}", MONEY_C if ok else DIM, (r.centerx, r.bottom - 40), "midtop")
             else:
+                use = {True: ": buy and use", False: ": no room"}.get(self.buy_use[i], "")
                 self.draw_item(r, CONS_NAMES[it], CONS_DESC[it], cons_color(it), cost, ok,
-                               tag=CONS_WORD[int(CONS_KIND[it])])
+                               tag=CONS_WORD[int(CONS_KIND[it])] + use)
         box(s, (322, 440, 920, 140), PANEL, 14)
         text(s, f.bold, "PACKS", PACK_C, (338, 452))
         text(s, f.bold, "VOUCHERS", VOUCHER_C, (338, 480))

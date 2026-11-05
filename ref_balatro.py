@@ -330,7 +330,8 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
              space: fn (slot) -> bool  (default: never)
     g may also hold the boss's rules: hand_debuffed (The Psychic / Eye / Mouth: 0 x 0, only
     Matador and AFTER), flint, boss_trigger (The Arm / The Ox did something), observatory
-    (hand name -> Planets held), skips. A Card with deb set is debuffed.
+    (hand name -> Planets held), skips, boss (its name while it is on: the boss checks a card
+    Midas Mask / Vampire change again). A Card with deb set is debuffed.
     -> dict(hand, chips, mult, score, money, gone (set of slots used up), played, round,
             acted, cards (after), broken (card indices), level_up, tarots, spawns (the
             Tarot / Spectral kinds the hand made, in order), dna)"""
@@ -422,6 +423,7 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
             for c in scored:
                 if is_face(c, m):
                     c.enh = GOLD
+                    c.deb = debuffed(c, g.get("boss"), m)     # set_ability: debuff_card again, no mark
                     reset.add(c)
                     acted.add(i)
         elif n == "Vampire":
@@ -429,12 +431,15 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
             for c in scored:
                 if c.enh != NONE_ and not c.deb and c not in vampired:
                     c.enh = NONE_
+                    c.deb = debuffed(c, g.get("boss"), m)     # a Stone card can take the boss's suit
                     vampired.add(c)
                     reset.add(c)
                     k += 1
             y["v"] += 0.1 * k
             if k:
                 acted.add(i)
+    # the scoring loop sets G.GAME.blind.triggered for each debuffed scoring card, after BEFORE
+    triggered = triggered or any(c.deb for c in scored)
 
     level = g.get("levels", {}).get(name, 1) + level_up
     chips, mult = hand_base(name, level)

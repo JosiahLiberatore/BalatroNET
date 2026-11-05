@@ -12,7 +12,8 @@ The order is the order of Balatro's evaluate_play (state_events.lua):
      Splash; Stone cards always score, Wild cards are every suit)
   2. BEFORE, slot order: counters that read the hand (Green, Ride the Bus, Obelisk ...),
      To Do $, Space Joker (level up), Midas Mask / Vampire, DNA. Ride the Bus and
-     DNA see the cards as the Midas Masks / Vampires to their left left them.
+     DNA see the cards as the Midas Masks / Vampires to their left left them. The boss
+     checks a card they change again (set_ability: debuff_card).
      The hand's base chips and mult come from its level after this step.
   3. each scored card in play order, each repetition (Red Seal, then jokers):
      its chips (+Bonus, Stone, perma), its mult (Mult, Lucky), $ (Gold Seal,
@@ -369,6 +370,9 @@ class PlayIn(NamedTuple):
     det_enh     : jax.Array = None   # (5,) the enhancements hand detection reads (a debuffed Wild: plain)
     all_ids     : jax.Array = None   # (J,) every held joker, a debuffed one too (Baseball Card counts it)
     card_room   : jax.Array = None   # free card instances (DNA copies: at most this many)
+    touch_debuff : jax.Array = None  # (5,) bool: the debuff a played card gets when Midas Mask / Vampire
+                                     # touch it (set_ability runs debuff_card again: a plain / Gold card
+                                     # without The Pillar mark)
 
 
 class PlayOut(NamedTuple):
@@ -415,7 +419,7 @@ def effective(ids, joker_value, joker_state):
     return rows, ok, joker_value[s], joker_state[s]
 
 
-def _before_cards(rows: Joker, ids, active, enh, sc, rank, pareidolia, deb):
+def _before_cards(rows: Joker, ids, active, enh, sc, rank, pareidolia, deb, tdeb):
     """The BEFORE step reads the cards in slot order (one eval_card per joker):
     Midas Mask (face cards -> Gold) and Vampire (strip enhancements, +X0.1 each),
     real rows only (neither copies). A card a Vampire took stays marked for the rest
@@ -424,23 +428,28 @@ def _before_cards(rows: Joker, ids, active, enh, sc, rank, pareidolia, deb):
     slots to their left left them. A debuffed card is no face card, and Vampire skips it.
     Both call set_ability, which builds a new ability table: the card loses its The Pillar
     mark (played_this_ante, set before the hand), even a Gold card Midas Mask sets again.
+    set_ability also runs the boss's debuff_card again: a touched card takes tdeb (a Stone
+    card a Vampire strips can have the boss's suit, or be a face card in The Plant), and a
+    later Midas Mask / Vampire skips it then.
     -> (enh (5,), stripped (J,), faces (J,) a scored face card when slot j acts,
         enh0 (J,) played card 0's enhancement when slot j acts, reset (5,) the cards
-        set_ability touched, reset0 (J,) card 0 was touched before slot j acts)"""
+        set_ability touched, reset0 (J,) card 0 was touched before slot j acts,
+        deb (5,) the debuffs after the step, deb0 (J,) card 0's debuff when slot j acts)"""
     def step(carry, j):
-        e, taken, reset = carry
-        seen = ((sc & ~deb & face(rank, pareidolia, e)).any(), e[0], reset[0])
+        e, taken, reset, d = carry
+        seen = ((sc & ~d & face(rank, pareidolia, e)).any(), e[0], reset[0], d[0])
         midas = active[j] & (rows.EFFECT[j] == E_MIDAS)
         vamp = active[j] & (ids[j] == J_VAMPIRE)
-        hit = vamp & sc & ~deb & (e != ENH_NONE) & ~taken
+        hit = vamp & sc & ~d & (e != ENH_NONE) & ~taken
         e = jnp.where(hit, ENH_NONE, e)
-        gold = midas & sc & ~deb & face(rank, pareidolia, e)
+        gold = midas & sc & ~d & face(rank, pareidolia, e)
         e = jnp.where(gold, ENH_GOLD, e)
-        return (e, taken | hit, reset | hit | gold), (hit.sum(),) + seen
+        touched = hit | gold
+        return (e, taken | hit, reset | touched, d | (touched & tdeb)), (hit.sum(),) + seen
     z = jnp.zeros_like(sc)
-    (enh, _, reset), (stripped, faces, enh0, reset0) = jax.lax.scan(step, (enh, z, z),
-                                                                    jnp.arange(active.shape[0]))
-    return enh, stripped, faces, enh0, reset, reset0
+    (enh, _, reset, deb), (stripped, faces, enh0, reset0, deb0) = jax.lax.scan(
+        step, (enh, z, z, deb), jnp.arange(active.shape[0]))
+    return enh, stripped, faces, enh0, reset, reset0, deb, deb0
 
 
 def _suit_sets(sc, suit, enh, smeared, deb=None):
@@ -487,6 +496,7 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     joker_ed = zi(J) if p.joker_ed is None else p.joker_ed
     f = jnp.bool_(False)
     deb = jnp.zeros(5, bool) if p.debuff is None else p.debuff
+    tdeb = jnp.zeros(5, bool) if p.touch_debuff is None else p.touch_debuff
     hdeb = jnp.zeros(H, bool) if p.held_debuff is None else p.held_debuff
     hand_debuffed = f if p.hand_debuffed is None else p.hand_debuffed
     boss_trigger = f if p.boss_trigger is None else p.boss_trigger
@@ -501,7 +511,6 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     played = p.hand_played.at[ht].add(1)
     in_round = p.hand_round.at[ht].add(1)
     sc = hand.scoring
-    live_sc = sc & ~deb                              # the cards that score (a debuffed one does not)
     isf0 = face(p.rank, mods.pareidolia, enh0) & ~deb
 
     # Blackboard: Card:is_suit with flush_calc (a debuffed card keeps its suit, a debuffed Wild only its own)
@@ -523,8 +532,13 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     #    Midas Mask / Vampire, then the hand's chips and mult at its level
     scored0 = Cards(p.rank, p.suit, sc, jnp.where(sc, jnp.cumsum(sc) - 1, -1),
                     jnp.zeros(5, bool), jnp.zeros(5, bool), enh0, None, deb)
-    enh, stripped, faces_at, enh0_at, reset, reset0_at = _before_cards(rows, ids, active, enh0, sc, p.rank,
-                                                                       mods.pareidolia, deb)
+    enh, stripped, faces_at, enh0_at, reset, reset0_at, deb, deb0_at = _before_cards(
+        rows, ids, active, enh0, sc, p.rank, mods.pareidolia, deb, tdeb)
+    # from here on the cards are as BEFORE left them: a card it debuffed scores nothing and
+    # triggers the boss (evaluate_play's scoring loop: G.GAME.blind.triggered)
+    live_sc = sc & ~deb                              # the cards that score (a debuffed one does not)
+    triggered = triggered | (sc & deb).any()
+    info = info._replace(boss_triggered=triggered)
     counts = rule_counts(rows, scored0, sc.astype(jnp.float32), info, tg, mods, p.joker_state, False)
     # Ride the Bus reads the faces as the Midas Masks / Vampires to its left left them
     counts = jnp.where(rows.UPD_COND == C_SCORING_FACE, faces_at[:, None].astype(jnp.float32), counts)
@@ -548,7 +562,7 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
         & (p.hand_round.sum() == 0) & (hand.n_played == 1)
     dna_n = jnp.clip(jnp.minimum(dna_on.sum(), room), 0, H - 1 - last).astype(jnp.int32)
     dna_slot = compact(jnp.arange(J), dna_on)
-    dna_enh, dna_mark = enh0_at[dna_slot], ~reset0_at[dna_slot]
+    dna_enh, dna_mark, dna_deb = enh0_at[dna_slot], ~reset0_at[dna_slot], deb0_at[dna_slot]
     kc = lane - (last + 1)
     is_copy = (kc >= 0) & (kc < dna_n)
     h_ok = p.held_ok | is_copy
@@ -556,7 +570,7 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     h_suit = jnp.where(is_copy, p.suit[0], p.held_suit)
     held_enh = jnp.where(is_copy, dna_enh[jnp.clip(kc, 0, J - 1)], held_enh)
     held_seal = jnp.where(is_copy, seal[0], held_seal)
-    hdeb = jnp.where(is_copy, deb[0], hdeb)
+    hdeb = jnp.where(is_copy, dna_deb[jnp.clip(kc, 0, J - 1)], hdeb)   # copy_card: other.debuff
     v_add, _, _ = update_ex(rows, active, value, p.joker_state, T_ON_CARD_ADDED,
                             jnp.full((J, rows.UPD_COND.shape[1]), dna_n, jnp.float32))
     value = jnp.where(dna_n > 0, v_add, value)

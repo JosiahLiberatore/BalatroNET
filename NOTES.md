@@ -509,6 +509,34 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       GUI: the cash-out screen (the $ and the Cash Out button; Use / Sell work there); END keeps the
       hand on the table (drag the jokers, then "Next: the end of the round"); in the shop and on
       the cash-out screen the sidebar shows the target of the blind on deck (it showed the old one).
+- [x] Buy and Use, the boss check after Midas Mask / Vampire, The Pillar's new marks (2026-11-05),
+      rules from the 1.0.1o Lua:
+      ENV RULES:
+      - Buy and Use (buy_from_shop, id 'buy_and_use'): a BUY of a Tarot / Planet when the
+        consumable slots are full pays the card and uses it at once, if can_use_consumeable allows
+        it with the card still in the shop (no hand, no slot of its own: a Planet, The Hermit,
+        Temperance, The Wheel of Fortune, Judgement; not a card Tarot, The Emperor, The High
+        Priestess, The Fool). The cost is paid first (The Hermit doubles the money after it). With
+        a free slot BUY then USE gives the same result, so there is no separate verb. Was: a no-op.
+      - Midas Mask / Vampire: set_ability runs the boss's debuff_card again on each card they
+        change (a plain / Gold card without The Pillar mark). A Stone card a Vampire strips can
+        have the boss's suit (The Club ...) or be a face card (The Plant): it is debuffed, scores
+        nothing and triggers the boss (Matador); a later Midas Mask / Vampire skips it, and a DNA
+        copy of it is debuffed too. Was: the debuffs from before the hand.
+      - The Pillar: a card played in The Pillar's own blind gets no new mark. The game marks it
+        (played_this_ante) but does not run debuff_card, so its flag stays as the blind's start set
+        it, and the marks go when the boss is beaten. So a Glass face card first played there breaks
+        as a face card (Canio), and a DNA copy made there is not debuffed. Was: debuffed at once.
+      AGENT (no training change): the BUY mask allows a Tarot / Planet the full slots cannot take
+      when the shop can use it; a playing card in the shop (Magic Trick) needs a free card slot,
+      not a free consumable slot (a mask bug). The obs and the action layout do not change.
+      TESTS: the reference model follows (Buy and Use through its USE effects; ref_play's BEFORE
+      checks a changed card again and sets the boss trigger after it; the marks; a DNA copy's
+      debuff). The soak checks that it met Buy and Use. 1 old scenario changed (Mercury with the
+      slots full is now Buy and Use), 6 new ones (Rules: Buy and Use x 2, refused; Bosses: The
+      Pillar + Canio, The Pillar + DNA, The Club + Vampire, The Plant + Vampire + Midas Mask).
+      GUI: a shop Tarot / Planet shows "buy and use" (or "no room") when the slots are full; the
+      message says "Bought and used".
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -538,7 +566,6 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
   these in real Balatro (unbounded consumables are possible); overflow is clamped and counted, same
   SHAPE-is-capacity / count-is-DATA rule as hand/deck
 - joker slots stop at 16: a Negative past 16 slots gives no slot (agent J_TOK = 16)
-- a bought Tarot / Planet goes to a slot (no "buy and use"; a human convenience, kept out)
 - The Ox: a tie uses the pairs() order of a new run; after a save + continue the game uses another
 - at most 8 held tags (MAX_TAGS)
 - one deck only: the Red Deck (the game's default, 4 discards); no endless mode (every stake is in)
@@ -552,9 +579,12 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
   - the score floor is float32 (+-1 chip only at an exact target); retrigger caps 12 scored /
     6 held (only Showman duplicates or long copy chains pass them)
   - a USE with too many cards selected takes the first ones (the game turns the button off)
-- open (no decision yet): Midas Mask / Vampire do not check the boss debuff again in BEFORE; a
-  card played in the Pillar blind counts as debuffed at once (Canio); the Orbital Tag's hand when
-  an ante number comes back, The Needle with 0 base hands, Crimson Heart on Astronomer
+- open (no decision yet): the Orbital Tag's hand when an ante number comes back, The Needle with
+  0 base hands, Crimson Heart on Astronomer
+- The Pillar: when a joker comes or goes later in its blind (a sale, Seltzer used up, Judgement
+  ...), the game checks every card again (set_blind reset), and a DNA copy made in that blind is
+  then debuffed (a suit / rank Tarot on the copy does it too); the env does not debuff the copy
+  in that round
 - a pack hand goes back to the bottom in lane order (the game: the hand's order, sorted by rank
   unless the player moved cards); only a full pass through the deck between two shuffles shows it
 - the END window comes only after a PLAY (a round that a sale ends, a boss disabled by a sale,

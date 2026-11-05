@@ -421,6 +421,13 @@ class View:
         from env import card_debuffed
         return bool(card_debuffed(self.h, card_id(c)))
 
+    @property
+    def hand_debuffed(self):
+        """The cards in hand the boss debuffs now (lane order)."""
+        from env import card_debuffed
+        return [self.card(int(self.h.hand[l])).name for l in range(MAX_HAND_SIZE)
+                if self.h.hand_valid[l] and bool(card_debuffed(self.h, int(self.h.hand[l])))]
+
 
 # ---------------------------------------------------------------------------
 # RUNNING ONE
@@ -1911,11 +1918,31 @@ RULES = [
       shop(jokers=("Joker",) * 5, shop_slots=("Bull",)),
       [buy(0)],
       [C("jokers held", lambda r: len(r[1].jokers), 5), C("money", lambda r: r[1].money, 10)]),
-    S("Rules", "Buy", "a Tarot or Planet needs a free consumable slot",
-      """With both consumable slots full, Mercury cannot be bought.""",
-      shop(consumables=("The Fool", "The Hermit"), shop_slots=(CONS_ID["Mercury"],), shop_kind=(IK_PLANET,)),
+    S("Rules", "Buy and Use", "a Planet with the consumable slots full is used at once",
+      """With both consumable slots full, BUY is the shop's Buy and Use (buy_from_shop): Mercury is
+      paid ($3) and used at once. Pair goes to level 2, Constellation gains X0.1, and the slots
+      keep The Fool and The Hermit.""",
+      shop(jokers=("Constellation",), consumables=("The Fool", "The Hermit"), shop_slots=(CONS_ID["Mercury"],),
+           shop_kind=(IK_PLANET,)),
       [buy(0)],
-      [C("consumables", lambda r: r[1].cons, ["The Fool", "The Hermit"]), C("money", lambda r: r[1].money, 10)]),
+      [C("consumables", lambda r: r[1].cons, ["The Fool", "The Hermit"]), C("money", lambda r: r[1].money, 7),
+       C("Pair level", lambda r: r[1].level("pair"), 2), C("Constellation", lambda r: r[1].jv(0), 1.1),
+       C("the shop", lambda r: r[1].shop, [])]),
+    S("Rules", "Buy and Use", "The Hermit doubles the money after its own price",
+      """Buy and Use pays first (ease_dollars comes before use_card): $10 - $3 = $7, then The Hermit
+      doubles it: $14.""",
+      shop(consumables=("The Fool", "Mercury"), shop_slots=(CONS_ID["The Hermit"],), shop_kind=(IK_TAROT,)),
+      [buy(0)],
+      [C("money", lambda r: r[1].money, 14), C("consumables", lambda r: r[1].cons, ["The Fool", "Mercury"])]),
+    S("Rules", "Buy and Use", "not for a card that needs a free slot or a hand",
+      """can_buy_and_use asks can_use_consumeable with the card still in the shop: The Emperor needs a
+      free slot for its Tarots, and The Magician needs cards in hand. With the slots full, neither
+      can be bought.""",
+      shop(consumables=("The Fool", "Mercury"), shop_slots=(CONS_ID["The Emperor"], CONS_ID["The Magician"]),
+           shop_kind=(IK_TAROT, IK_TAROT)),
+      [buy(0), buy(1)],
+      [C("money", lambda r: r[2].money, 10), C("consumables", lambda r: r[2].cons, ["The Fool", "Mercury"]),
+       C("the shop", lambda r: r[2].shop, ["The Emperor", "The Magician"])]),
     S("Rules", "Buy", "a Tarot or Planet costs $3",
       """Tarot and Planet cards cost $3 in the shop and sell for $1.""",
       shop(shop_slots=(CONS_ID["The Hermit"],), shop_kind=(IK_TAROT,)),
@@ -2210,6 +2237,37 @@ BOSSES = [
       boss("The Pillar", played_ante=("2H",), consumables=("Death",)),
       [use(0, "KD 2H")],
       [C("KD's card is now 2H", lambda r: r[1].card("KD").name, "2H"), C("debuffed", lambda r: r[1].debuffed("KD"), True)]),
+    S("Bosses", "The Pillar + Canio", "a card played in The Pillar's blind breaks as a face card",
+      """A card first played in The Pillar's own blind is not debuffed in that hand: the game marks it
+      (played_this_ante), but its debuff flag stays as the blind's start set it. KD (Glass, X2)
+      scores 15 x 2 = 30; two Oops! All 6s make it break, and Canio counts it: X1 -> X2.""",
+      boss("The Pillar", jokers=("Canio", "Oops! All 6s", "Oops! All 6s"), cards_mod={"KD": dict(enh=4)}),
+      [play("KD")],
+      [C("score", _score(), 30), C("KD destroyed", lambda r: r[1].card("KD").live, False),
+       C("Canio", lambda r: r[1].jv(0), 2.0)]),
+    S("Bosses", "The Pillar + DNA", "a copy made in The Pillar's blind is not debuffed",
+      """DNA copies KD into the hand. copy_card copies the debuff flag too, and KD's flag is off (it
+      was first played in this blind). So the copy can score later in this round.""",
+      boss("The Pillar", jokers=("DNA",)),
+      [play("KD")],
+      [C("Kings of Diamonds in hand", lambda r: r[1].hand.count("KD"), 1),
+       C("debuffed cards in hand", lambda r: r[1].hand_debuffed, [])]),
+    S("Bosses", "The Club + Vampire", "a Stone card Vampire strips is a Club again: debuffed",
+      """A Stone card has no suit, so The Club does not debuff the Stone 2C. Vampire strips it in
+      BEFORE; set_ability runs the boss check again, and the 2 of Clubs is debuffed: it scores nothing
+      and triggers the boss (Matador: $8). Pair of Kings: (10 + 10 + 10) x 2 x 1.1 (Vampire) = 66.""",
+      boss("The Club", hand="KD KH 2C 3S 4D 6D 7H 8S", jokers=("Vampire", "Matador"), cards_mod={"2C": dict(enh=6)}),
+      [play("KD KH 2C")],
+      [C("score", _score(), 66), C("money (Matador)", lambda r: r[1].money, 8),
+       C("2C", lambda r: r[1].card("2C").enh, "none")]),
+    S("Bosses", "The Plant + Vampire + Midas Mask", "a later Midas Mask skips the card Vampire made a face",
+      """The Stone KD is no face card, so The Plant lets it score. Vampire (slot 1) strips it: KD is a
+      King again, and The Plant debuffs it. Midas Mask (slot 2) skips a debuffed card, so KD stays
+      plain. High Card 2C: (5 + 2) x 1 x 1.1 = 7.""",
+      boss("The Plant", hand="KD 2C 3S 4D 6D 7H 8S 9C", jokers=("Vampire", "Midas Mask"),
+           cards_mod={"KD": dict(enh=6)}),
+      [play("KD 2C")],
+      [C("score", _score(), 7), C("KD", lambda r: r[1].card("KD").enh, "none")]),
     S("Bosses", "The Needle", "only 1 hand, x1 blind",
       """The Needle: 1 hand only, and the blind is small: 1 x the base. Ante 2: 800 chips.""",
       boss_select("The Needle"),

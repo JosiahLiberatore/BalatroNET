@@ -1178,7 +1178,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
         g = ref_g(p)
         g.update(money=w.f["money"], levels={HAND_NAMES[k]: int(w.level[k]) for k in range(N_HAND_TYPES)},
                  hand_debuffed=debuffed, flint=boss == "The Flint", boss_trigger=arm or ox,
-                 discards=max(int(p.discards), 0), card_room=int((~w.cards["card_live"]).sum()))
+                 discards=max(int(p.discards), 0), card_room=int((~w.cards["card_live"]).sum()), boss=boss)
         if "Observatory" in w.vouchers:
             obs = Counter(HAND_NAMES[_PARAM[x]] for x in w.cons if _KIND[x] == CK_PLANET)
             g["observatory"] = obs
@@ -1207,10 +1207,13 @@ def check_step(c, tag, p, a, q, reward, out=None):
         w.f["last_hand"] = hi
         if boss == "The Mouth" and int(p.boss_hand) < 0:
             w.f["boss_hand"] = hi
+        # the mark (Midas / Vampire: set_ability takes it); in The Pillar's own blind only a mark
+        # from before it (a new one debuffs nothing there: the flags were set at the blind's start)
+        old_mark = lambda i: bool(p.card_played_ante[i]) or boss != "The Pillar"
         for k, card in enumerate(res["cards"]):
             w.cards["card_enh"][card.i] = card.enh
             w.cards["card_bonus"][card.i] = card.bonus
-            w.cards["card_played_ante"][card.i] = k not in res["reset"]   # Midas / Vampire: set_ability
+            w.cards["card_played_ante"][card.i] = k not in res["reset"] and old_mark(card.i)
         first = int(np.asarray(p.hand_round).sum()) == 0
         after = res["cards"]                                 # the cards after BEFORE (Midas, Vampire)
         sixth = ("Sixth Sense" in R.acting_names(J) and first and len(cards) == 1 and not debuffed
@@ -1228,9 +1231,9 @@ def check_step(c, tag, p, a, q, reward, out=None):
         if first and len(cards) == 1 and not debuffed:
             for src in res["dna"]:                              # each DNA copies the card as it saw it
                 w.new_cards.append((True, dict(card_rank=src.r, card_suit=src.s, card_enh=src.enh,
-                                               card_ed=src.ed, card_seal=src.seal,
-                                               card_bonus=cards[0].bonus, card_played_ante=float(src.mark))))
-                held_cards.append(R.Card(-1, src.r, src.s, src.enh, src.ed, src.seal))
+                                               card_ed=src.ed, card_seal=src.seal, card_bonus=cards[0].bonus,
+                                               card_played_ante=float(src.mark and old_mark(cards[0].i)))))
+                held_cards.append(R.Card(-1, src.r, src.s, src.enh, src.ed, src.seal, deb=src.deb))
         J = _drop(J, res["gone"])
         w.f.update(chips_scored=total, hands=int(p.hands) - 1)
         w.f["money"] += int(res["money"])
@@ -1275,6 +1278,11 @@ def check_step(c, tag, p, a, q, reward, out=None):
         else:
             cost = cons_cost_ref(item, 0, w.disc, astro) if item >= 0 else 0
             room = w.room() > 0
+        # Buy and Use: a Tarot / Planet the full slots cannot take is used at once, if the shop
+        # allows its use (can_buy_and_use: can_use_consumeable from outside the slots, no hand)
+        buy_use = kind in (IK_TAROT, IK_PLANET) and not room and item >= 0
+        if buy_use:
+            room = _can_use(p, J, w, item, np.zeros(MAX_HAND_SIZE, bool), False)
         if 0 <= t < MAX_SHOP_SLOTS and bool(p.shop_free[t]):
             cost = 0
         floor = -20 * R.acting_names(J).count("Credit Card")
@@ -1291,9 +1299,11 @@ def check_step(c, tag, p, a, q, reward, out=None):
                 w.new_cards.append((False, dict(card_rank=int(p.shop_rank[t]), card_suit=int(p.shop_suit[t]),
                                                 card_enh=int(p.shop_enh[t]), card_ed=ed, card_seal=0)))
                 _bump(J, "Hologram", 0.25)
-            else:
+            elif not buy_use:
                 w.give(item, astro)
             w.f["money"] = int(p.money) - cost
+            if buy_use:                                     # paid first: The Hermit sees the money after
+                J = _apply_cons(c, tag, p, q, J, w, item, np.zeros(MAX_HAND_SIZE, bool))
             npeq(c, f"{tag}: BUY empties the shop slot", q.shop_slots[t], -1)
             npeq(c, f"{tag}: BUY: the slot's stickers go with the card", q.shop_sticker[t], 0)
     elif verb == V_REDEEM:
@@ -2749,6 +2759,11 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
                 stats["rent paid"] += 1
             if verb in (V_BUY, V_PICK) and (np.asarray(q.joker_sticker) != 0).sum() > (np.asarray(p.joker_sticker) != 0).sum():
                 stats["sticker joker in"] += 1
+            tb = int(a_host.target[i])
+            if verb == V_BUY and 0 <= tb < MAX_SHOP_SLOTS and int(p.shop_kind[tb]) in (IK_TAROT, IK_PLANET) \
+                    and int(p.shop_slots[tb]) >= 0 > int(q.shop_slots[tb]) \
+                    and np.array_equal(np.asarray(p.consumables), np.asarray(q.consumables)):
+                stats["buy and use"] += 1
         done = np.isin(np.asarray(post.game_stage), (STAGE_LOST, STAGE_WON))
         if done.any():
             stats["max ante"] = max(stats["max ante"], int(np.asarray(post.ante)[done].max()))
@@ -2766,6 +2781,8 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
     c.check("the soak met the END window and acted on the cash-out screen",
             min(stats["end windows"], stats["cash-out actions"]) > 0,
             {k: stats[k] for k in ("end windows", "cash-out actions")})
+    c.check("the soak met Buy and Use (a BUY with the consumable slots full)", stats["buy and use"] > 0,
+            stats["buy and use"])
     return c.done()
 
 

@@ -37,8 +37,13 @@ Spectral pack deals its hand from the top and puts it back at the bottom.
 BOSS BLINDS act only while their round is on (STAGE_BLIND, STAGE_END) and not disabled
 (Chicot, Luchador, a sold joker in Verdant Leaf). A debuffed card is a pure
 function of the boss and the card (card_debuffed), so it needs no state; The
-Pillar reads card_played_ante. Face-down cards (hand_down, joker_down) change
-nothing in the env: only what a player sees.
+Pillar reads card_played_ante (a card played in The Pillar's own blind gets no
+mark: the game set the debuff flags at the blind's start). Face-down cards
+(hand_down, joker_down) change nothing in the env: only what a player sees.
+
+BUY of a Tarot / Planet when the consumable slots are full is the game's Buy and
+Use: the card is paid and used at once (if it can be used in the shop). With a
+free slot, BUY then USE gives the same result, so there is no separate verb.
 
 The return contract (NOTES: "reward = CASHOUT dollars"):
     reward = the cashout $ on the step that runs the end of a won round (the PLAY that
@@ -588,20 +593,25 @@ def mods_of(state):
     return rule_mods(acting(state))
 
 
-def card_debuffed(state, inst, mods=None):
-    """(...,) bool — blind.lua debuff_card for card instances inst: the suit bosses
-    (Card:is_suit with bypass: a Wild card has every suit, a Stone card none; Smeared
-    Joker), The Plant (face cards; Pareidolia: every card), The Pillar (played this
-    ante), Verdant Leaf (every card). Only while the boss is on."""
+def debuff_rule(state, r, s, e, marked, mods=None):
+    """(...,) bool — blind.lua debuff_card for a card of rank r, suit s, enhancement e and The
+    Pillar mark marked: the suit bosses (Card:is_suit with bypass: a Wild card has every suit, a
+    Stone card none; Smeared Joker), The Plant (face cards; Pareidolia: every card), The Pillar
+    (marked), Verdant Leaf (every card). Only while the boss is on."""
     mods = mods_of(state) if mods is None else mods
-    i = jnp.clip(inst, 0, MAX_DECK_SIZE - 1)
-    r, s, e = state.card_rank[i], state.card_suit[i], state.card_enh[i]
     b = state.boss
     bs = BOSS_SUIT[jnp.clip(b, 0, N_BOSSES - 1)]
     suit_hit = (bs >= 0) & suit_is(s, bs, mods.smeared, e)
     face_hit = (b == BK_PLANT) & is_face_card(r, mods.pareidolia, e)
-    pillar = (b == BK_PILLAR) & state.card_played_ante[i]
-    return boss_active(state) & (inst >= 0) & (suit_hit | face_hit | pillar | (b == BK_LEAF))
+    pillar = (b == BK_PILLAR) & marked
+    return boss_active(state) & (suit_hit | face_hit | pillar | (b == BK_LEAF))
+
+
+def card_debuffed(state, inst, mods=None):
+    """(...,) bool — debuff_rule for card instances inst (The Pillar reads card_played_ante)."""
+    i = jnp.clip(inst, 0, MAX_DECK_SIZE - 1)
+    return (inst >= 0) & debuff_rule(state, state.card_rank[i], state.card_suit[i], state.card_enh[i],
+                                      state.card_played_ante[i], mods)
 
 
 def build_ctx(state) -> jax.Array:
@@ -714,6 +724,9 @@ def _play_in(state, select):
     mods = mods_of(state)
     r, s, e, ed, seal, bonus = _gather(state, cards)
     deb = card_debuffed(state, cards, mods) & valid
+    # Midas Mask / Vampire (BEFORE) call set_ability, which runs debuff_card again: the card is
+    # then a Gold / plain card (Wild and Stone gone) without The Pillar mark
+    touch = debuff_rule(state, r, s, ENH_NONE, False, mods) & valid
     hr, hs, he, _, hseal, _ = _gather(state, state.hand)
     hdeb = card_debuffed(state, state.hand, mods) & held_ok
     # flush detection: a debuffed Wild card has only its own suit (Card:is_suit flush_calc)
@@ -733,7 +746,8 @@ def _play_in(state, select):
                e, ed, seal, bonus, he, hseal, level, jnp.where(state.joker_debuff, ED_NONE, state.joker_ed),
                debuff=deb, held_debuff=hdeb, hand_debuffed=debuffed, boss_trigger=arm | ox,
                flint=boss_is(state, BK_FLINT), observatory=observatory(state),
-               det_enh=det_e, all_ids=state.jokers, card_room=(~state.card_live).sum().astype(jnp.int32))
+               det_enh=det_e, all_ids=state.jokers, card_room=(~state.card_live).sum().astype(jnp.int32),
+               touch_debuff=touch)
     return p, sel, cards, valid, dict(ht=ht, debuffed=debuffed, arm=arm, ox=ox, money=money, level=level)
 
 
@@ -786,6 +800,8 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
       - a verb the current stage does not accept    -> no-op
       - DISCARD with 0 discards left                -> PLAY
       - BUY / SELL / OPEN / REDEEM with a bad target, too little $, or no free slot -> no-op
+      - BUY of a Tarot / Planet with the consumable slots full -> Buy and Use (a no-op when
+        the card cannot be used in the shop: a card Tarot, The Emperor, The Fool ...)
       - SELL of an Eternal joker                    -> no-op
       - USE / PICK of a consumable that cannot be used now (wrong card count,
         no room, no hand) -> no-op
@@ -805,10 +821,11 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     no_cards = ((verb == V_PLAY) | (verb == V_DISCARD)) & ~fix_select(state, action.select, 5).any()
     legal = legal & ~no_cards
     branch = jnp.where(legal, verb, V_NOOP)
-    # one branch each for PLAY / DISCARD and USE / PICK (they share their heavy parts)
-    branch = jnp.where(branch == V_DISCARD, V_PLAY, jnp.where(branch == V_PICK, V_USE, branch))
     action = action._replace(verb=verb, target=jnp.asarray(action.target, jnp.int32),
                              dest=jnp.asarray(action.dest, jnp.int32))
+    # one branch each for PLAY / DISCARD and USE / PICK / Buy and Use (they share their heavy parts)
+    branch = jnp.where(branch == V_DISCARD, V_PLAY, jnp.where(branch == V_PICK, V_USE, branch))
+    branch = jnp.where((branch == V_BUY) & buy_and_use(state, action.target), V_USE, branch)
     nxt, _, _ = jax.lax.switch(branch, _HANDLERS, state, action)
     go_end = legal & (verb == V_NEXT) & (state.game_stage == STAGE_END)
     nxt, reward, over = _settle(nxt, legal & (verb == V_PLAY), go_end)
@@ -1341,17 +1358,37 @@ def apply_cons(state, cid, select, key, extra=0):
                           last_cons=jnp.where(CONS_KIND[c] == CK_SPECTRAL, state.last_cons, cid))
 
 
+def buy_and_use(state, t):
+    """A BUY of shop slot t is the game's Buy and Use (buy_from_shop, id 'buy_and_use'): the slot
+    holds a Tarot / Planet and the consumable slots are full. With a free slot BUY then USE gives
+    the same result, so only a BUY that cannot take the card uses it."""
+    kind = state.shop_kind[jnp.clip(t, 0, MAX_SHOP_SLOTS - 1)]
+    return ((kind == IK_TAROT) | (kind == IK_PLANET)) & (cons_room(state) <= 0)
+
+
 def _use_pick(state: balatroEnvState, action: balatroAction):
-    """USE a held consumable, or PICK a pack card: they share one use_consumeable. A pack's
-    joker / playing card goes to the jokers / the deck instead. A Chicot made in a boss round
-    (The Soul) disables the boss at once (add_to_deck)."""
+    """USE a held consumable, PICK a pack card, or BUY a Tarot / Planet the full consumable slots
+    cannot take (Buy and Use): they share one use_consumeable. A pack's joker / playing card
+    goes to the jokers / the deck instead. A Chicot made in a boss round (The Soul) disables the
+    boss at once (add_to_deck)."""
     is_use = action.verb == V_USE
+    is_buy = action.verb == V_BUY
     t = action.target
     key, sub = jax.random.split(jax.random.fold_in(state.key, K_USE))
     # USE: consumable slot t
     slot = jnp.clip(t, 0, MAX_CONSUMABLES - 1)
     u_cid = state.consumables[slot]
     u_ok = (t >= 0) & (t < MAX_CONSUMABLES) & can_use(state, u_cid, action.select, True)
+    # BUY: shop slot t. can_buy_and_use asks can_use_consumeable with the card in the shop (no
+    # hand, no slot of its own); the card is paid first (ease_dollars comes before use_card, so
+    # The Hermit doubles the money after the cost)
+    b = jnp.clip(t, 0, MAX_SHOP_SLOTS - 1)
+    b_cid, b_cost = state.shop_slots[b], shop_item_cost(state, b)
+    b_ok = (t >= 0) & (t < state.shop_size) & (b_cid >= 0) & affordable(state, b_cost) \
+        & can_use_base(state, b_cid, False)
+    b_state = state._replace(money=state.money - b_cost, shop_slots=state.shop_slots.at[b].set(-1),
+                             shop_free=state.shop_free.at[b].set(False),
+                             shop_sticker=state.shop_sticker.at[b].set(0))
     # PICK: pack card t
     i = jnp.clip(t, 0, MAX_PACK - 1)
     p_ok = pick_ok(state, t, action.select)
@@ -1361,19 +1398,21 @@ def _use_pick(state: balatroEnvState, action: balatroAction):
                              pack_sticker=state.pack_sticker.at[i].set(0))
     cons = (kind == PK_ARCANA) | (kind == PK_CELESTIAL) | (kind == PK_SPECTRAL)
 
-    base = tree_where(is_use, take_cons(state, slot), p_state)._replace(key=key)
+    base = tree_where(is_use, take_cons(state, slot), tree_where(is_buy, b_state, p_state))._replace(key=key)
     neg = is_use & (state.cons_ed[slot] == ED_NEG)
-    used = apply_cons(base, jnp.where(is_use, u_cid, item), action.select, sub, neg.astype(jnp.int32))
+    cid = jnp.where(is_use, u_cid, jnp.where(is_buy, b_cid, item))
+    used = apply_cons(base, cid, action.select, sub, neg.astype(jnp.int32))
     joker = acquire(p_state._replace(key=key), item, state.pack_ed[i], state.pack_sticker[i])[0]
     card, added = add_card(p_state._replace(key=key), state.pack_rank[i], state.pack_suit[i],
                            state.pack_enh[i], state.pack_ed[i], state.pack_seal[i])
     card = _event(card, T_ON_CARD_ADDED, added.astype(jnp.float32))
     picked = tree_where(cons, used, tree_where(kind == PK_BUFFOON, joker, card))
     picked = tree_where(picked.pack_left <= 0, _close_pack(picked), picked)
-    got = tree_where(is_use, used, picked)
+    got = tree_where(is_use | is_buy, used, picked)
     chicot = (acting(got) == J_CHICOT).any() & ~(acting(state) == J_CHICOT).any()
     got = tree_where(chicot, disable_boss(got), got)
-    return tree_where(jnp.where(is_use, u_ok, p_ok), got, state), jnp.int32(0), jnp.bool_(False)
+    ok = jnp.where(is_use, u_ok, jnp.where(is_buy, b_ok, p_ok))
+    return tree_where(ok, got, state), jnp.int32(0), jnp.bool_(False)
 
 
 def _sell_cons(state: balatroEnvState, action: balatroAction):
@@ -1576,12 +1615,16 @@ def _blind_action(state: balatroEnvState, action: balatroAction):
     # PLAY: the played cards keep Midas / Vampire / Hiker changes; Glass cards break; Sixth Sense.
     # Sixth Sense and the Glass check read the cards after the BEFORE step (a Stone 6 a Vampire
     # stripped is a 6). The played cards get The Pillar mark (play_cards_from_highlighted), and
-    # a card Midas Mask / Vampire touched loses it again (set_ability).
+    # a card Midas Mask / Vampire touched loses it again (set_ability). In The Pillar's own blind
+    # a new mark debuffs nothing in the game: the debuff flags were set at the blind's start
+    # (Blind:set_blind) and the marks go when the boss is beaten. So the env gives no new mark
+    # there: a face card that breaks counts for Canio, and a DNA copy is not debuffed.
+    pillar = boss_is(pre, BK_PILLAR)
     sixth = ((acting(pre) == J_SIXTH).any() & first_hand & (res.valid.sum() == 1)
              & (pr[0] == 4) & (out.enh[0] != ENH_STONE) & ~info["debuffed"])
     gone_cards = on(res.valid & (out.broken | sixth))
     glass_gone = (res.valid & (out.broken | sixth) & (out.enh == ENH_GLASS)).sum()
-    marks = (pre.card_played_ante | on(res.valid)) & ~on(res.valid & out.reset)
+    marks = (pre.card_played_ante | on(res.valid & ~pillar)) & ~on(res.valid & out.reset)
     played = pre._replace(
         hands=pre.hands - 1,
         hand_valid=pre.hand_valid & ~res.sel, hand_down=pre.hand_down & ~res.sel,
@@ -1612,12 +1655,15 @@ def _blind_action(state: balatroEnvState, action: balatroAction):
     # DNA (copies too): the 1st hand of the round is one card -> each DNA effect puts a copy at
     # the end of the hand and into the deck. score_play already counted them as held cards and
     # gave Hologram its X0.25 each; copy k is the card as the Midas Masks / Vampires to the left
-    # of the k-th DNA effect left it, with its The Pillar mark (copy_card).
+    # of the k-th DNA effect left it, with its The Pillar mark (copy_card; in The Pillar's blind
+    # only a mark from before the blind, see above).
     c0 = jnp.clip(res.cards[0], 0, MAX_DECK_SIZE - 1)
+    c0_mark = pre.card_played_ante[c0] | ~pillar
 
     def dna_copy(k, s):
         return add_card(s, pre.card_rank[c0], pre.card_suit[c0], out.dna_enh[k], pre.card_ed[c0],
-                        pre.card_seal[c0], pre.card_bonus[c0], to_hand=True, played=out.dna_mark[k])[0]
+                        pre.card_seal[c0], pre.card_bonus[c0], to_hand=True,
+                        played=out.dna_mark[k] & c0_mark)[0]
     played = jax.lax.fori_loop(0, out.dna_n, dna_copy, played)
     played = remove_jokers(played, out.expired)
 
