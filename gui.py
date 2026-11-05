@@ -66,7 +66,8 @@ from items import (CONS_NAMES, CONS_DESC, CONS_KIND, CONS_LO, CONS_HI, CK_TAROT,
                    PACK_KIND, PACK_CHOOSE, PK_ARCANA, PK_CELESTIAL, PK_STANDARD, PK_BUFFOON, PK_SPECTRAL,
                    ENH_NAMES, ED_NAMES, SEAL_NAMES, IK_JOKER, IK_TAROT, IK_CARD, N_HAND_TYPES, hand_chips_mult,
                    BOSS_NAMES, BOSS_DESC, TAG_NAMES, TAG_DESC, VOUCHER_NAMES, VOUCHER_DESC, VOUCHER_ID,
-                   BOSS_REROLL_COST)
+                   BOSS_REROLL_COST, STAKE_NAMES, STAKE_DESC, N_STAKES, STK_ETERNAL, STK_PERISH, STK_RENTAL,
+                   ST_NO_SMALL_REWARD)
 from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J_EMPTY,
                     MAX_JOKERS, rows_for, resolve, COMMON, UNCOMMON, RARE, LEGENDARY,
                     E_ADD_MULT, E_ADD_CHIPS, E_XMULT, E_ADD_MONEY, EFFECT_NAMES,
@@ -123,6 +124,9 @@ ENH_FACE  = {1: (205, 228, 250), 2: (250, 214, 210), 3: (240, 232, 250), 4: (215
              5: (196, 202, 208), 6: (128, 128, 132), 7: (246, 220, 140), 8: (214, 244, 214)}
 ENH_TAG   = {1: "+30", 2: "+4 Mult", 3: "Wild", 4: "Glass", 5: "Steel", 6: "Stone", 7: "Gold", 8: "Lucky"}
 ED_EDGE   = {1: (120, 170, 255), 2: (255, 120, 170), 3: (255, 200, 60), 4: (40, 40, 40)}
+STICKER_C = {STK_ETERNAL: (190, 120, 255), STK_PERISH: (90, 200, 230), STK_RENTAL: (240, 190, 60)}
+STAKE_C   = [(225, 225, 225), (230, 70, 70), (70, 190, 110), (60, 60, 70), (70, 120, 230), (160, 80, 200),
+             (240, 140, 50), (240, 200, 60)]
 SEAL_C    = {1: (243, 185, 68), 2: (230, 60, 60), 3: (60, 120, 230), 4: (150, 80, 200)}
 
 
@@ -151,6 +155,19 @@ def joker_text(jid, h, slot=None):
             .replace("{mail}", RANK_WORD[int(h.mail_rank)])
             .replace("{idol}", f"{RANK_WORD[idol % 13]} of {SUIT_WORD[idol // 13]}s")
             .replace("{todo}", todo))
+
+
+def sticker_words(st, left=None):
+    """[(word, color)] of a joker's stake stickers; left: a held Perishable joker's rounds left."""
+    st, out = int(st), []
+    if st & STK_ETERNAL:
+        out.append(("Eternal", STICKER_C[STK_ETERNAL]))
+    if st & STK_PERISH:
+        out.append(("Perishable" if left is None else f"Perish {int(left)}" if left > 0 else "Perished",
+                    STICKER_C[STK_PERISH]))
+    if st & STK_RENTAL:
+        out.append(("Rental", STICKER_C[STK_RENTAL]))
+    return out
 
 
 def effect_label(jid, v, h=None, slot=None):
@@ -494,7 +511,7 @@ class Dropdown:
 # the test menu: one sub menu per kind of test
 # ---------------------------------------------------------------------------
 TEST_CATS = ["Jokers", "Enhancements", "Editions", "Seals", "Tarots", "Planets", "Spectrals", "Vouchers",
-             "Packs", "Tags", "Bosses", "Rules"]
+             "Packs", "Tags", "Bosses", "Stakes", "Rules"]
 
 
 def test_place(sc):
@@ -540,6 +557,7 @@ class App:
         self.fonts = Fonts()
         self.clock = pygame.time.Clock()
         self.seed = seed
+        self.stake = 1                 # 1 White .. 8 Gold (K: the next stake, a new run)
         self.log = []
         self.show_deck = False
         self.seed_edit = None          # the typed digits while the seed box is open
@@ -579,15 +597,15 @@ class App:
 
     def new_run(self, seed):
         self.seed = seed
-        self.state = reset(jax.random.key(seed), 52, 8, self.scale)
+        self.state = reset(jax.random.key(seed), 52, 8, self.scale, self.stake)
         self.selected = set()          # lanes
         self.joker_sel = None          # joker slot
         self.cons_sel = None           # consumable slot
         self.last_play = None          # (PlayResult on host, cards, pre-state hands)
         self.cashout = None            # breakdown text
         self.refresh()
-        self.say(f"New run, seed {seed}, target scale {self.scale:g}. Choose a blind: "
-                 f"the {BLIND_NAMES[0]} needs {self.targets[0]:,} chips.")
+        self.say(f"New run, seed {seed}, {STAKE_NAMES[self.stake - 1]}, target scale {self.scale:g}. Choose a "
+                 f"blind: the {BLIND_NAMES[0]} needs {self.targets[0]:,} chips.")
 
     def refresh(self):
         self.h = host(self.state)
@@ -596,8 +614,8 @@ class App:
         self.reroll = int(reroll_price(self.state))
         h, st = self.h, self.state
         # the blind select's targets and rewards; the shop's prices; the boss's debuffs
-        self.targets = [int(blind_target(st.ante, i, st.target_scale, st.boss)) for i in range(3)]
-        self.rewards = [int(blind_dollars(i, st.boss)) for i in range(3)]
+        self.targets = [int(blind_target(st.ante, i, st.target_scale, st.boss, stake=st.stake)) for i in range(3)]
+        self.rewards = [int(blind_dollars(i, st.boss, st.stake)) for i in range(3)]
         self.prices = [int(shop_item_cost(st, i)) for i in range(len(h.shop_slots))]
         self.pack_prices = [int(pack_cost(st, h.pack_slots[i], h.pack_free[i])) for i in range(len(h.pack_slots))]
         self.v_price = int(voucher_cost(st))
@@ -728,7 +746,7 @@ class App:
         if int(pre.game_stage) == STAGE_BLIND and int(h.game_stage) in (STAGE_SHOP, STAGE_WON):
             res = self.last_play[0] if self.last_play is not None and verb == V_PLAY else None
             beaten = res is not None and int(pre.chips_scored) + int(res.score) >= int(pre.blind_target)
-            blind = int(blind_dollars(pre.blind_index, pre.boss)) if beaten else 0
+            blind = int(blind_dollars(pre.blind_index, pre.boss, pre.stake)) if beaten else 0
             hands = int(h.hands)
             rest = int(h.last_cashout) - blind - hands
             self.cashout = (f"Cash out ${int(h.last_cashout)}:  blind ${blind}  +  "
@@ -1032,11 +1050,10 @@ class App:
             i = a - A_BUY
             if int(h.shop_slots[i]) < 0:
                 return action_name(a)
-            cost = int(item_cost(self.state, h.shop_kind[i], h.shop_slots[i], h.shop_ed[i]))
-            return f"BUY {self.item_name(h, i)} (${cost})"
+            return f"BUY {self.item_name(h, i)} (${self.prices[i]})"
         if A_OPEN <= a < A_USE:
             pid = int(h.pack_slots[a - A_OPEN])
-            return f"OPEN {PACK_NAMES[pid]} (${int(pack_cost(self.state, pid))})" if pid >= 0 else action_name(a)
+            return f"OPEN {PACK_NAMES[pid]} (${self.pack_prices[a - A_OPEN]})" if pid >= 0 else action_name(a)
         if A_USE <= a < A_SELL_CONS:
             cid = int(h.consumables[a - A_USE])
             return f"USE {CONS_NAMES[cid]}" if cid >= 0 else action_name(a)
@@ -1201,6 +1218,8 @@ class App:
         b["deck"] = Button((1150, 710, 116, 36), "Deck (V)", PANEL_HI)
         b["levels"] = Button((928, 716, 86, 30), "Levels", AI_C if self.show_levels else PANEL_HI)
         b["tests"] = Button((716, 716, 104, 30), "Tests (T)", AI_C if self.test_mode else PANEL_HI)
+        b["stake"] = Button((824, 716, 100, 30), STAKE_NAMES[self.stake - 1].split()[0] + " (K)", PANEL_HI,
+                            not self.test_mode)
         b["model"] = Button((1020, 710, 120, 36), "Model (P)", AI_C if self.show_model else PANEL_HI,
                             not self.test_mode)
         if self.test_mode:
@@ -1324,6 +1343,8 @@ class App:
             self.new_run(int.from_bytes(os.urandom(4), "little") >> 1)
         elif name == "dev_money":
             self.give_money(10)
+        elif name == "stake":
+            self.next_stake()
         elif name == "deck":
             self.show_deck = True
         elif name == "model":
@@ -1349,6 +1370,12 @@ class App:
             self.refresh()
         elif name == "ai_odds":
             self.ai_odds = not self.ai_odds
+
+    def next_stake(self):
+        """The next stake (Gold goes back to White): a new run with the same seed."""
+        self.stake = self.stake % N_STAKES + 1
+        self.new_run(self.seed)
+        self.say(f"{STAKE_NAMES[self.stake - 1]}: {STAKE_DESC[self.stake - 1]}.")
 
     def toggle(self, lane):
         if lane in self.selected:
@@ -1412,6 +1439,8 @@ class App:
             if 0 <= k2 < n:
                 self.move_joker(self.joker_sel, k2)
             return
+        if k == pygame.K_k and not self.test_mode:
+            return self.next_stake()
         if k == pygame.K_n:
             self.new_run(self.seed + 1)
         elif stage == STAGE_SELECT:
@@ -1547,6 +1576,9 @@ class App:
         y += 20
         # the boss of this ante, the held tags, the redeemed vouchers
         info = []
+        st = int(h.stake)
+        if st > 1:
+            info.append((f"{STAKE_NAMES[st - 1]}: {STAKE_DESC[st - 1]}, and the stakes below", STAKE_C[st - 1]))
         if int(h.boss) >= 0:
             off = " (disabled)" if bool(h.boss_disabled) and stage == STAGE_BLIND and bi == BLIND_BOSS else ""
             info.append((f"Boss: {BOSS_NAMES[int(h.boss)]}{off}: {BOSS_DESC[int(h.boss)]}", BLIND_C[2]))
@@ -1594,6 +1626,9 @@ class App:
                 pygame.draw.rect(s, ED_EDGE[ed], r.inflate(-6, -6), 2, border_radius=8)
                 text(s, f.small, clip(f.small, ED_NAMES[ed], r.w - 8), ED_EDGE[ed] if ed != 4 else DIM,
                      (r.centerx, r.bottom - 48), "midtop")
+            stk = sticker_words(h.joker_sticker[i], h.joker_perish[i])
+            if stk:
+                self.draw_stickers(r, stk, r.bottom - (64 if ed else 48))
             text(s, fit(f, name, r.w - 10), name, TEXT, (r.centerx, r.y + 8), "midtop")
             yy = r.y + 36
             for line in wrap(f.small, joker_text(jid, h, i), r.w - 14)[:4]:
@@ -1603,11 +1638,27 @@ class App:
             if bool(h.joker_debuff[i]):                     # Crimson Heart
                 self.mark_debuffed(r)
                 label, col = "disabled", DEBUFF_C
+            elif int(h.joker_sticker[i]) & STK_PERISH and int(h.joker_perish[i]) <= 0:
+                self.mark_debuffed(r)                       # Perishable: debuffed for good
+                label, col = "perished", DEBUFF_C
             if f.bold.size(f"now {label}")[0] <= r.w - 4:
                 text(s, f.bold, f"now {label}", col, (r.centerx, r.bottom - 30), "midtop")
             else:                                           # a narrow card: the label alone, 2 lines
                 for k, line in enumerate(wrap(f.small, label, r.w - 4)[:2]):
                     text(s, f.small, clip(f.small, line, r.w - 4), col, (r.centerx, r.bottom - 31 + 14 * k), "midtop")
+
+    def draw_stickers(self, r, words, y):
+        """A joker's stake stickers, one line across the card (each word in its color)."""
+        f = self.fonts
+        widths = [f.small.size(w)[0] for w, _ in words]
+        gap = 6
+        while sum(widths) + gap * (len(words) - 1) > r.w - 8 and any(len(w) > 4 for w, _ in words):
+            words = [(w[:max(len(w) - 1, 4)], c) for w, c in words]       # a narrow card: shorter words
+            widths = [f.small.size(w)[0] for w, _ in words]
+        x = r.centerx - (sum(widths) + gap * (len(words) - 1)) // 2
+        for (w, c), wd in zip(words, widths):
+            text(self.screen, f.small, w, c, (x, y))
+            x += wd + gap
 
     def draw_item(self, r, name, desc, edge, price=None, ok=True, ed=0, tag=None):
         """One shop / pack card: name, text, price."""
@@ -1642,6 +1693,9 @@ class App:
             if kind == IK_JOKER:
                 self.draw_item(r, JOKER_NAMES[it], joker_text(it, h), RARITY_C[int(JOKER_RARITY[it])],
                                cost, ok, ed, ED_NAMES[ed] if ed else None)
+                stk = sticker_words(h.shop_sticker[i])
+                if stk:
+                    self.draw_stickers(r, stk, r.bottom - 58)
             elif kind == IK_CARD:                            # Magic Trick: a playing card
                 box(s, r, PANEL_HI, 10, CARD_EDGE, 2)
                 cr = pygame.Rect(0, 0, 76, 106)
@@ -1704,7 +1758,9 @@ class App:
             text(s, f.small, state, AI_C if i == on else DIM, (r.centerx, r.y + 62), "midtop")
             text(s, f.small, "Score at least", DIM, (r.centerx, r.y + 86), "midtop")
             text(s, f.big, f"{self.targets[i]:,}", MULT_C, (r.centerx, r.y + 104), "midtop")
-            text(s, f.body, f"Reward ${self.rewards[i]}", MONEY_C, (r.centerx, r.y + 144), "midtop")
+            no_reward = i == 0 and int(h.stake) >= ST_NO_SMALL_REWARD
+            text(s, f.body, "No reward" if no_reward else f"Reward ${self.rewards[i]}", DIM if no_reward else MONEY_C,
+                 (r.centerx, r.y + 144), "midtop")
             yy = r.y + 180
             if on <= i < BLIND_BOSS:                     # a blind not played yet: Skip takes its tag
                 tname, tdesc = tag_text(h, i)
@@ -1752,6 +1808,9 @@ class App:
                 ed = int(h.pack_ed[i])
                 self.draw_item(r, JOKER_NAMES[it], joker_text(it, h), RARITY_C[int(JOKER_RARITY[it])],
                                ed=ed, tag=ED_NAMES[ed] if ed else None)
+                stk = sticker_words(h.pack_sticker[i])
+                if stk:
+                    self.draw_stickers(r, stk, r.bottom - 24)
             else:
                 self.draw_item(r, CONS_NAMES[it], CONS_DESC[it], cons_color(it))
 

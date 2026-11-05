@@ -815,6 +815,18 @@ JOKER_DESC  = [d.desc for d in TABLE]   # display only (gui.py)
 JOKER_ID    = {name: i for i, name in enumerate(JOKER_NAMES)}
 N_JOKERS    = len(TABLE)
 
+# The stake stickers (game.lua P_CENTERS eternal_compat / perishable_compat = false): these jokers
+# are never Eternal (they go away by themselves, or a sale is their ability) or Perishable (they
+# grow over the run). Every other joker can be both.
+NOT_ETERNAL = ("Gros Michel", "Ice Cream", "Cavendish", "Luchador", "Turtle Bean", "Diet Cola", "Popcorn",
+               "Ramen", "Seltzer", "Mr. Bones", "Invisible Joker")
+NOT_PERISHABLE = ("Ceremonial Dagger", "Ride the Bus", "Runner", "Constellation", "Green Joker", "Red Card",
+                  "Madness", "Square Joker", "Vampire", "Hologram", "Rocket", "Obelisk", "Lucky Cat",
+                  "Flash Card", "Spare Trousers", "Castle", "Glass Joker", "Wee Joker")
+assert all(n in JOKER_ID for n in NOT_ETERNAL + NOT_PERISHABLE)
+JOKER_ETERNAL_OK = jnp.array([n not in NOT_ETERNAL for n in JOKER_NAMES])
+JOKER_PERISH_OK  = jnp.array([n not in NOT_PERISHABLE for n in JOKER_NAMES])
+
 J_EMPTY = -1
 MAX_JOKERS = 32
 

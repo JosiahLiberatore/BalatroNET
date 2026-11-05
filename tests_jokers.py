@@ -47,7 +47,8 @@ from items import (CONS_NAMES, CONS_ID, CONS_KIND, CONS_USE, CONS_PARAM, CONS_LO
                    U_ECTOPLASM, U_IMMOLATE, U_ANKH, U_HEX, U_CRYPTID, U_SOUL, U_BLACK_HOLE,
                    PACK_NAMES, PACK_KIND, PACK_SIZE, PACK_CHOOSE, PACK_COST, PK_ARCANA, PK_CELESTIAL,
                    PK_STANDARD, PK_BUFFOON, PK_SPECTRAL, PLANET_OF_HAND, ED_COST, IK_JOKER, IK_PLANET,
-                   IK_TAROT, IK_CARD, N_HAND_TYPES, BOSS_NAMES, TAG_NAMES, VOUCHER_NAMES)
+                   IK_TAROT, IK_CARD, N_HAND_TYPES, BOSS_NAMES, TAG_NAMES, VOUCHER_NAMES,
+                   STK_ETERNAL, STK_PERISH, STK_RENTAL)
 from jokers import TABLE, JOKER_NAMES, JOKER_ID, JOKERS, JOKER_COST, JOKER_RARITY, MAX_JOKERS, N_JOKERS
 from scoring import HAND_NAMES
 from fixtures import state, select, cards as card_ids
@@ -172,7 +173,7 @@ def _deaths(c, tag, J, q):
         if k < len(got) and got[k] == x["name"]:
             left.append(x)
             k += 1
-        elif x["name"] in ("Gros Michel", "Cavendish") and not x.get("deb"):
+        elif x["name"] in ("Gros Michel", "Cavendish") and (not x.get("deb") or x.get("fresh")):
             gros |= x["name"] == "Gros Michel"
         else:
             c.check(f"{tag}: {x['name']} left the loadout", False, got, [y["name"] for y in J])
@@ -213,8 +214,22 @@ def _sell_of(cost):
     return max(1, cost // 2)
 
 
-def joker_sell(name, ed, disc):
-    return _sell_of(R.cost(int(JOKER_COST[JOKER_ID[name]]) + int(ED_COST[ed]), disc))
+def joker_cost_ref(name, ed, disc, stk=0):
+    """set_cost: the joker's cost + its edition after the discount; a Rental joker $1."""
+    return 1 if stk & STK_RENTAL else R.cost(int(JOKER_COST[JOKER_ID[name]]) + int(ED_COST[ed]), disc)
+
+
+def joker_sell(name, ed, disc, stk=0):
+    return _sell_of(joker_cost_ref(name, ed, disc, stk))
+
+
+def _reprice_cons(w, astro_old, astro_new):
+    """Astronomer in or out: every held consumable's sell value follows its new cost (a
+    Negative Planet $1 <-> $4); the extra (Gift Card) stays."""
+    if astro_old != astro_new:
+        w.cons_sell = [s + _sell_of(cons_cost_ref(cid, e, w.disc, astro_new))
+                       - _sell_of(cons_cost_ref(cid, e, w.disc, astro_old))
+                       for cid, e, s in zip(w.cons, w.cons_ed, w.cons_sell)]
 
 
 def cons_cost_ref(cid, ed, disc, astro):
@@ -240,7 +255,7 @@ class Want:
              "free_rerolls", "reroll_cost", "last_hand", "last_cons", "tarots_used", "skips", "ante",
              "blind_index", "boss_hand", "unused_discards", "round_hand_bonus", "ecto_minus",
              "consumable_slots", "base_hand_size", "base_hands", "base_discards", "shop_size", "boss", "round",
-             "ox_hand", "boss_sub", "pack_return", "blind_target", "pack_id", "pack_left", "reroll_inc")
+             "ox_hand", "boss_sub", "pack_return", "blind_target", "pack_id", "pack_left", "reroll_inc", "stake")
         self.f = {f: int(getattr(p, f)) for f in F}
         self.f.update(gros_extinct=bool(p.gros_extinct), boss_disabled=bool(p.boss_disabled),
                       boss_rerolled=bool(p.boss_rerolled), reroll_d6=bool(p.reroll_d6))
@@ -369,11 +384,34 @@ def _sel(p, sel, cid):
     return lanes, _LO[cid] <= len(lanes) <= _HI[cid]
 
 
+def _perished(x):
+    """A Perishable joker after its last round (debuffed for good)."""
+    return bool(x.get("stk", 0) & STK_PERISH) and x.get("left", 0) <= 0
+
+
+def _eternal(x):
+    return bool(x.get("stk", 0) & STK_ETERNAL)
+
+
 def records(p):
-    """The held jokers as reference records, slot order (deb: Crimson Heart disabled it)."""
-    return [dict(name=NAME[int(j)], v=float(p.joker_value[i]), st=int(p.joker_state[i]),
-                 sell=int(p.joker_sell_value[i]), ed=int(p.joker_ed[i]), deb=bool(p.joker_debuff[i]))
-            for i, j in enumerate(p.jokers) if j >= 0]
+    """The held jokers as reference records, slot order. deb: it does not act (Crimson Heart
+    disabled it, or it perished); stk: its stickers (STK_*); left: a Perishable joker's rounds left."""
+    out = []
+    for i, j in enumerate(p.jokers):
+        if j >= 0:
+            x = dict(name=NAME[int(j)], v=float(p.joker_value[i]), st=int(p.joker_state[i]),
+                     sell=int(p.joker_sell_value[i]), ed=int(p.joker_ed[i]), stk=int(p.joker_sticker[i]),
+                     left=int(p.joker_perish[i]))
+            x["deb"] = bool(p.joker_debuff[i]) or _perished(x)
+            out.append(x)
+    return out
+
+
+def new_record(nm, v, st, ed, disc, stk=0):
+    """A joker as it enters: a shop / Buffoon pack one with its stickers (a Perishable one has
+    5 rounds), any other with none."""
+    return dict(name=nm, v=v, st=st, sell=joker_sell(nm, ed, disc, stk), ed=ed, deb=False, stk=stk,
+                left=R.PERISH_ROUNDS if stk & STK_PERISH else 0)
 
 
 def card_of(p, inst, boss=None, m=None):
@@ -400,8 +438,7 @@ def _new_joker(c, tag, w, J, q, k, rarity=None, extra=""):
     if rarity is not None:
         c.check(f"{tag}: the new joker's rarity{extra}", int(JOKER_RARITY[jid]) == rarity, nm, rarity)
     ed = int(q.joker_ed[k])
-    J.append(dict(name=nm, v=_seed(jid), st=int(q.joker_state[k]), sell=joker_sell(nm, ed, w.disc), ed=ed,
-                  deb=False))
+    J.append(new_record(nm, _seed(jid), int(q.joker_state[k]), ed, w.disc))
     w.f["free_rerolls"] += nm == "Chaos the Clown"
     w.f["discards"] += R.D_SIZE.get(nm, 0)
 
@@ -505,42 +542,55 @@ def _apply_cons(c, tag, p, q, J, w, cid, sel):
         for i in changed:
             c.check(f"{tag}: Wheel: from none to Foil / Holo / Poly", J[i]["ed"] == 0 and
                     int(q.joker_ed[i]) in (1, 2, 3), J[i]["ed"], int(q.joker_ed[i]))
-            J[i]["sell"] += joker_sell(J[i]["name"], int(q.joker_ed[i]), w.disc) - joker_sell(J[i]["name"], 0, w.disc)
+            J[i]["sell"] += (joker_sell(J[i]["name"], int(q.joker_ed[i]), w.disc, J[i]["stk"])
+                             - joker_sell(J[i]["name"], 0, w.disc, J[i]["stk"]))
             J[i]["ed"] = int(q.joker_ed[i])
     elif u == U_ECTOPLASM:
         hit = [i for i, x in enumerate(J) if x["ed"] == 0 and int(q.joker_ed[i]) == 4]
         c.eq(f"{tag}: Ectoplasm makes one editionless joker Negative", len(hit), 1)
         for i in hit:
-            J[i]["sell"] += joker_sell(J[i]["name"], 4, w.disc) - joker_sell(J[i]["name"], 0, w.disc)
+            J[i]["sell"] += joker_sell(J[i]["name"], 4, w.disc, J[i]["stk"]) - joker_sell(J[i]["name"], 0, w.disc, J[i]["stk"])
             J[i]["ed"] = 4
         w.f["base_hand_size"] -= w.f["ecto_minus"]
         w.f["ecto_minus"] += 1
     elif u in (U_HEX, U_ANKH):
+        # Hex: a random editionless joker turns Polychrome; Ankh: a random joker (an Eternal one
+        # too) is copied (copy_card: its stickers and rounds left too). Every other joker but the
+        # Eternal ones is destroyed. The env's pick is read from q: the choice whose survivors
+        # (slot order) are q's jokers.
         names = [NAME[int(j)] for j in q.jokers if j >= 0]
-        want_n = 1 if u == U_HEX else 2
-        c.check(f"{tag}: {CONS_NAMES[cid]} leaves {want_n} joker(s) of one kind",
-                len(names) == want_n and len(set(names)) == 1, names)
-        cand = [x for x in J if names and x["name"] == names[0] and (u == U_ANKH or x["ed"] == 0)]
+        surv = lambda x: [y for y in J if y is x or _eternal(y)]
+
+        def fits(x):
+            k = next(i for i, y in enumerate(surv(x)) if y is x)
+            return (abs(x["v"] - float(q.joker_value[k])) < 1e-4 and x["stk"] == int(q.joker_sticker[k])
+                    and x["left"] == int(q.joker_perish[k]) and (u == U_ANKH or int(q.joker_ed[k]) == 3))
+        cand = [x for x in J if (u == U_ANKH or x["ed"] == 0)
+                and [y["name"] for y in surv(x)] + ([x["name"]] if u == U_ANKH else []) == names]
         if len(cand) > 1:
-            cand = [x for x in cand if abs(x["v"] - float(q.joker_value[0])) < 1e-4] or cand
-        c.check(f"{tag}: {CONS_NAMES[cid]} keeps a held joker", bool(cand), names, [x["name"] for x in J])
+            cand = [x for x in cand if fits(x)] or cand
+        c.check(f"{tag}: {CONS_NAMES[cid]} keeps a held joker and the Eternal ones", bool(cand), names,
+                [x["name"] for x in J])
         if cand:
             x = cand[0]
             for y in J:
-                if y is not x:
+                if y is not x and not _eternal(y):
                     w.f["discards"] = max(w.f["discards"] - (0 if y.get("deb") else R.D_SIZE.get(y["name"], 0)), 0)
-                    w.f["free_rerolls"] = max(w.f["free_rerolls"] - (y["name"] == "Chaos the Clown"), 0)
+                    w.f["free_rerolls"] = max(w.f["free_rerolls"] - (y["name"] == "Chaos the Clown" and not _perished(y)), 0)
+            astro_old = "Astronomer" in R.acting_names(J)
             if u == U_HEX:
-                x["sell"] += joker_sell(x["name"], 3, w.disc) - joker_sell(x["name"], x["ed"], w.disc)
+                x["sell"] += joker_sell(x["name"], 3, w.disc, x["stk"]) - joker_sell(x["name"], x["ed"], w.disc, x["stk"])
                 x["ed"] = 3
-                J[:] = [x]
+                J[:] = surv(x)
             else:
                 ced = 0 if x["ed"] == 4 else x["ed"]
-                extra = x["sell"] - joker_sell(x["name"], x["ed"], w.disc)
-                cp = dict(x, ed=ced, sell=joker_sell(x["name"], ced, w.disc) + extra, deb=False)
-                w.f["free_rerolls"] += x["name"] == "Chaos the Clown"
-                w.f["discards"] += R.D_SIZE.get(x["name"], 0)
-                J[:] = [x, cp]
+                extra = x["sell"] - joker_sell(x["name"], x["ed"], w.disc, x["stk"])
+                cp = dict(x, ed=ced, sell=joker_sell(x["name"], ced, w.disc, x["stk"]) + extra, deb=_perished(x))
+                if not _perished(x):            # a perished copy adds nothing (env.copy_joker)
+                    w.f["free_rerolls"] += x["name"] == "Chaos the Clown"
+                    w.f["discards"] += R.D_SIZE.get(x["name"], 0)
+                J[:] = surv(x) + [cp]
+            _reprice_cons(w, astro_old, "Astronomer" in R.acting_names(J))
     elif u in (U_JUDGEMENT, U_WRAITH, U_SOUL):
         _new_joker(c, tag, w, J, q, len(J), {U_WRAITH: 3, U_SOUL: 4}.get(u), f" ({CONS_NAMES[cid]})")
         if u == U_WRAITH:
@@ -618,6 +668,15 @@ def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
                       & (w.cards["card_rank"] == R.NINE)).sum())
     g["discards"] = max(w.f["discards"], 0)
     J = _drop(J, R.ref_end_of_round(J, g))
+    # calculate_perishable (after each joker's end-of-round effect): one round less; at 0 it is
+    # debuffed for good, before the cash out ($, To the Moon) reads the jokers
+    astro_old = "Astronomer" in R.acting_names(J)
+    for x in J:
+        if x["stk"] & STK_PERISH and x["left"] > 0:
+            x["left"] -= 1
+            if x["left"] == 0:
+                x["deb"] = x["fresh"] = True              # fresh: it still rolled its own end of round
+    _reprice_cons(w, astro_old, "Astronomer" in R.acting_names(J))
     money = w.f["money"]
     v = w.vouchers
     rate = 1 + sum(x["name"] == "To the Moon" for x in J if not x.get("deb"))
@@ -628,7 +687,7 @@ def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
     if invest:
         w.tags = [(t, h) for t, h in w.tags if t != "Investment Tag"]
     boss = BOSS_NAMES[int(p.boss)] if int(p.boss) >= 0 else None
-    pay = 0 if saved else (R.BOSSES[boss][2] if is_boss and boss else 5 if is_boss else R.BLIND_PAY[int(p.blind_index)])
+    pay = 0 if saved else R.blind_pay(int(p.blind_index), boss if is_boss else None, int(p.stake))
     cashout = pay + w.f["hands"] + interest + int(R.ref_dollar_bonus(J, g)) + 25 * invest
     won = is_boss and int(p.ante) >= R.WIN_ANTE
     w.f.update(money=money + cashout, last_cashout=cashout, game_stage=STAGE_WON if won else STAGE_SHOP,
@@ -649,7 +708,7 @@ def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
     else:
         w.f["blind_index"] += 1
     for x in J:
-        x["deb"] = False
+        x["deb"] = _perished(x)                           # Crimson Heart lets go; a perished one stays
     return J, cashout
 
 
@@ -707,8 +766,11 @@ def _check_shop(c, tag, q, w, fresh=True):
                         bool(w.vouchers & {"Magic Trick", "Illusion"}), w.vouchers)
             if kd == IK_JOKER and 0 <= it < N_JOKERS:
                 c.check(f"{tag}: shop slot {i}: no Legendary", int(JOKER_RARITY[it]) != 4, NAME[it])
+            _check_stickers(c, f"{tag}: shop slot {i}", NAME[it] if kd == IK_JOKER and 0 <= it < N_JOKERS else None,
+                            int(q.shop_sticker[i]), w.f["stake"])
         else:
             c.check(f"{tag}: locked shop slot {i} empty", it == -1, it)
+            npeq(c, f"{tag}: locked shop slot {i}: no stickers", q.shop_sticker[i], 0)
     free = [i for i in range(size) if int(q.shop_slots[i]) >= 0 and bool(q.shop_free[i])]
     if not coupon:
         # an Uncommon / Rare Tag makes a free joker; an edition tag puts its edition on a joker
@@ -735,6 +797,17 @@ def _check_shop(c, tag, q, w, fresh=True):
                     and all(bool(q.pack_free[i]) for i in range(2) if int(q.pack_slots[i]) >= 0))
         want_r = 0 if used["D6 Tag"] else w.f["reroll_cost"]
         w.f.update(reroll_cost=want_r, reroll_d6=bool(used["D6 Tag"]))
+
+
+def _check_stickers(c, tag, name, stk, stake):
+    """A shop / pack card's stickers: only a joker has them, and they fit the joker and the stake
+    (ref_balatro.stickers_ok)."""
+    if name is None:
+        c.eq(f"{tag}: no stickers (not a joker)", stk, 0)
+    else:
+        c.check(f"{tag}: stickers fit {name} at stake {stake}",
+                0 <= stk < 8 and R.stickers_ok(name, stk & STK_ETERNAL, stk & STK_PERISH, stk & STK_RENTAL, stake),
+                stk)
 
 
 def _enter_select(c, tag, p, q, J, w):
@@ -818,6 +891,9 @@ def _check_pack(c, tag, p, q, w, J, pid):
     size = int(PACK_SIZE[pid])
     c.check(f"{tag}: OPEN: {size} cards", all(x >= 0 for x in items[:size]) and all(x < 0 for x in items[size:]), items)
     kind = _PKIND[pid]
+    for i in range(5):
+        _check_stickers(c, f"{tag}: OPEN: card {i}", NAME[items[i]] if kind == PK_BUFFOON and items[i] >= 0 else None,
+                        int(q.pack_sticker[i]), w.f["stake"])
     if kind in (PK_ARCANA, PK_CELESTIAL, PK_SPECTRAL):
         ok_kind = {PK_ARCANA: {CK_TAROT} | ({CK_SPECTRAL} if "Omen Globe" in w.vouchers else set()),
                    PK_CELESTIAL: {CK_PLANET}, PK_SPECTRAL: {CK_SPECTRAL}}[kind]
@@ -854,9 +930,10 @@ def _disable(c, tag, p, w, J):
         w.f["discards"] += w.f["boss_sub"]
     if boss == "The Needle":
         w.f["hands"] += w.f["boss_sub"]
-    w.f["blind_target"] = R.blind_chips(int(p.ante), 2, boss, float(p.target_scale), disabled=True)
+    w.f["blind_target"] = R.blind_chips(int(p.ante), 2, boss, float(p.target_scale), disabled=True,
+                                        stake=int(p.stake))
     for x in J:
-        if x.get("deb"):
+        if x.get("deb") and not _perished(x):
             w.f["discards"] += R.D_SIZE.get(x["name"], 0)
             x["deb"] = False
     w.f["boss_disabled"] = True
@@ -867,7 +944,8 @@ def _blind_start(c, tag, p, q, J, w):
     is_boss = int(p.blind_index) == BLIND_BOSS
     boss = BOSS_NAMES[int(p.boss)] if is_boss and int(p.boss) >= 0 else None
     w.f.update(game_stage=STAGE_BLIND, round=w.f["round"] + 1, chips_scored=0, boss_disabled=False, boss_hand=-1,
-               blind_target=R.blind_chips(int(p.ante), int(p.blind_index), boss, float(p.target_scale)),
+               blind_target=R.blind_chips(int(p.ante), int(p.blind_index), boss, float(p.target_scale),
+                                          stake=int(p.stake)),
                discards_used=0)
     hs, hc, dc, js = R.ref_budget(J, w.f["base_hand_size"], w.f["base_hands"], w.f["base_discards"])
     w.f["hands"], w.f["discards"] = hc, dc
@@ -889,7 +967,7 @@ def _blind_start(c, tag, p, q, J, w):
         n = names[t]
         if x["name"] == "Madness" and not is_boss:
             x["v"] += 0.5
-            victims = [k for k in range(len(J)) if k != i and k not in sliced]
+            victims = [k for k in range(len(J)) if k != i and k not in sliced and not _eternal(J[k])]
             if victims:
                 gone_names = Counter(names) - Counter(NAME[int(j)] for j in q.jokers if j >= 0)
                 vic = [k for k in victims if gone_names[names[k]] > 0]
@@ -904,7 +982,7 @@ def _blind_start(c, tag, p, q, J, w):
             buffer += make
         if n == "Cartomancer":
             carto += 1
-        if x["name"] == "Ceremonial Dagger" and i + 1 < len(J) and i + 1 not in sliced:
+        if x["name"] == "Ceremonial Dagger" and i + 1 < len(J) and i + 1 not in sliced and not _eternal(J[i + 1]):
             sliced.add(i + 1)
             x["v"] += 2 * J[i + 1]["sell"]
             buffer -= 1
@@ -912,7 +990,7 @@ def _blind_start(c, tag, p, q, J, w):
             marble += 1
     for k in sorted(sliced, reverse=True):
         y = J.pop(k)
-        w.f["discards"] = max(w.f["discards"] - R.D_SIZE.get(y["name"], 0), 0)
+        w.f["discards"] = max(w.f["discards"] - (0 if y.get("deb") else R.D_SIZE.get(y["name"], 0)), 0)
     if burgle:
         w.f["discards"] = 0                            # Burglar: before a Riff-raff Drunkard's +1
     # Riff-raff's jokers (random Commons): read from q after the survivors
@@ -927,7 +1005,7 @@ def _blind_start(c, tag, p, q, J, w):
         w.new_cards.append((False, dict(card_enh=R.STONE, card_ed=0, card_seal=0)))
     _bump(J, "Hologram", 0.25 * k_m)
     w.f["hands"] += 3 * burgle
-    w.f["free_rerolls"] = sum(x["name"] == "Chaos the Clown" for x in J)
+    w.f["free_rerolls"] = sum(x["name"] == "Chaos the Clown" and not x.get("deb") for x in J)
     # Amber Acorn shuffles the jokers (read the order from q); Chicot disables the boss
     if boss == "Amber Acorn" and len(J) > 1:
         order = [NAME[int(j)] for j in q.jokers if j >= 0]
@@ -975,27 +1053,30 @@ def _check_draw_end(c, tag, q, J):
         c.check(f"{tag}: Cerulean Bell: the forced card is in hand", int(q.forced_card) in held, int(q.forced_card))
     deb = [bool(x) for x in q.joker_debuff[:len(J)]]
     if boss == "Crimson Heart" and J:
-        c.eq(f"{tag}: Crimson Heart: one joker disabled", sum(deb), 1)
+        # one joker, or none when no joker can be picked (the only ones left perished)
+        c.eq(f"{tag}: Crimson Heart: the disabled jokers", sum(deb), sum(1 for x in J if x.get("deb") and not _perished(x)))
     elif boss != "Crimson Heart":
         c.check(f"{tag}: no joker disabled", not any(bool(x) for x in q.joker_debuff), q.joker_debuff[:8])
 
 
 def _heart_pick(c, tag, p, q, J, w):
-    """Crimson Heart after the first draw / a PLAY: a random joker (not the one before, if
-    there are 2 or more), read from q; its discards go with it."""
+    """Crimson Heart after the first draw / a PLAY: a random joker that is not debuffed (not the
+    one before, nor a perished one; with one joker: that one, but a perished one stays as it is),
+    read from q; its discards go with it."""
     if boss_on(q) != "Crimson Heart" or not J:
         return 0
     new = [k for k in range(len(J)) if bool(q.joker_debuff[k])]
-    c.eq(f"{tag}: Crimson Heart: one joker disabled", len(new), 1)
-    old = [k for k, x in enumerate(J) if x.get("deb")]
-    if len(J) >= 2 and old and new:
-        c.check(f"{tag}: Crimson Heart: not the same joker again", new[0] not in old, new, old)
+    old = [k for k, x in enumerate(J) if x.get("deb") and not _perished(x)]
+    cand = [k for k, x in enumerate(J) if not _perished(x) and (len(J) < 2 or not x.get("deb"))]
+    c.eq(f"{tag}: Crimson Heart: one joker disabled", len(new), 1 if cand else 0)
+    c.check(f"{tag}: Crimson Heart: not the same joker again, nor a perished one", all(k in cand for k in new),
+            new, cand)
     back = sum(R.D_SIZE.get(J[k]["name"], 0) for k in old) - sum(R.D_SIZE.get(J[k]["name"], 0) for k in new)
     w.f["discards"] = max(w.f["discards"] + back, 0)
     h = lambda x: R.H_SIZE.get(x["name"], 0) + (int(x["v"]) if x["name"] == "Turtle Bean" else 0)
     grow = max(sum(h(J[k]) for k in old), 0) + max(-sum(h(J[k]) for k in new), 0)
     for k, x in enumerate(J):
-        x["deb"] = k in new
+        x["deb"] = k in new or _perished(x)
     return grow
 
 
@@ -1158,8 +1239,9 @@ def check_step(c, tag, p, a, q, reward, out=None):
         kind = int(p.shop_kind[t]) if 0 <= t < MAX_SHOP_SLOTS else 0
         ed = int(p.shop_ed[t]) if 0 <= t < MAX_SHOP_SLOTS else 0
         astro = "Astronomer" in R.acting_names(J)
+        stk = int(p.shop_sticker[t]) if 0 <= t < MAX_SHOP_SLOTS else 0
         if kind == IK_JOKER:
-            cost = R.cost(int(JOKER_COST[item]) + int(ED_COST[ed]), w.disc) if item >= 0 else 0
+            cost = joker_cost_ref(NAME[item], ed, w.disc, stk) if item >= 0 else 0
             room = n < int(p.joker_slots) + (ed == 4 and int(p.joker_slots) < R.SLOT_CAP)
         elif kind == IK_CARD:
             cost = R.cost(1 + int(ED_COST[ed]), w.disc)
@@ -1174,8 +1256,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
             if kind == IK_JOKER:
                 nm = NAME[item]
                 st = int(sum(p.hand_played)) if nm == "Loyalty Card" else 0
-                J.append(dict(name=nm, v=float(R.SEED.get(nm, JOKERS.VALUE[item])), st=st,
-                              sell=joker_sell(nm, ed, w.disc), ed=ed, deb=False))
+                J.append(new_record(nm, float(R.SEED.get(nm, JOKERS.VALUE[item])), st, ed, w.disc, stk))
                 if nm == "To Do List":
                     observe_state = {len(J) - 1}
                 w.f.update(free_rerolls=int(p.free_rerolls) + (nm == "Chaos the Clown"),
@@ -1188,6 +1269,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
                 w.give(item, astro)
             w.f["money"] = int(p.money) - cost
             npeq(c, f"{tag}: BUY empties the shop slot", q.shop_slots[t], -1)
+            npeq(c, f"{tag}: BUY: the slot's stickers go with the card", q.shop_sticker[t], 0)
     elif verb == V_REDEEM:
         v = int(p.shop_vouchers[t]) if 0 <= t < 4 else -1
         cost = R.cost(10, w.disc)
@@ -1214,7 +1296,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
                 w.f["base_hands" if vn == "Hieroglyph" else "base_discards"] -= 1
             if w.disc != old_disc:
                 for x in J:
-                    x["sell"] += joker_sell(x["name"], x["ed"], w.disc) - joker_sell(x["name"], x["ed"], old_disc)
+                    x["sell"] += joker_sell(x["name"], x["ed"], w.disc, x["stk"]) - joker_sell(x["name"], x["ed"], old_disc, x["stk"])
                 astro = "Astronomer" in R.acting_names(J)
                 w.cons_sell = [s + _sell_of(cons_cost_ref(cid, e, w.disc, astro))
                                - _sell_of(cons_cost_ref(cid, e, old_disc, astro))
@@ -1222,7 +1304,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
             npeq(c, f"{tag}: REDEEM: the voucher leaves the shop", q.shop_vouchers[t], -1)
             npeq(c, f"{tag}: REDEEM: no ante voucher after a redeem", q.ante_voucher, -1)
     elif verb == V_SELL:
-        if 0 <= t < MAX_JOKERS and int(p.jokers[t]) >= 0:
+        if 0 <= t < MAX_JOKERS and int(p.jokers[t]) >= 0 and not _eternal(J[t]):     # can_sell_card
             x0 = J[t]
             nm = x0["name"]
             for i, x in enumerate(J):
@@ -1245,15 +1327,22 @@ def check_step(c, tag, p, a, q, reward, out=None):
                             dup, [y["name"] for y in J])
             if not x0.get("deb"):
                 w.f["discards"] = max(w.f["discards"] - R.D_SIZE.get(nm, 0), 0)
-            w.f["free_rerolls"] = max(w.f["free_rerolls"] - (nm == "Chaos the Clown"), 0)
+            w.f["free_rerolls"] = max(w.f["free_rerolls"] - (nm == "Chaos the Clown" and not _perished(x0)), 0)
+            astro_old = "Astronomer" in R.acting_names(J)
             J = _drop(J, {t})
             if dup is not None:
-                src = [y for y in J if y["name"] == dup][0]
+                # the copy (copy_card): the stickers and rounds left too; read which one from q
+                src_c = [y for y in J if y["name"] == dup]
+                k = len(J)
+                src = ([y for y in src_c if y["stk"] == int(q.joker_sticker[k]) and y["left"] == int(q.joker_perish[k])
+                        and abs(y["v"] - float(q.joker_value[k])) < 1e-4] or src_c)[0]
                 ced = 0 if src["ed"] == 4 else src["ed"]
-                extra = src["sell"] - joker_sell(dup, src["ed"], w.disc)
-                J.append(dict(src, ed=ced, sell=joker_sell(dup, ced, w.disc) + extra, deb=False))
-                w.f["free_rerolls"] += dup == "Chaos the Clown"
-                w.f["discards"] += R.D_SIZE.get(dup, 0)
+                extra = src["sell"] - joker_sell(dup, src["ed"], w.disc, src["stk"])
+                J.append(dict(src, ed=ced, sell=joker_sell(dup, ced, w.disc, src["stk"]) + extra, deb=_perished(src)))
+                if not _perished(src):                      # a perished copy adds nothing (env.copy_joker)
+                    w.f["free_rerolls"] += dup == "Chaos the Clown"
+                    w.f["discards"] += R.D_SIZE.get(dup, 0)
+            _reprice_cons(w, astro_old, "Astronomer" in R.acting_names(J))
             if boss == "Verdant Leaf":
                 _disable(c, tag, p, w, J)
             if w.f["boss_disabled"] and boss is not None and int(p.chips_scored) >= w.f["blind_target"]:
@@ -1361,8 +1450,8 @@ def check_step(c, tag, p, a, q, reward, out=None):
                 ed = int(p.pack_ed[t])
                 nm = NAME[item]
                 st = int(sum(p.hand_played)) if nm == "Loyalty Card" else 0
-                J.append(dict(name=nm, v=float(R.SEED.get(nm, JOKERS.VALUE[item])), st=st,
-                              sell=joker_sell(nm, ed, w.disc), ed=ed, deb=False))
+                J.append(new_record(nm, float(R.SEED.get(nm, JOKERS.VALUE[item])), st, ed, w.disc,
+                                    int(p.pack_sticker[t])))
                 if nm == "To Do List":
                     observe_state = {len(J) - 1}
                 w.f.update(free_rerolls=int(p.free_rerolls) + (nm == "Chaos the Clown"),
@@ -1412,7 +1501,10 @@ def check_step(c, tag, p, a, q, reward, out=None):
     npeq(c, f"{tag}: sell values", q.joker_sell_value, np.array([x["sell"] for x in J] + [0] * (MAX_JOKERS - k)))
     npeq(c, f"{tag}: joker states", q.joker_state, np.array([x["st"] for x in J] + [0] * (MAX_JOKERS - k)))
     npeq(c, f"{tag}: joker editions", q.joker_ed, np.array([x["ed"] for x in J] + [0] * (MAX_JOKERS - k)))
-    npeq(c, f"{tag}: joker debuffs", q.joker_debuff, np.array([bool(x.get("deb")) for x in J] + [False] * (MAX_JOKERS - k)))
+    npeq(c, f"{tag}: joker debuffs", q.joker_debuff,
+         np.array([bool(x.get("deb")) and not _perished(x) for x in J] + [False] * (MAX_JOKERS - k)))
+    npeq(c, f"{tag}: joker stickers", q.joker_sticker, np.array([x["stk"] for x in J] + [0] * (MAX_JOKERS - k)))
+    npeq(c, f"{tag}: Perishable rounds left", q.joker_perish, np.array([x["left"] for x in J] + [0] * (MAX_JOKERS - k)))
     manacle = _manacle(q)
     hs, hc, dc, js = R.ref_budget(J, w.f["base_hand_size"], w.f["base_hands"], w.f["base_discards"],
                                   w.f["round_hand_bonus"] - manacle, "Antimatter" in w.vouchers)
@@ -1474,10 +1566,13 @@ def _end_round(c, tag, p, q, J, w, held_cards, total, played=None):
     bones = [i for i, x in enumerate(J) if x["name"] == "Mr. Bones" and not x.get("deb")]
     saved = not beaten and bones and total >= 0.25 * w.f["blind_target"]
     if beaten or saved:
+        w.f["money"] -= R.RENTAL_RATE * sum(1 for x in J if x["stk"] & STK_RENTAL)   # calculate_rental
         if saved:
             J = _drop(J, {bones[0]})
         J, _ = _clear_round(c, tag, p, J, w, held_cards, bool(saved), played)
         J, gros = _deaths(c, tag, J, q)
+        for x in J:
+            x.pop("fresh", None)
         w.f["gros_extinct"] = bool(p.gros_extinct) or gros
         c.check(f"{tag}: the round targets are cards / suits",
                 0 <= int(q.idol_card) < 52 and 0 <= int(q.mail_rank) < 13
@@ -2431,15 +2526,19 @@ def _policy(p, rng):
     return int(rng.integers(0, N_VERBS)), sel, 0, 0         # LOST / WON: all no-ops
 
 
-_batch_reset = jax.jit(jax.vmap(lambda k: reset(k, 52, 8)))
+_batch_reset = jax.jit(jax.vmap(lambda k, stake: reset(k, 52, 8, 1.0, stake)))
 _batch_budget = jax.jit(jax.vmap(apply_budget))
 _PAIRS = [(VOUCHER_NAMES.index(a), VOUCHER_NAMES.index(b)) for a, b in R.VOUCHER_PAIRS]
 
 
 def _soak_batch(rng, key, n_envs):
-    """Fresh runs: 0-4 random starting jokers, some money, a mix of curriculum scales."""
-    batch = _batch_reset(jax.random.split(key, n_envs))
+    """Fresh runs: a random stake, 0-4 random starting jokers (with the stake's stickers; a
+    Perishable one 0-5 rounds left), some money, a mix of curriculum scales."""
+    stakes = rng.integers(1, 9, n_envs)
+    batch = _batch_reset(jax.random.split(key, n_envs), jnp.asarray(stakes, jnp.int32))
     J = np.full((n_envs, MAX_JOKERS), -1, np.int32)
+    STK = np.zeros((n_envs, MAX_JOKERS), np.int32)
+    LEFT = np.zeros((n_envs, MAX_JOKERS), np.int32)
     V = np.zeros((n_envs, MAX_JOKERS), np.float32)
     S = np.zeros((n_envs, MAX_JOKERS), np.int32)
     T = np.zeros((n_envs, MAX_JOKERS), np.int32)
@@ -2452,6 +2551,13 @@ def _soak_batch(rng, key, n_envs):
         for slot, j in enumerate(rng.integers(0, N_JOKERS, rng.integers(0, 5))):
             E[i, slot] = int(rng.integers(1, 4)) if rng.random() < 0.1 else 0
             cost = int(JOKER_COST[j]) + int(ED_COST[E[i, slot]])
+            u, st, nm = rng.random(), int(stakes[i]), NAME[j]
+            et = st >= 4 and u > 0.7 and nm not in R.NOT_ETERNAL
+            pe = st >= 7 and 0.4 < u <= 0.7 and nm not in R.NOT_PERISHABLE
+            re = st >= 8 and rng.random() > 0.7
+            STK[i, slot] = et * STK_ETERNAL + pe * STK_PERISH + re * STK_RENTAL
+            LEFT[i, slot] = int(rng.integers(0, 6)) if pe else 0
+            cost = 1 if re else cost
             J[i, slot], S[i, slot] = j, max(1, cost // 2)
             V[i, slot] = _seed(j)
             T[i, slot] = int(rng.integers(3, N_HAND_TYPES)) if NAME[j] == "To Do List" else 0
@@ -2479,10 +2585,16 @@ def _soak_batch(rng, key, n_envs):
         card_enh=jnp.asarray(enh), card_seal=jnp.asarray(seal), card_ed=jnp.asarray(ced),
         money=jnp.asarray(rng.integers(0, 30, n_envs), jnp.int32), target_scale=jnp.asarray(scale),
         blind_target=jnp.asarray(np.maximum(np.floor(100 * scale), 1), jnp.int32),
-        vouchers=jnp.asarray(VCH))
+        vouchers=jnp.asarray(VCH), joker_sticker=jnp.asarray(STK), joker_perish=jnp.asarray(LEFT))
     batch = _batch_budget(batch)
     # the first blind starts with the budget the jokers give
     return batch._replace(hands=batch.handcount, discards=batch.discardcount)
+
+
+def _n_perished(h):
+    """The held jokers of host state h that perished (Perishable, no round left)."""
+    return int((((np.asarray(h.joker_sticker) & STK_PERISH) > 0) & (np.asarray(h.joker_perish) == 0)
+                & (np.asarray(h.jokers) >= 0)).sum())
 
 
 def _swap_in(done, fresh, batch):
@@ -2537,6 +2649,17 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
                 stats["lost"] += 1
             if int(q.game_stage) == STAGE_WON and int(p.game_stage) != STAGE_WON:
                 stats["won"] += 1
+            # the stake stickers at work: an Eternal joker kept from a SELL, a joker that perished,
+            # a round end with a Rental joker held, a sticker bought or picked
+            if verb == V_SELL and 0 <= int(a_host.target[i]) < MAX_JOKERS and int(p.joker_sticker[int(a_host.target[i])]) & STK_ETERNAL \
+                    and int(p.jokers[int(a_host.target[i])]) >= 0:
+                stats["eternal kept"] += 1
+            stats["perished"] += _n_perished(q) > _n_perished(p)
+            if int(q.game_stage) in (STAGE_SHOP, STAGE_WON) and int(p.game_stage) == STAGE_BLIND \
+                    and (np.asarray(p.joker_sticker) & STK_RENTAL).any():
+                stats["rent paid"] += 1
+            if verb in (V_BUY, V_PICK) and (np.asarray(q.joker_sticker) != 0).sum() > (np.asarray(p.joker_sticker) != 0).sum():
+                stats["sticker joker in"] += 1
         done = np.isin(np.asarray(post.game_stage), (STAGE_LOST, STAGE_WON))
         if done.any():
             stats["max ante"] = max(stats["max ante"], int(np.asarray(post.ante)[done].max()))
@@ -2548,6 +2671,9 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
     print(f"  joker soak: jokers never held at a PLAY: {never or 'none'}")
     c.check("the soak cleared blinds", stats["clears"] > 0, stats["clears"])
     c.check("the soak bought jokers", stats["buy"] > 0, stats["buy"])
+    c.check("the soak met the stake stickers (Eternal SELL, perished, rent, a sticker joker in)",
+            min(stats["eternal kept"], stats["perished"], stats["rent paid"], stats["sticker joker in"]) > 0,
+            {k: stats[k] for k in ("eternal kept", "perished", "rent paid", "sticker joker in")})
     return c.done()
 
 

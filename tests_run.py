@@ -390,6 +390,16 @@ def run_targets_test():
     shop = state(hand="4C KD", game_stage=STAGE_SHOP, target_scale=0.1, blind_index=BLIND_BIG)
     got, _, _ = env_step(env_step(shop, act(V_NEXT))[0], act(V_NEXT))
     c.eq("NEXT uses the state's scale: big = 45", got.blind_target, 45)
+    # the stakes (get_blind_amount): scaling 2 from Green (stake 3), 3 from Purple (stake 6)
+    lua = {1: [300, 800, 2000, 5000, 11000, 20000, 35000, 50000],
+           2: [300, 900, 2600, 8000, 20000, 36000, 60000, 100000],
+           3: [300, 1000, 3200, 9000, 25000, 60000, 110000, 200000]}
+    for stake in range(1, 9):
+        row = lua[3 if stake >= 6 else 2 if stake >= 3 else 1]
+        c.eq(f"stake {stake}: the Small Blinds of antes 1-8", [int(blind_target(jnp.int32(a), 0, stake=stake))
+                                                               for a in range(1, 9)], row)
+        c.eq(f"stake {stake}: ante 0 = 100", blind_target(jnp.int32(0), 0, stake=stake), 100)
+        c.eq(f"stake {stake}: reset", reset(jax.random.key(0), 52, 8, 1.0, stake).blind_target, 300)
     return c.done()
 
 

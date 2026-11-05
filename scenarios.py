@@ -32,9 +32,9 @@ from items import (CONS_ID, CONS_NAMES, CONS_KIND, CK_TAROT, CK_PLANET, PACK_NAM
                    PACK_CHOOSE, PK_ARCANA, PK_CELESTIAL, PK_STANDARD, PK_BUFFOON, MAX_PACK, ENH_NAMES,
                    ED_NAMES, SEAL_NAMES, HAND_NAMES, N_HAND_TYPES, IK_JOKER, IK_PLANET, IK_TAROT, IK_CARD,
                    CK_SPECTRAL, PK_SPECTRAL, BOSS_NAMES, TAG_NAMES, VOUCHER_NAMES, BOSS_ID, TAG_ID, VOUCHER_ID,
-                   PACK_SIZE, hand_chips_mult)
+                   PACK_SIZE, hand_chips_mult, STAKE_NAMES, STICKER_NAMES)
 import ref_balatro as R
-from jokers import JOKER_NAMES, JOKER_ID, JOKER_RARITY
+from jokers import JOKER_NAMES, JOKER_ID, JOKER_RARITY, JOKER_ETERNAL_OK, JOKER_PERISH_OK
 from fixtures import state, card_id, lanes as pad
 
 H8 = "KD KC 2H 3S 4C 6D 7H 8S"      # a Pair of Kings to play; 2H 3S 4C 6D 7H 8S held
@@ -215,6 +215,10 @@ def _int(field):
     return property(lambda self: int(getattr(self.h, field)))
 
 
+def _stk_words(st):
+    return [w for b, w in STICKER_NAMES if int(st) & b]
+
+
 class View:
     """One host state, read by name."""
     money, hands, discards, hand_size, deck_size, joker_slots, last_cashout, reroll_cost, \
@@ -225,8 +229,21 @@ class View:
             "pack_left", "skips", "consumable_slots", "base_hand_size", "shop_size", "round",
             "unused_discards", "chips_scored", "ecto_minus", "base_hands", "base_discards"))
 
+    stake = _int("stake")
+
     def __init__(self, h):
         self.h = h
+
+    def jstk(self, i):
+        """The stake stickers of held joker i (Eternal, Perishable, Rental)."""
+        return _stk_words(self.h.joker_sticker[i])
+
+    def jleft(self, i):
+        """A Perishable joker's rounds left (0: perished)."""
+        return int(self.h.joker_perish[i])
+
+    def shop_stk(self, i):
+        return _stk_words(self.h.shop_sticker[i])
 
     @property
     def stage(self):
@@ -3096,8 +3113,267 @@ SELECT_RULES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# STAKES (game.lua start_run: a stake has every rule of the stakes below it) and the stickers
+# they put on shop and Buffoon pack jokers (common_events.lua create_card, card.lua)
+# ---------------------------------------------------------------------------
+def _run_at(stake):
+    from env import reset
+    return lambda: reset(jax.random.key(0), 52, 8, 1.0, stake)
+
+
+def _target(ante, blind_i, stake):
+    from env import blind_target
+    return int(blind_target(ante, blind_i, stake=stake))
+
+
+def _small_pay(stake):
+    from env import blind_dollars
+    return int(blind_dollars(0, -1, stake))
+
+
+def _sticker_shares(s, n=8000):
+    """Over n fresh shops of s: (the Eternal share of the jokers that can be Eternal, the
+    Perishable share of the ones that can be Perishable, the Rental share of all jokers, the
+    jokers with stickers they cannot have: Eternal and Perishable together, or one on a joker
+    that cannot take it)."""
+    keys = jax.random.split(jax.random.key(9), n)
+    roll = _shop_rolls(keys, s)
+    ids, kinds, stk = (np.asarray(x) for x in (roll.ids, roll.kinds, roll.stickers))
+    j = (kinds == IK_JOKER) & (ids >= 0)
+    return _shares(ids[j], stk[j])
+
+
+def _shares(ids, stk):
+    e_ok, p_ok = np.asarray(JOKER_ETERNAL_OK)[ids], np.asarray(JOKER_PERISH_OK)[ids]
+    e, p, rr = (stk & 1) > 0, (stk & 2) > 0, (stk & 4) > 0
+    bad = int((e & p).sum() + (e & ~e_ok).sum() + (p & ~p_ok).sum())
+    return round(float(e[e_ok].mean()), 3), round(float(p[p_ok].mean()), 3), round(float(rr.mean()), 3), bad
+
+
+_pack_full = jax.jit(jax.vmap(lambda k, s, pid: roll_pack_cards(k, s, pid), in_axes=(0, None, None)))
+
+
+def _pack_sticker_shares(s, pid, n=4000):
+    """_sticker_shares over the jokers of n Buffoon packs pid opened in state s."""
+    out = _pack_full(jax.random.split(jax.random.key(10), n), s, jnp.int32(pid))
+    k = int(PACK_SIZE[pid])
+    ids, stk = np.asarray(out[0])[:, :k].ravel(), np.asarray(out[6])[:, :k].ravel()
+    return _shares(ids, stk)
+
+
+STAKES = [
+    S("Stakes", "White Stake", "the base rules",
+      """White Stake: the base difficulty. A new run has 4 discards (the Red Deck), the Small
+      Blind pays $3, ante 2's Small Blind needs 800 chips and the ante 8 boss 100,000; no shop
+      joker has a sticker (8000 shops).""",
+      _run_at(1),
+      [],
+      [C("stake", lambda r: r[0].stake, 1), C("discards", lambda r: r[0].discards, 4),
+       C("Small Blind $", lambda r: _small_pay(1), 3), C("ante 2 Small Blind", lambda r: _target(2, 0, 1), 800),
+       C("ante 8 boss", lambda r: _target(8, 2, 1), 100000),
+       C("sticker shares (E, P, R, wrong)", lambda r: _sticker_shares(r.raw[0]), (0.0, 0.0, 0.0, 0))]),
+    S("Stakes", "Red Stake", "the Small Blind pays no reward money",
+      """Red Stake: the Small Blind gives no reward money (no_blind_reward.Small). Beat it with 2
+      hands left and $0: the cash out is $0 + $2 for the hands = $2 (White Stake: $5).""",
+      blind(clear=True, stake=2),
+      [play("KD KC")],
+      [C("cash out", lambda r: r[1].last_cashout, 2), C("money", lambda r: r[1].money, 2),
+       C("reward", lambda r: r.rewards[0], 2)]),
+    S("Stakes", "Red Stake", "the Big Blind still pays $4",
+      """Red Stake takes only the Small Blind's reward: the Big Blind pays $4 + $2 for the hands.""",
+      blind(clear=True, stake=2, blind_index=1),
+      [play("KD KC")],
+      [C("cash out", lambda r: r[1].last_cashout, 6)]),
+    S("Stakes", "Green Stake", "the required score scales faster",
+      """Green Stake: get_blind_amount with scaling 2: 300, 900, 2600, 8000, 20000, 36000, 60000,
+      100000 for antes 1 to 8. Ante 2's Small Blind needs 900 chips (White: 800), its Big Blind
+      1,350, the ante 8 boss 200,000.""",
+      select(ante=2, stake=3),
+      [play_blind()],
+      [C("ante 2 Small Blind", lambda r: r[1].blind_target, 900), C("ante 2 Big Blind", lambda r: _target(2, 1, 3), 1350),
+       C("ante 8 boss", lambda r: _target(8, 2, 3), 200000), C("ante 1 Small Blind", lambda r: _target(1, 0, 3), 300)]),
+    S("Stakes", "Black Stake + Eternal", "shop jokers can be Eternal",
+      """Black Stake: create_card makes a shop joker Eternal when its poll is above 0.7 (30 %), but
+      never one that cannot be (Gros Michel, Ice Cream, Cavendish, Luchador, Turtle Bean, Diet Cola,
+      Popcorn, Ramen, Seltzer, Mr. Bones, Invisible Joker: eternal_compat false). No Perishable or
+      Rental joker yet (8000 shops).""",
+      lambda: state(stake=4),
+      [],
+      [C("Eternal share", lambda r: _sticker_shares(r.raw[0])[0], Between(0.28, 0.32)),
+       C("Perishable share", lambda r: _sticker_shares(r.raw[0])[1], 0.0),
+       C("Rental share", lambda r: _sticker_shares(r.raw[0])[2], 0.0),
+       C("stickers a joker cannot have", lambda r: _sticker_shares(r.raw[0])[3], 0)]),
+    S("Stakes", "Eternal", "an Eternal joker cannot be sold",
+      """An Eternal joker can't be sold (can_sell_card): SELL does nothing, the joker and the money
+      stay.""",
+      shop(stake=4, jokers=("Joker",), joker_sticker=("E",)),
+      [sell(0)],
+      [C("jokers", lambda r: r[1].jokers, ["Joker"]), C("money", lambda r: r[1].money, 10),
+       C("changed fields", _changed, ())]),
+    S("Stakes", "Eternal + Madness", "Madness never destroys an Eternal joker",
+      """Madness destroys a random other joker that is not Eternal. Its only other joker is an
+      Eternal Bull: nothing is destroyed, Madness still gains X0.5 (X1 -> X1.5).""",
+      select(stake=4, jokers=("Madness", "Bull"), joker_sticker=("", "E")),
+      [play_blind()],
+      [C("jokers", lambda r: r[1].jokers, ["Madness", "Bull"]), C("X Mult", lambda r: r[1].jv(0), 1.5)]),
+    S("Stakes", "Eternal + Ceremonial Dagger", "Ceremonial Dagger never destroys an Eternal joker",
+      """Ceremonial Dagger destroys the joker to its right only when it is not Eternal: the
+      Eternal Bull stays and the Dagger gains no Mult.""",
+      select(stake=4, jokers=("Ceremonial Dagger", "Bull"), joker_sticker=("", "E")),
+      [play_blind()],
+      [C("jokers", lambda r: r[1].jokers, ["Ceremonial Dagger", "Bull"]), C("Mult", lambda r: r[1].jv(0), 0.0)]),
+    S("Stakes", "Eternal + Hex", "Hex keeps the Eternal jokers",
+      """Hex makes a random joker without an edition Polychrome and destroys the others, but not
+      an Eternal one. The Eternal Foil Joker cannot be picked (it has an edition): Bull turns
+      Polychrome and both stay.""",
+      blind(stake=4, consumables=("Hex",), jokers=("Joker", "Bull"), joker_ed=(1, 0), joker_sticker=("E", "")),
+      [use(0)],
+      [C("jokers", lambda r: r[1].jokers, ["Joker", "Bull"]), C("Bull's edition", lambda r: r[1].jed(1), "Polychrome"),
+       C("the Joker is still Eternal", lambda r: r[1].jstk(0), ["Eternal"])]),
+    S("Stakes", "Eternal + Ankh", "Ankh keeps the Eternal jokers, and can copy one",
+      """Ankh copies a random joker (an Eternal one too) and destroys the others but the Eternal
+      ones; the copy keeps the stickers (copy_card). Eternal Joker + Bull: Joker and its Eternal
+      copy, or the Joker, Bull and a copy of Bull.""",
+      blind(stake=4, consumables=("Ankh",), jokers=("Joker", "Bull"), joker_sticker=("E", "")),
+      [use(0)],
+      [C("jokers", lambda r: r[1].jokers, OneOf((["Joker", "Joker"], ["Joker", "Bull", "Bull"]))),
+       C("stickers", lambda r: [r[1].jstk(i) for i in range(len(r[1].jokers))],
+         OneOf(([["Eternal"], ["Eternal"]], [["Eternal"], [], []])))]),
+    S("Stakes", "Blue Stake", "-1 discard",
+      """Blue Stake: one discard less each round (starting_params.discards - 1): the Red Deck's 4
+      discards are 3.""",
+      _run_at(5),
+      [],
+      [C("discards", lambda r: r[0].discards, 3), C("discards per round", lambda r: int(r[0].h.discardcount), 3),
+       C("base discards", lambda r: r[0].base_discards, 3), C("hands", lambda r: r[0].hands, 4)]),
+    S("Stakes", "Purple Stake", "the required score scales faster again",
+      """Purple Stake: scaling 3: 300, 1000, 3200, 9000, 25000, 60000, 110000, 200000. Ante 2's
+      Small Blind needs 1,000 chips, the ante 8 boss 400,000.""",
+      select(ante=2, stake=6),
+      [play_blind()],
+      [C("ante 2 Small Blind", lambda r: r[1].blind_target, 1000), C("ante 5 Big Blind", lambda r: _target(5, 1, 6), 37500),
+       C("ante 8 boss", lambda r: _target(8, 2, 6), 400000)]),
+    S("Stakes", "Orange Stake + Perishable", "shop jokers can be Perishable",
+      """Orange Stake: the same poll makes a shop joker Perishable in 0.4 .. 0.7 (30 %), never one
+      that grows over the run (Ride the Bus, Runner, Constellation ...: perishable_compat false),
+      and never an Eternal one. Eternal stays 30 % (8000 shops).""",
+      lambda: state(stake=7),
+      [],
+      [C("Eternal share", lambda r: _sticker_shares(r.raw[0])[0], Between(0.28, 0.32)),
+       C("Perishable share", lambda r: _sticker_shares(r.raw[0])[1], Between(0.28, 0.32)),
+       C("Rental share", lambda r: _sticker_shares(r.raw[0])[2], 0.0),
+       C("stickers a joker cannot have", lambda r: _sticker_shares(r.raw[0])[3], 0)]),
+    S("Stakes", "Perishable", "one round less at each round end",
+      """calculate_perishable: a Perishable joker counts its rounds at the end of each round: 5
+      -> 4. It still acts (+4 Mult: 30 x 6 = 180).""",
+      blind(clear=True, stake=7, jokers=("Joker",), joker_sticker=("P",), joker_perish=(5,)),
+      [play("KD KC")],
+      [C("score", _score(), 180), C("rounds left", lambda r: r[1].jleft(0), 4), C("stage", lambda r: r[1].stage, "SHOP")]),
+    S("Stakes", "Perishable", "after its last round it is debuffed for good",
+      """With 1 round left the joker still acts in that round (30 x 6 = 180), then its count goes to
+      0 and it is debuffed (set_debuff) for the rest of the run.""",
+      blind(clear=True, stake=7, jokers=("Joker",), joker_sticker=("P",), joker_perish=(1,)),
+      [play("KD KC")],
+      [C("score", _score(), 180), C("rounds left", lambda r: r[1].jleft(0), 0),
+       C("stickers", lambda r: r[1].jstk(0), ["Perishable"]), C("jokers", lambda r: r[1].jokers, ["Joker"])]),
+    S("Stakes", "Perishable", "a perished joker does nothing",
+      """A perished Joker gives no +4 Mult: KD KC = 30 x 2 = 60.""",
+      blind(stake=7, jokers=("Joker",), joker_sticker=("P",), joker_perish=(0,)),
+      [play("KD KC")],
+      [C("score", _score(), 60)]),
+    S("Stakes", "Perishable + Juggler", "a perished Juggler takes its hand size",
+      """A joker that perishes leaves the deck's effects (remove_from_deck): a Juggler's +1 hand
+      size goes, 9 -> 8.""",
+      blind(clear=True, stake=7, jokers=("Juggler",), joker_sticker=("P",), joker_perish=(1,), hand_size=9,
+            deck_ptr=8),
+      [play("KD KC")],
+      [C("hand size", lambda r: r[1].hand_size, 8), C("rounds left", lambda r: r[1].jleft(0), 0)]),
+    S("Stakes", "Perishable + Golden Joker", "no cash-out money in the round it perishes",
+      """The joker perishes in end_round, before the cash out reads calculate_dollar_bonus: a
+      Golden Joker that perishes pays no $4. The Small Blind (Orange Stake: $0) with 2 hands left:
+      $2.""",
+      blind(clear=True, stake=7, jokers=("Golden Joker",), joker_sticker=("P",), joker_perish=(1,)),
+      [play("KD KC")],
+      [C("cash out", lambda r: r[1].last_cashout, 2)]),
+    S("Stakes", "Perishable + Golden Joker", "with a round left it still pays",
+      """With 2 rounds left the Golden Joker counts to 1 and pays its $4: $0 + $2 + $4 = $6.""",
+      blind(clear=True, stake=7, jokers=("Golden Joker",), joker_sticker=("P",), joker_perish=(2,)),
+      [play("KD KC")],
+      [C("cash out", lambda r: r[1].last_cashout, 6), C("rounds left", lambda r: r[1].jleft(0), 1)]),
+    S("Stakes", "Perishable + Negative", "a perished Negative joker keeps its slot",
+      """A debuffed Negative joker keeps its extra joker slot (queue_negative_removal: the slot goes
+      only when the card is removed): 6 slots before and after it perishes.""",
+      blind(clear=True, stake=7, jokers=("Joker",), joker_ed=(4,), joker_sticker=("P",), joker_perish=(1,)),
+      [play("KD KC")],
+      [C("joker slots", lambda r: r[1].joker_slots, 6), C("rounds left", lambda r: r[1].jleft(0), 0)]),
+    S("Stakes", "Perishable + Crimson Heart", "Crimson Heart never picks a perished joker",
+      """Crimson Heart picks a joker that is not debuffed: never the perished Joker. After the first
+      draw it is the Bull or the Banner; after a hand, the other one (not the same one again).""",
+      boss_select("Crimson Heart", stake=7, jokers=("Joker", "Bull", "Banner"), joker_sticker=("P", "", ""),
+                  joker_perish=(0, 0, 0)),
+      [play_blind(), play((0,))],
+      [C("the perished Joker is never disabled", lambda r: [r[1].jdeb(0), r[2].jdeb(0)], [False, False]),
+       C("one live joker disabled after the first draw", lambda r: r[1].jdeb(1) + r[1].jdeb(2), 1),
+       C("the other one after a hand", lambda r: [r[2].jdeb(1), r[2].jdeb(2)],
+         lambda r: [not r[1].jdeb(1), not r[1].jdeb(2)])]),
+    S("Stakes", "Gold Stake + Rental", "shop jokers can be Rental",
+      """Gold Stake: a second poll makes a shop joker Rental above 0.7 (30 %), any joker, with or
+      without the Eternal / Perishable sticker (8000 shops).""",
+      lambda: state(stake=8),
+      [],
+      [C("Eternal share", lambda r: _sticker_shares(r.raw[0])[0], Between(0.28, 0.32)),
+       C("Perishable share", lambda r: _sticker_shares(r.raw[0])[1], Between(0.28, 0.32)),
+       C("Rental share", lambda r: _sticker_shares(r.raw[0])[2], Between(0.28, 0.32)),
+       C("stickers a joker cannot have", lambda r: _sticker_shares(r.raw[0])[3], 0)]),
+    S("Stakes", "Rental", "a Rental joker costs $1 and sells for $1",
+      """set_cost: a Rental joker's cost is $1 (Blueprint: $10 -> $1), so its sell value is $1.""",
+      shop(stake=8, shop_slots=("Blueprint", "."), shop_sticker=("R",)),
+      [buy(0), sell(0)],
+      [C("price", lambda r: r[0].shop_price(0), 1), C("money after the buy", lambda r: r[1].money, 9),
+       C("sell value", lambda r: r[1].jsell(0), 1), C("stickers", lambda r: r[1].jstk(0), ["Rental"]),
+       C("money after the sale", lambda r: r[2].money, 10)]),
+    S("Stakes", "Rental", "$3 a round, before the interest",
+      """calculate_rental (end_round): each Rental joker takes $3 before the cash out counts the
+      interest. $10 -> $7: interest $1. The Big Blind: $4 + $2 for the hands + $1 = $7 cash out,
+      $14 in all (no Rental: $18).""",
+      blind(clear=True, stake=8, blind_index=1, jokers=("Joker",), joker_sticker=("R",), money=10),
+      [play("KD KC")],
+      [C("cash out", lambda r: r[1].last_cashout, 7), C("money", lambda r: r[1].money, 14)]),
+    S("Stakes", "Rental", "the rent can take the money below $0",
+      """ease_dollars has no floor: two Rental jokers take $6 from $2 (-$4), then the Small Blind's
+      cash out (Gold Stake: $0) pays $2 for the hands: -$2.""",
+      blind(clear=True, stake=8, jokers=("Joker", "Bull"), joker_sticker=("R", "R"), money=2),
+      [play("KD KC")],
+      [C("money", lambda r: r[1].money, -2), C("cash out", lambda r: r[1].last_cashout, 2)]),
+    S("Stakes", "Rental + Buffoon Pack", "a Buffoon pack joker can have stickers",
+      """create_card for a pack joker polls the stickers too ('packetper', 'packssjr'): about 30 % of
+      each at Gold Stake (4000 Buffoon Packs).""",
+      lambda: state(stake=8),
+      [],
+      [C("Eternal share", lambda r: _pack_sticker_shares(r.raw[0], PACK["Buffoon Pack"])[0], Between(0.27, 0.33)),
+       C("Perishable share", lambda r: _pack_sticker_shares(r.raw[0], PACK["Buffoon Pack"])[1], Between(0.27, 0.33)),
+       C("Rental share", lambda r: _pack_sticker_shares(r.raw[0], PACK["Buffoon Pack"])[2], Between(0.27, 0.33)),
+       C("stickers a joker cannot have", lambda r: _pack_sticker_shares(r.raw[0], PACK["Buffoon Pack"])[3], 0)]),
+    S("Stakes", "Rental + Judgement", "a joker from a Tarot gets no stickers",
+      """Only shop and pack jokers get stickers: Judgement's joker comes into the joker slots
+      (create_card with area G.jokers), with no sticker even at Gold Stake.""",
+      blind(stake=8, consumables=("Judgement",)),
+      [use(0)],
+      [C("jokers", lambda r: len(r[1].jokers), 1), C("stickers", lambda r: r[1].jstk(0), [])]),
+    S("Stakes", "Rental + Perishable + Ankh", "Ankh's copy keeps the stickers",
+      """copy_card copies the ability table: Ankh's copy of a Perishable Rental Joker with 3 rounds
+      left is Perishable and Rental with 3 rounds left, and sells for $1.""",
+      blind(stake=8, consumables=("Ankh",), jokers=("Joker",), joker_sticker=("PR",), joker_perish=(3,)),
+      [use(0)],
+      [C("jokers", lambda r: r[1].jokers, ["Joker", "Joker"]),
+       C("the copy's stickers", lambda r: r[1].jstk(1), ["Perishable", "Rental"]),
+       C("the copy's rounds left", lambda r: r[1].jleft(1), 3), C("the copy's sell value", lambda r: r[1].jsell(1), 1)]),
+]
+
+
 SCENARIOS = (JOKERS + NEW_JOKERS + TAROTS + PLANETS + SPECTRALS + PACKS + SPECTRAL_PACKS + CARDS + BOSSES + TAGS
-             + VOUCHERS + RULES + SELECT_RULES)
+             + VOUCHERS + RULES + SELECT_RULES + STAKES)
 
 
 # ---------------------------------------------------------------------------
@@ -3172,7 +3448,7 @@ def all_scenarios():
 
 
 # ---------------------------------------------------------------------------
-# COVERAGE — every joker, consumable, pack, card modifier, boss, tag and voucher has a test
+# COVERAGE — every joker, consumable, pack, card modifier, boss, tag, voucher, stake and sticker has a test
 # ---------------------------------------------------------------------------
 def subjects(scenarios):
     return {part.strip() for sc in scenarios for part in sc.subject.split("+")}
@@ -3192,7 +3468,8 @@ def missing():
             if abs(float(base.chips) - chips) > 1e-3 or abs(float(base.mult) - mult) > 1e-3:
                 have |= set(jokers)
     want = (set(JOKER_NAMES) | set(CONS_NAMES) | set(PACK_NAMES) | set(ENH_NAMES[1:]) | set(ED_NAMES[1:])
-            | {n + " Seal" for n in SEAL_NAMES[1:]} | set(BOSS_NAMES) | set(TAG_NAMES) | set(VOUCHER_NAMES))
+            | {n + " Seal" for n in SEAL_NAMES[1:]} | set(BOSS_NAMES) | set(TAG_NAMES) | set(VOUCHER_NAMES)
+            | set(STAKE_NAMES) | {w for _, w in STICKER_NAMES})
     return sorted(want - have)
 
 

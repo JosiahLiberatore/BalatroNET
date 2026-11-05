@@ -905,7 +905,22 @@ BOSSES = {"The Hook": (1, 2, 5, False), "The Ox": (6, 2, 5, False), "The House":
           "The Flint": (2, 2, 5, False), "The Mark": (2, 2, 5, False), "Amber Acorn": (8, 2, 8, True),
           "Verdant Leaf": (8, 2, 8, True), "Violet Vessel": (8, 6, 8, True), "Crimson Heart": (8, 2, 8, True),
           "Cerulean Bell": (8, 2, 8, True)}
-ANTE_BASE = [100, 300, 800, 2000, 5000, 11000, 20000, 35000, 50000]
+# get_blind_amount by G.GAME.modifiers.scaling (1: White / Red, 2: from Green, 3: from Purple); ante 0: 100
+ANTE_BASE = {1: [100, 300, 800, 2000, 5000, 11000, 20000, 35000, 50000],
+             2: [100, 300, 900, 2600, 8000, 20000, 36000, 60000, 100000],
+             3: [100, 300, 1000, 3200, 9000, 25000, 60000, 110000, 200000]}
+
+
+def scaling_of(stake):
+    """game.lua start_run: stake >= 3 -> scaling 2, stake >= 6 -> scaling 3."""
+    return 3 if stake >= 6 else 2 if stake >= 3 else 1
+
+
+def blind_pay(blind, boss, stake):
+    """$ a beaten blind pays: 3 / 4 / the boss's; stake >= 2: no_blind_reward.Small."""
+    if blind == 0 and stake >= 2:
+        return 0
+    return BOSSES[boss][2] if blind == 2 and boss else 5 if blind == 2 else BLIND_PAY[blind]
 
 
 def boss_eligible(name, ante):
@@ -916,13 +931,14 @@ def boss_eligible(name, ante):
     return lo <= max(1, ante) and (max(1, ante) % WIN_ANTE != 0 or ante < 2)
 
 
-def blind_chips(ante, blind, boss=None, scale=1.0, disabled=False):
-    """The target: the ante's base x 1 / 1.5 / the boss's x (a disabled Wall / Vessel: x2)."""
+def blind_chips(ante, blind, boss=None, scale=1.0, disabled=False, stake=1):
+    """The target: the ante's base (the stake's scaling) x 1 / 1.5 / the boss's x (a disabled
+    Wall / Vessel: x2)."""
     x = [1, 1.5][blind] if blind < 2 else (2 if boss is None else BOSSES[boss][1])
     if blind == 2 and disabled and boss in ("The Wall", "Violet Vessel"):
         x = 2
     # float32, as the env computes it (a scale of 0.03 x 300 is 9 there, not 8.99...)
-    t = np.float32(ANTE_BASE[min(max(ante, 0), 8)]) * np.float32(x) * np.float32(scale)
+    t = np.float32(ANTE_BASE[scaling_of(stake)][min(max(ante, 0), 8)]) * np.float32(x) * np.float32(scale)
     return max(int(np.floor(t)), 1)
 
 
@@ -955,3 +971,28 @@ def cost(base, discount=0):
 
 def discount_of(vouchers):
     return 50 if "Liquidation" in vouchers else 25 if "Clearance Sale" in vouchers else 0
+
+
+# ---------------------------------------------------------------------------
+# STAKE STICKERS — create_card (common_events.lua), Card:set_eternal / set_perishable /
+# set_rental / calculate_rental / calculate_perishable (card.lua), written again here
+# ---------------------------------------------------------------------------
+NOT_ETERNAL = {"Gros Michel", "Ice Cream", "Cavendish", "Luchador", "Turtle Bean", "Diet Cola", "Popcorn",
+               "Ramen", "Seltzer", "Mr. Bones", "Invisible Joker"}                  # eternal_compat = false
+NOT_PERISHABLE = {"Ceremonial Dagger", "Ride the Bus", "Runner", "Constellation", "Green Joker", "Red Card",
+                  "Madness", "Square Joker", "Vampire", "Hologram", "Rocket", "Obelisk", "Lucky Cat",
+                  "Flash Card", "Spare Trousers", "Castle", "Glass Joker", "Wee Joker"}  # perishable_compat = false
+PERISH_ROUNDS = 5        # G.GAME.perishable_rounds
+RENTAL_RATE = 3          # G.GAME.rental_rate
+
+
+def stickers_ok(name, eternal, perishable, rental, stake):
+    """Can a shop / Buffoon pack joker `name` have these stickers at `stake`? One poll gives
+    Eternal (> 0.7, stake >= 4, eternal_compat) or else Perishable (0.4 .. 0.7, stake >= 7,
+    perishable_compat), never both; another poll gives Rental (> 0.7, stake >= 8, any joker)."""
+    if eternal and (perishable or stake < 4 or name in NOT_ETERNAL):
+        return False
+    if perishable and (stake < 7 or name in NOT_PERISHABLE):
+        return False
+    return not rental or stake >= 8
+

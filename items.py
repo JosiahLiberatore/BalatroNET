@@ -420,3 +420,34 @@ BOSS_SUIT = jnp.array([d.suit for d in BOSS_TABLE], jnp.int32)
 WHEEL_ODDS = 7                 # The Wheel: 1 in 7 cards drawn face down
 SERPENT_DRAW = 3               # The Serpent: draw 3 after a PLAY or DISCARD
 BOSS_REROLL_COST = 10          # Director's Cut / Retcon
+
+
+# ---------------------------------------------------------------------------
+# STAKES (game.lua start_run) — a stake has every rule of the stakes below it — and the
+# stickers they put on shop and Buffoon pack jokers (common_events.lua create_card)
+# ---------------------------------------------------------------------------
+STAKE_NAMES = ["White Stake", "Red Stake", "Green Stake", "Black Stake", "Blue Stake", "Purple Stake",
+               "Orange Stake", "Gold Stake"]     # stake 1 .. 8
+STAKE_DESC = ["Base difficulty",
+              "Small Blind gives no reward money",
+              "Required score scales faster for each Ante",
+              "Shop can have Eternal Jokers (can't be sold or destroyed)",
+              "-1 Discard",
+              "Required score scales faster for each Ante",
+              "Shop can have Perishable Jokers (debuffed after 5 Rounds)",
+              "Shop can have Rental Jokers (costs $3 per round)"]
+N_STAKES = len(STAKE_NAMES)
+ST_NO_SMALL_REWARD = 2   # Red: no_blind_reward.Small
+ST_SCALING_2 = 3         # Green: modifiers.scaling = 2 (get_blind_amount)
+ST_ETERNAL = 4           # Black: enable_eternals_in_shop
+ST_DISCARD = 5           # Blue: starting_params.discards - 1
+ST_SCALING_3 = 6         # Purple: modifiers.scaling = 3
+ST_PERISH = 7            # Orange: enable_perishables_in_shop
+ST_RENTAL = 8            # Gold: enable_rentals_in_shop
+STK_ETERNAL, STK_PERISH, STK_RENTAL = 1, 2, 4     # a joker's stickers (bits)
+STICKER_NAMES = [(STK_ETERNAL, "Eternal"), (STK_PERISH, "Perishable"), (STK_RENTAL, "Rental")]
+STICKER_POLL = 0.7       # Eternal: a poll > 0.7; Perishable: 0.4 < the same poll <= 0.7; Rental: its own poll > 0.7
+PERISH_POLL = 0.4
+PERISH_ROUNDS = 5        # G.GAME.perishable_rounds
+RENTAL_RATE = 3          # G.GAME.rental_rate: $ each Rental joker takes at the end of a round
+RENTAL_COST = 1          # set_cost: a Rental joker costs $1 (its sell value $1)

@@ -425,6 +425,44 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       legal mask does ($0 always; Credit Card below $0). Was: the full price and money >= price,
       so the agent saw a free card as a paid one it could not pay for. Obs size unchanged (2301).
       Agent tests: the same failures as before (the blind select mask, the picker), none new.
+- [x] Stakes (2026-11-04): all 8, White to Gold (game.lua start_run; each stake has the rules of the
+      ones below it). state.stake (1 .. 8); reset(key, deck, hand, scale, stake=1).
+      ENV RULES (all new):
+      - Red: the Small Blind pays $0 (no_blind_reward.Small; blind_dollars).
+      - Green: get_blind_amount scaling 2 (300, 900, 2600, 8000, 20000, 36000, 60000, 100000);
+        Purple: scaling 3 (300, 1000, 3200, 9000, 25000, 60000, 110000, 200000); ante 0: 100.
+        env.ANTE_BASE is a (3, 9) table.
+      - Blue: -1 discard (the Red Deck's 4 -> 3).
+      - Black / Orange / Gold: create_card gives a shop joker (an Uncommon / Rare Tag's too) or a
+        Buffoon pack joker its stickers (env.roll_sticker): one poll > 0.7 Eternal (stake 4+,
+        eternal_compat), else 0.4 .. 0.7 Perishable (stake 7+, perishable_compat), never both;
+        a second poll > 0.7 Rental (stake 8, any joker). jokers.NOT_ETERNAL (11 jokers) /
+        NOT_PERISHABLE (18). Judgement, Wraith, The Soul, Riff-raff, Top-up Tag: no stickers.
+      - Eternal: no SELL (can_sell_card); Madness, Ceremonial Dagger, Hex and Ankh skip it (Ankh can
+        still pick it to copy). Perishable: 5 rounds; at each round end (after the joker's own
+        end-of-round effect) one less; at 0 it is debuffed for good (env.perished, acting() leaves
+        it out): no cash-out $ in that round already, its hand size / discards / Chaos reroll go
+        (remove_from_deck), a Negative one keeps its slot, Crimson Heart never picks it. Rental: costs
+        $1 (sells for $1), $3 at each round end (every held one, a debuffed one and a saving Mr.
+        Bones too) before the cash out's interest; the money can go below $0.
+      - copy_card (Ankh, Invisible Joker) copies the stickers and the rounds left.
+      - New state: stake, joker_sticker / joker_perish (per joker slot), shop_sticker, pack_sticker
+        (STK_ETERNAL 1 | STK_PERISH 2 | STK_RENTAL 4). Invariants: the stickers fit the joker and the
+        stake, a Perishable joker has 0 .. 5 rounds.
+      DIVERGENCES (new): an Ankh / Invisible Joker copy of a perished joker is perished and adds
+      nothing (the game's add_to_deck still gives its hand size / discards). Crimson Heart with no
+      joker to pick (2 jokers: a perished one and the last pick): the game passes an empty list to
+      pseudorandom_element, which indexes a nil entry (a Lua error); the env picks none.
+      AGENT (no training change; train.py still plays the White Stake): the legal mask never sells
+      an Eternal joker. obs 2301 -> 2464: the stake (one-hot 8), the stickers of each held, shop and
+      Buffoon pack joker, a held Perishable joker's rounds left / 5. Old params do not load.
+      TESTS: the reference model (ref_balatro: the stake tables, stickers_ok; tests_jokers.
+      check_step: the stickers through BUY / PICK / SELL / Ankh / Hex / Madness / Dagger / Crimson
+      Heart, rent, the perish count, the cash out, the sticker rules of every new shop and pack);
+      the soak plays random stakes with random starting stickers (Eternal SELLs, perishes, rent);
+      28 scenarios in a new Stakes group (GUI test menu: Stakes); every stake and sticker needs one.
+      GUI: K (or the stake button) starts the next stake; the stickers on held, shop and pack jokers
+      (a perished joker crossed out); the stake in the sidebar; "No reward" on the Small Blind.
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -457,7 +495,11 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - a bought Tarot / Planet goes to a slot (no "buy and use"; a human convenience, kept out)
 - The Ox: a tie uses the pairs() order of a new run; after a save + continue the game uses another
 - at most 8 held tags (MAX_TAGS)
-- one deck only: the Red Deck (the game's default, 4 discards); White Stake; no endless mode
+- one deck only: the Red Deck (the game's default, 4 discards); no endless mode (every stake is in)
+- an Ankh / Invisible Joker copy of a perished joker is perished and adds nothing (the game's
+  add_to_deck still gives its hand size / discards)
+- Crimson Heart with no joker to pick (a perished joker and the last pick): the env picks none
+  (the game: pseudorandom_element on an empty list, a Lua error)
 - the round's chips stop at 2^31 - 1, a hand's score at 2,147,483,520 (int32; the game: a double,
   up to ~1e308). No result changes: the run ends at ante 8, whose largest target is 300,000
 - found in the Lua review (2026-11-04), kept as they are:
