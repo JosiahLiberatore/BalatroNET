@@ -93,16 +93,18 @@ X_COUNTERS = ("Obelisk", "Hit the Road", "Ramen", "Campfire", "Constellation", "
 
 
 class Card:
-    """One playing card. A Stone card has no rank and no suit. deb: the boss debuffs it."""
-    __slots__ = ("i", "r", "s", "enh", "ed", "seal", "bonus", "deb")
+    """One playing card. A Stone card has no rank and no suit. deb: the boss debuffs it.
+    mark: The Pillar's played_this_ante (a DNA copy reports it)."""
+    __slots__ = ("i", "r", "s", "enh", "ed", "seal", "bonus", "deb", "mark")
 
-    def __init__(self, i, r=None, s=None, enh=0, ed=0, seal=0, bonus=0.0, deb=False):
+    def __init__(self, i, r=None, s=None, enh=0, ed=0, seal=0, bonus=0.0, deb=False, mark=False):
         self.i, self.enh, self.ed, self.seal, self.bonus, self.deb = i, enh, ed, seal, bonus, deb
         self.r = i % 13 if r is None else r
         self.s = i // 13 if s is None else s
+        self.mark = mark
 
     def copy(self):
-        return Card(self.i, self.r, self.s, self.enh, self.ed, self.seal, self.bonus, self.deb)
+        return Card(self.i, self.r, self.s, self.enh, self.ed, self.seal, self.bonus, self.deb, self.mark)
 
     def __repr__(self):
         return "23456789TJQKA"[self.r] + "CDHS"[self.s] + (f"/{self.enh}" if self.enh else "")
@@ -365,12 +367,13 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
         gone = _after(J)
         return dict(hand=name, chips=0, mult=0, score=0, money=money - g["money"], gone=gone, played=played,
                     round=rnd_cnt, acted=acted, cards=cards, broken=[], level_up=0, tarots=0, spawns=[],
-                    dna=[], triggered=True)
+                    dna=[], triggered=True, reset=[])
 
     # BEFORE, one joker at a time in slot order (evaluate_play: eval_card per joker). Ride the Bus
     # and DNA see the cards as the Midas Masks / Vampires to their left left them.
     level_up = 0
     vampired = set()                                       # card.lua v.vampired: until the hand ends
+    reset = set()                                          # set_ability (Midas Mask, Vampire): The Pillar mark goes
     dna = []                                               # DNA copies (copies too), slot order
     first_hand = sum(Counter(g["round"]).values()) == 0
     for i, x in enumerate(J):
@@ -385,8 +388,17 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
                 acted.add(i)
             continue
         if n == "DNA":
-            if first_hand and len(cards) == 1:
-                dna.append(cards[0].copy())
+            if first_hand and len(cards) == 1 and len(dna) < g.get("card_room", 128):
+                # G.hand:emplace in BEFORE: the copy is a held card of this hand, at its end, and
+                # Hologram gains at once (playing_card_joker_effects). copy_card keeps the card's
+                # debuff and its The Pillar mark (gone if a Midas Mask / Vampire touched it first).
+                cp = cards[0].copy()
+                cp.mark = cards[0] not in reset
+                dna.append(cp)
+                held.append((max([lane for lane, _ in held] + [-1]) + 1, cp))
+                for z in J:
+                    if z["name"] == "Hologram" and not z.get("deb"):
+                        z["v"] += 0.25
             continue
         if bp and n not in ("To Do List",):
             continue
@@ -410,6 +422,7 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
             for c in scored:
                 if is_face(c, m):
                     c.enh = GOLD
+                    reset.add(c)
                     acted.add(i)
         elif n == "Vampire":
             k = 0
@@ -417,6 +430,7 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
                 if c.enh != NONE_ and not c.deb and c not in vampired:
                     c.enh = NONE_
                     vampired.add(c)
+                    reset.add(c)
                     k += 1
             y["v"] += 0.1 * k
             if k:
@@ -659,8 +673,8 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
                 add_c = v
             elif n == "Blue Joker" and g["deck_left"] > 0:
                 add_c = 2 * g["deck_left"]
-            elif n == "Erosion" and 52 - g["deck_size"] > 0:
-                add_m = 4 * (52 - g["deck_size"])
+            elif n == "Erosion" and 52 - (g["deck_size"] + len(dna)) > 0:          # the DNA copies count
+                add_m = 4 * (52 - (g["deck_size"] + len(dna)))
             elif n == "Bull" and money > 0:
                 add_c = 2 * money
             elif n == "Blackboard" and all(is_suit(c, CLUBS, m, "flush") or is_suit(c, SPADES, m, "flush")
@@ -724,7 +738,7 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
     return dict(hand=name, chips=chips, mult=mult, score=int(chips * mult // 1), money=money - g["money"],
                 gone=gone, played=played, round=rnd_cnt, acted=acted, cards=cards, broken=broken,
                 level_up=level_up, tarots=tarots, spawns=["tarot"] * tarots + spawns, dna=dna,
-                triggered=triggered)
+                triggered=triggered, reset=[k for k, c in enumerate(cards) if c in reset])
 
 
 def _after(J):
@@ -912,12 +926,12 @@ def blind_chips(ante, blind, boss=None, scale=1.0, disabled=False):
     return max(int(np.floor(t)), 1)
 
 
-# tag: min ante (P_TAGS, in order)
-TAGS = {"Uncommon Tag": 1, "Rare Tag": 1, "Negative Tag": 2, "Foil Tag": 1, "Holographic Tag": 1,
-        "Polychrome Tag": 1, "Investment Tag": 1, "Voucher Tag": 1, "Boss Tag": 1, "Standard Tag": 2,
-        "Charm Tag": 1, "Meteor Tag": 2, "Buffoon Tag": 2, "Handy Tag": 2, "Garbage Tag": 2,
-        "Ethereal Tag": 2, "Coupon Tag": 1, "Double Tag": 1, "Juggle Tag": 1, "D6 Tag": 1, "Top-up Tag": 2,
-        "Skip Tag": 1, "Orbital Tag": 2, "Economy Tag": 1}
+# tag: min ante (P_TAGS, in order; 0 = min_ante nil: any ante, ante 0 too)
+TAGS = {"Uncommon Tag": 0, "Rare Tag": 0, "Negative Tag": 2, "Foil Tag": 0, "Holographic Tag": 0,
+        "Polychrome Tag": 0, "Investment Tag": 0, "Voucher Tag": 0, "Boss Tag": 0, "Standard Tag": 2,
+        "Charm Tag": 0, "Meteor Tag": 2, "Buffoon Tag": 2, "Handy Tag": 2, "Garbage Tag": 2,
+        "Ethereal Tag": 2, "Coupon Tag": 0, "Double Tag": 0, "Juggle Tag": 0, "D6 Tag": 0, "Top-up Tag": 2,
+        "Skip Tag": 0, "Orbital Tag": 2, "Economy Tag": 0}
 TAG_PACK = {"Standard Tag": "Mega Standard Pack", "Charm Tag": "Mega Arcana Pack",
             "Meteor Tag": "Mega Celestial Pack", "Buffoon Tag": "Mega Buffoon Pack",
             "Ethereal Tag": "Spectral Pack"}

@@ -194,7 +194,7 @@ SOURCE_NAMES = ["CONSTANT", "COUNTER", "QUERY"]
 Q_NONE              = 0
 Q_MONEY_DIV_5       = 1    # Bootstraps
 Q_EMPTY_JOKER_SLOTS = 2    # Joker Stencil. A held Stencil counts as empty
-                           # ("Joker Stencil included"), so the count is >= 1.
+                           # ("Joker Stencil included"); at least 1 (X1: more jokers than slots).
 Q_DECK_STEEL_COUNT  = 3    # Steel Joker - Steel cards in the full deck
 Q_DECK_STONE_COUNT  = 4    # Stone Joker - Stone cards in the full deck
 Q_DECK_NINE_COUNT   = 5    # Cloud 9 - 9s in the FULL deck, not the undealt part

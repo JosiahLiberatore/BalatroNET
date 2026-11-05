@@ -57,7 +57,9 @@ from jokers import (Joker, RuleMods, NO_MODS, rows_for, resolve, update_ex, copy
                     E_ADD_MULT, E_ADD_CHIPS, E_XMULT, E_RETRIGGER, E_ADD_MONEY, E_CHIPS_MULT,
                     E_MULT_NOMINAL, E_MULT_RANDOM, E_XMULT_UNCOMMON, E_PERMA_CHIPS,
                     E_SPAWN_CONSUMABLE, E_LEVEL_UP, E_MIDAS, J_VAMPIRE, S_COUNTER,
-                    E_SPAWN_SPECTRAL, Q_MONEY, Q_MONEY_DIV_5, Q_HAND_PLAYED, Q_OTHER_SELL, expired)
+                    E_SPAWN_SPECTRAL, E_SPAWN_CARD, T_ON_CARD_ADDED, Q_MONEY, Q_MONEY_DIV_5,
+                    Q_HAND_PLAYED, Q_OTHER_SELL, Q_DECK_LOST, expired)
+from arrays import compact
 
 BASE_CARD_CHIPS = jnp.array([2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11])
 
@@ -67,6 +69,7 @@ FLUSH, STRAIGHT, THREE_KIND, TWO_PAIR, PAIR, HIGH_CARD = range(6, 12)
 
 MAX_REPS = 12        # repetitions of one scored card (1 + Red Seal, Hanging Chad, Sock, Hack, Dusk, Seltzer, copies)
 MAX_HELD_REPS = 6    # repetitions of one held card (1 + Red Seal, Mime and its copies)
+SCORE_CAP = 2147483520.0   # the largest float32 below 2^31: a hand's score saturates here (int32)
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +368,7 @@ class PlayIn(NamedTuple):
     observatory : jax.Array = None   # (N_HAND_TYPES,) held Planets per hand (Observatory: X1.5 each)
     det_enh     : jax.Array = None   # (5,) the enhancements hand detection reads (a debuffed Wild: plain)
     all_ids     : jax.Array = None   # (J,) every held joker, a debuffed one too (Baseball Card counts it)
+    card_room   : jax.Array = None   # free card instances (DNA copies: at most this many)
 
 
 class PlayOut(NamedTuple):
@@ -393,10 +397,13 @@ class PlayOut(NamedTuple):
     lucky_hits  : jax.Array   # (5,) Lucky Card triggers per played card
     glass_roll  : jax.Array   # (5,) bool — the 1 in 4 Glass draws (tests)
     space_roll  : jax.Array   # (J,) bool — the 1 in 4 Space Joker draws (tests)
-    dna_enh     : jax.Array   # (J,) played card 0's enhancement when slot j acts in BEFORE (DNA copies it)
+    dna_enh     : jax.Array   # (J,) DNA copy k's enhancement (copy k = the k-th DNA effect, slot order)
     joker_state : jax.Array   # (J,) after the hand
     spawn_kind  : jax.Array   # (J,) what each slot's main effect creates: CK_TAROT / CK_SPECTRAL, -1 none
     boss_triggered : jax.Array  # bool: the hand triggered the boss (Matador)
+    dna_n       : jax.Array   # scalar int: DNA copies made (they were held cards in this hand)
+    dna_mark    : jax.Array   # (J,) bool: copy k has The Pillar mark (no Midas / Vampire touched card 0 first)
+    reset       : jax.Array   # (5,) bool: Midas Mask / Vampire touched the card (its The Pillar mark goes)
 
 
 def effective(ids, joker_value, joker_state):
@@ -415,20 +422,25 @@ def _before_cards(rows: Joker, ids, active, enh, sc, rank, pareidolia, deb):
     of the hand (card.lua v.vampired): a later Vampire skips it, even after a Midas
     Mask makes it Gold again. Ride the Bus and DNA in slot j see the cards as the
     slots to their left left them. A debuffed card is no face card, and Vampire skips it.
+    Both call set_ability, which builds a new ability table: the card loses its The Pillar
+    mark (played_this_ante, set before the hand), even a Gold card Midas Mask sets again.
     -> (enh (5,), stripped (J,), faces (J,) a scored face card when slot j acts,
-        enh0 (J,) played card 0's enhancement when slot j acts)"""
+        enh0 (J,) played card 0's enhancement when slot j acts, reset (5,) the cards
+        set_ability touched, reset0 (J,) card 0 was touched before slot j acts)"""
     def step(carry, j):
-        e, taken = carry
-        seen = ((sc & ~deb & face(rank, pareidolia, e)).any(), e[0])
+        e, taken, reset = carry
+        seen = ((sc & ~deb & face(rank, pareidolia, e)).any(), e[0], reset[0])
         midas = active[j] & (rows.EFFECT[j] == E_MIDAS)
         vamp = active[j] & (ids[j] == J_VAMPIRE)
         hit = vamp & sc & ~deb & (e != ENH_NONE) & ~taken
         e = jnp.where(hit, ENH_NONE, e)
-        e = jnp.where(midas & sc & ~deb & face(rank, pareidolia, e), ENH_GOLD, e)
-        return (e, taken | hit), (hit.sum(),) + seen
-    (enh, _), (stripped, faces, enh0) = jax.lax.scan(step, (enh, jnp.zeros_like(sc)),
-                                                     jnp.arange(active.shape[0]))
-    return enh, stripped, faces, enh0
+        gold = midas & sc & ~deb & face(rank, pareidolia, e)
+        e = jnp.where(gold, ENH_GOLD, e)
+        return (e, taken | hit, reset | hit | gold), (hit.sum(),) + seen
+    z = jnp.zeros_like(sc)
+    (enh, _, reset), (stripped, faces, enh0, reset0) = jax.lax.scan(step, (enh, z, z),
+                                                                    jnp.arange(active.shape[0]))
+    return enh, stripped, faces, enh0, reset, reset0
 
 
 def _suit_sets(sc, suit, enh, smeared, deb=None):
@@ -511,7 +523,8 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     #    Midas Mask / Vampire, then the hand's chips and mult at its level
     scored0 = Cards(p.rank, p.suit, sc, jnp.where(sc, jnp.cumsum(sc) - 1, -1),
                     jnp.zeros(5, bool), jnp.zeros(5, bool), enh0, None, deb)
-    enh, stripped, faces_at, enh0_at = _before_cards(rows, ids, active, enh0, sc, p.rank, mods.pareidolia, deb)
+    enh, stripped, faces_at, enh0_at, reset, reset0_at = _before_cards(rows, ids, active, enh0, sc, p.rank,
+                                                                       mods.pareidolia, deb)
     counts = rule_counts(rows, scored0, sc.astype(jnp.float32), info, tg, mods, p.joker_state, False)
     # Ride the Bus reads the faces as the Midas Masks / Vampires to its left left them
     counts = jnp.where(rows.UPD_COND == C_SCORING_FACE, faces_at[:, None].astype(jnp.float32), counts)
@@ -523,13 +536,40 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     space_roll = jax.random.uniform(k_space, (J,)) < _odds(erows, mods)
     level_up = (space & space_roll).sum().astype(jnp.int32)
     value = value + jnp.where(active & (ids == J_VAMPIRE), rows.UPD_DELTA[:, 0] * stripped, 0.0)
+    # DNA (copies too): the round's first hand is one card -> each DNA effect copies it, as the
+    # slots to its left left it, onto the end of the hand (G.hand:emplace in BEFORE). So in this
+    # hand the copies are held cards (Steel, Baron, Raised Fist, Blackboard, Mime ...), Erosion
+    # counts them, and Hologram gains at once (playing_card_joker_effects). copy_card keeps the
+    # card's debuff and its The Pillar mark (unless a Midas Mask / Vampire touched it first).
+    lane = jnp.arange(H)
+    last = jnp.max(jnp.where(p.held_ok, lane, -1))
+    room = jnp.int32(H) if p.card_room is None else p.card_room
+    dna_on = eok & (erows.TRIGGER == T_BEFORE) & (erows.EFFECT == E_SPAWN_CARD) \
+        & (p.hand_round.sum() == 0) & (hand.n_played == 1)
+    dna_n = jnp.clip(jnp.minimum(dna_on.sum(), room), 0, H - 1 - last).astype(jnp.int32)
+    dna_slot = compact(jnp.arange(J), dna_on)
+    dna_enh, dna_mark = enh0_at[dna_slot], ~reset0_at[dna_slot]
+    kc = lane - (last + 1)
+    is_copy = (kc >= 0) & (kc < dna_n)
+    h_ok = p.held_ok | is_copy
+    h_rank = jnp.where(is_copy, p.rank[0], p.held_rank)
+    h_suit = jnp.where(is_copy, p.suit[0], p.held_suit)
+    held_enh = jnp.where(is_copy, dna_enh[jnp.clip(kc, 0, J - 1)], held_enh)
+    held_seal = jnp.where(is_copy, seal[0], held_seal)
+    hdeb = jnp.where(is_copy, deb[0], hdeb)
+    v_add, _, _ = update_ex(rows, active, value, p.joker_state, T_ON_CARD_ADDED,
+                            jnp.full((J, rows.UPD_COND.shape[1]), dna_n, jnp.float32))
+    value = jnp.where(dna_n > 0, v_add, value)
+    hb_enh = jnp.where(hdeb & (held_enh == ENH_WILD), ENH_NONE, held_enh)
+    held_black = ~(h_ok & ~(suit_is(h_suit, 0, mods.smeared, hb_enh)
+                            | suit_is(h_suit, 3, mods.smeared, hb_enh))).any()
     hchips, hmult = hand_chips_mult(level.at[ht].add(level_up))
     # The Flint: the base chips and mult are halved (rounded, mult at least 1)
     h_chips = jnp.where(flint, jnp.maximum(jnp.floor(hchips[ht] * 0.5 + 0.5), 0), hchips[ht])
     h_mult = jnp.where(flint, jnp.maximum(jnp.floor(hmult[ht] * 0.5 + 0.5), 1), hmult[ht])
     seeing_double, flower = _suit_sets(sc, p.suit, enh, mods.smeared, deb)
     ace = (sc & has_rank(enh) & (p.rank == 12)).any()
-    info = info._replace(seeing_double=seeing_double, flower_pot=flower,
+    info = info._replace(seeing_double=seeing_double, flower_pot=flower, held_black=held_black,
                          ace_straight=ace & hand.contains[STRAIGHT])
 
     isf = face(p.rank, mods.pareidolia, enh) & ~deb
@@ -590,10 +630,10 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     value, _, _ = update_ex(rows, active, value, p.joker_state, T_PER_SCORED, counts)
 
     # 4. cards held in hand x repetitions (Red Seal, Mime) x (Steel, the jokers)
-    lo = jnp.where(p.held_ok & has_rank(held_enh), p.held_rank, 99)
-    lowest = p.held_ok & has_rank(held_enh) & (jnp.arange(H) == (H - 1 - jnp.argmin(lo[::-1]))) \
+    lo = jnp.where(h_ok & has_rank(held_enh), h_rank, 99)
+    lowest = h_ok & has_rank(held_enh) & (jnp.arange(H) == (H - 1 - jnp.argmin(lo[::-1]))) \
         & (lo.min() < 99)                                                        # the last lowest
-    held = Cards(p.held_rank, p.held_suit, p.held_ok, jnp.full(H, -1), jnp.zeros(H, bool), lowest,
+    held = Cards(h_rank, h_suit, h_ok, jnp.full(H, -1), jnp.zeros(H, bool), lowest,
                  held_enh, None, hdeb)
     m_held = match(erows.CONDITION, erows.COND_PARAM, held, info, tg, mods, estate) & eok[:, None]
     m_held = m_held & ~hdeb[None, :]                 # a debuffed held card gives nothing (Mime: nothing to repeat)
@@ -601,16 +641,16 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     mime = on_held & (erows.EFFECT == E_RETRIGGER)
     hfx = on_held & ~mime
     hroll = jax.random.uniform(k_held, (H, MAX_HELD_REPS, J)) < odds[None, None, :]
-    steel = p.held_ok & ~hdeb & (held_enh == ENH_STEEL)
+    steel = h_ok & ~hdeb & (held_enh == ENH_STEEL)
     first = (m_held & hfx[:, None]).T & hroll[:, 0, :]                          # (H, J)
     had = first.any(axis=1) | steel
     hreps = 1 + had * ((held_seal == SEAL_RED) + (m_held * (mime * erows.VALUE)[:, None]).sum(axis=0))
-    hreps = jnp.where(p.held_ok, jnp.clip(hreps, 1, MAX_HELD_REPS), 0).astype(jnp.int32)
+    hreps = jnp.where(h_ok, jnp.clip(hreps, 1, MAX_HELD_REPS), 0).astype(jnp.int32)
     hlive = (jnp.arange(MAX_HELD_REPS)[None, :] < hreps[:, None])                # (H, Rh)
     hon = hlive[:, :, None] & (m_held & hfx[:, None]).T[:, None, :] & hroll      # (H, Rh, J)
     hm = jnp.select([erows.EFFECT == E_ADD_MULT, erows.EFFECT == E_MULT_NOMINAL],
                     [jnp.broadcast_to(erows.VALUE, (H, J)),
-                     erows.VALUE[None, :] * BASE_CARD_CHIPS[p.held_rank][:, None]], default=0.0)
+                     erows.VALUE[None, :] * BASE_CARD_CHIPS[h_rank][:, None]], default=0.0)
     hm = jnp.broadcast_to(hm[:, None, :], hon.shape)
     money = money + (hon * d_j).sum()
     steel_x = jnp.where(hlive & steel[:, None], STEEL_X, 1.0)
@@ -622,7 +662,8 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     now = p.money + money
     ctx = (p.ctx.at[Q_MONEY].set(jnp.maximum(now, 0.0))
                 .at[Q_MONEY_DIV_5].set(jnp.maximum(jnp.floor(now / 5), 0.0))
-                .at[Q_HAND_PLAYED].set(played[ht]))
+                .at[Q_HAND_PLAYED].set(played[ht])
+                .at[Q_DECK_LOST].set(jnp.maximum(p.ctx[Q_DECK_LOST] - dna_n, 0.0)))   # Erosion: the DNA copies
     src = copy_sources(ids)
     ev = value[jnp.clip(src, 0, J - 1)]
     v = resolve(erows, eok, ev, ctx)
@@ -666,14 +707,16 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     glass_roll = jax.random.uniform(k_glass, (5,)) < mods.odds / GLASS_ODDS
     broken = live_sc & (enh == ENH_GLASS) & glass_roll
 
-    # floor(chips x mult): a few float32 ulps of slack, so 15 x 12.6 is 189 and not 188.99998 -> 188
-    prod = chips * mult
-    score = jnp.floor(prod * (1 + 2.0 ** -22) + 1e-3).astype(jnp.int32)
+    # floor(chips x mult): a few float32 ulps of slack, so 15 x 12.6 is 189 and not 188.99998 -> 188.
+    # The game adds in a double; the int32 score stops at SCORE_CAP (env.py caps the round's sum too).
+    prod = jnp.nan_to_num(chips * mult, nan=0.0, posinf=SCORE_CAP)
+    score = jnp.floor(jnp.minimum(prod * (1 + 2.0 ** -22) + 1e-3, SCORE_CAP)).astype(jnp.int32)
     perma = hike_rep.sum(axis=1)
     out = PlayOut(ht, sc, base_chips, base_mult, chips, mult, score, money, value, gone,
                   played, in_round, reps, roll, hroll, rnd, enh, broken, perma, level_up,
                   spawn.astype(jnp.int32), jnp.stack([lucky_m, lucky_d], axis=-1), lucky_hits,
-                  glass_roll, space_roll, enh0_at, p.joker_state, spawn_kind, triggered)
+                  glass_roll, space_roll, dna_enh, p.joker_state, spawn_kind, triggered,
+                  dna_n, dna_mark, reset)
 
     # a debuffed hand (The Psychic / The Eye / The Mouth): 0 chips x 0 mult; no BEFORE, no card,
     # no joker effect but Matador's $ (copies too); the AFTER step still acts
@@ -688,6 +731,7 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
         joker_value=d_value, expired=expired(rows, active, d_value, d_fired),
         reps=jnp.zeros_like(reps), enh=enh0, broken=z5, perma=jnp.zeros_like(perma),
         level_up=jnp.int32(0), tarots=jnp.int32(0), lucky_hits=jnp.zeros_like(lucky_hits),
+        dna_n=jnp.int32(0), reset=z5,
         spawn_kind=jnp.full(J, -1, jnp.int32))
     return jax.tree.map(lambda a, b: jnp.where(hand_debuffed, a, b), dead, out)
 

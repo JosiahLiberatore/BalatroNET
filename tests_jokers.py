@@ -56,6 +56,8 @@ from tests_run import Checks, act
 NAME = JOKER_NAMES          # id -> name; the reference is keyed by name, never by id
 assert HAND_NAMES == R.HAND_ORDER
 CARD_FIELDS = ("card_rank", "card_suit", "card_enh", "card_ed", "card_seal", "card_bonus", "card_live")
+SCORE_CAP = 2147483520                 # scoring.SCORE_CAP: a hand's score stops here (float32 < 2^31)
+INT32_MAX = 2147483647                 # env: chips_scored stops here
 _KIND = [int(k) for k in CONS_KIND]
 _USE = [int(u) for u in CONS_USE]
 _PARAM = [int(x) for x in CONS_PARAM]
@@ -238,10 +240,11 @@ class Want:
              "free_rerolls", "reroll_cost", "last_hand", "last_cons", "tarots_used", "skips", "ante",
              "blind_index", "boss_hand", "unused_discards", "round_hand_bonus", "ecto_minus",
              "consumable_slots", "base_hand_size", "base_hands", "base_discards", "shop_size", "boss", "round",
-             "ox_hand", "boss_sub", "pack_return", "blind_target", "pack_id", "pack_left")
+             "ox_hand", "boss_sub", "pack_return", "blind_target", "pack_id", "pack_left", "reroll_inc")
         self.f = {f: int(getattr(p, f)) for f in F}
         self.f.update(gros_extinct=bool(p.gros_extinct), boss_disabled=bool(p.boss_disabled),
-                      boss_rerolled=bool(p.boss_rerolled))
+                      boss_rerolled=bool(p.boss_rerolled), reroll_d6=bool(p.reroll_d6))
+        self.extra_room = 0                # a Negative card being used keeps its slot until it dissolves
         self.level = np.array(p.hand_level)
         self.planets_used = np.array(p.planets_used)
         held = [k for k in range(MAX_CONSUMABLES) if int(p.consumables[k]) >= 0]
@@ -261,7 +264,7 @@ class Want:
 
     def capacity(self):
         return self.f["consumable_slots"] + sum(e == 4 for e in self.cons_ed) \
-            + sum(n for _, n, _, _, e in self.new_cons if e == 4)
+            + sum(n for _, n, _, _, e in self.new_cons if e == 4) + self.extra_room
 
     def room(self):
         return self.capacity() - len(self.cons) - sum(n for _, n, _, _, _ in self.new_cons)
@@ -468,6 +471,7 @@ def _apply_cons(c, tag, p, q, J, w, cid, sel):
     if u == U_ENHANCE:
         for i in inst:
             cd["card_enh"][i] = prm
+            cd["card_played_ante"][i] = False             # set_ability: a new ability table
     elif u == U_SUIT:
         for i in inst:
             cd["card_suit"][i] = prm
@@ -483,7 +487,7 @@ def _apply_cons(c, tag, p, q, J, w, cid, sel):
     elif u == U_DEATH:
         right = inst[-1]
         for i in inst[:-1]:
-            for f in CARD_FIELDS[:-1]:
+            for f in CARD_FIELDS[:-1] + ("card_played_ante",):       # copy_card: the mark too
                 cd[f][i] = cd[f][right]
     elif u == U_FOOL:
         w.give(int(p.last_cons), astro)
@@ -585,7 +589,8 @@ def _apply_cons(c, tag, p, q, J, w, cid, sel):
         free = int((~w.cards["card_live"]).sum())
         for _ in range(min(2, free)):
             w.new_cards.append((True, dict(card_rank=src.r, card_suit=src.s, card_enh=src.enh, card_ed=src.ed,
-                                           card_seal=src.seal, card_bonus=src.bonus)))
+                                           card_seal=src.seal, card_bonus=src.bonus,
+                                           card_played_ante=float(cd["card_played_ante"][inst[0]]))))
         _bump(J, "Hologram", 0.25 * min(2, free))
     w.f["tarots_used"] += _KIND[cid] == CK_TAROT
     if _KIND[cid] != CK_SPECTRAL:
@@ -629,11 +634,15 @@ def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
     w.f.update(money=money + cashout, last_cashout=cashout, game_stage=STAGE_WON if won else STAGE_SHOP,
                unused_discards=w.f["unused_discards"] + max(w.f["discards"], 0), round_hand_bonus=0,
                boss_disabled=False)
-    w.f["reroll_cost"] = 5 - 2 * ("Reroll Surplus" in v) - 2 * ("Reroll Glut" in v)
+    w.f.update(reroll_cost=5 - 2 * ("Reroll Surplus" in v) - 2 * ("Reroll Glut" in v), reroll_inc=0,
+               reroll_d6=False)
     if is_boss:
         played = np.array(p.hand_played) if played is None else played   # this hand counted
         w.f["ox_hand"] = R.ox_hand(played)
         w.cards["card_played_ante"][:] = False
+        for _, attrs in w.new_cards:                       # a DNA copy made by this hand forgets too
+            if attrs and "card_played_ante" in attrs:
+                attrs["card_played_ante"] = 0.0
         if not won:
             w.f["ante"] += 1
         w.f["blind_index"] = 0
@@ -725,7 +734,7 @@ def _check_shop(c, tag, q, w, fresh=True):
                     all(bool(q.shop_free[i]) for i in range(size) if int(q.shop_slots[i]) >= 0)
                     and all(bool(q.pack_free[i]) for i in range(2) if int(q.pack_slots[i]) >= 0))
         want_r = 0 if used["D6 Tag"] else w.f["reroll_cost"]
-        w.f["reroll_cost"] = want_r
+        w.f.update(reroll_cost=want_r, reroll_d6=bool(used["D6 Tag"]))
 
 
 def _enter_select(c, tag, p, q, J, w):
@@ -904,6 +913,8 @@ def _blind_start(c, tag, p, q, J, w):
     for k in sorted(sliced, reverse=True):
         y = J.pop(k)
         w.f["discards"] = max(w.f["discards"] - R.D_SIZE.get(y["name"], 0), 0)
+    if burgle:
+        w.f["discards"] = 0                            # Burglar: before a Riff-raff Drunkard's +1
     # Riff-raff's jokers (random Commons): read from q after the survivors
     q_names = [NAME[int(j)] for j in q.jokers if j >= 0]
     for _ in range(riff):
@@ -916,8 +927,6 @@ def _blind_start(c, tag, p, q, J, w):
         w.new_cards.append((False, dict(card_enh=R.STONE, card_ed=0, card_seal=0)))
     _bump(J, "Hologram", 0.25 * k_m)
     w.f["hands"] += 3 * burgle
-    if burgle:
-        w.f["discards"] = 0
     w.f["free_rerolls"] = sum(x["name"] == "Chaos the Clown" for x in J)
     # Amber Acorn shuffles the jokers (read the order from q); Chicot disables the boss
     if boss == "Amber Acorn" and len(J) > 1:
@@ -939,14 +948,21 @@ def _blind_start(c, tag, p, q, J, w):
     juggle = sum(t == "Juggle Tag" for t, _ in w.tags)
     w.tags = [(t, h) for t, h in w.tags if t != "Juggle Tag"]
     w.f["round_hand_bonus"] += 3 * juggle
-    # the draw: hand_size cards (+ Certificate's)
+    # the draw: hand_size cards (+ Certificate's); at hand size 0 the draw ends the run first
+    hs = w_hand_size(J, w, q)
+    if hs <= 0:
+        w.f["game_stage"] = STAGE_LOST
+        npeq(c, f"{tag}: hand size 0: no opening hand", int(np.asarray(q.hand_valid).sum()), 0)
+        return J
     n_cert = min(_eff_count(J, "Certificate"), 3, int((~w.cards["card_live"]).sum()) - k_m)
     for _ in range(n_cert):
         w.new_cards.append((True, dict(card_enh=0, card_ed=0)))
     _bump(J, "Hologram", 0.25 * n_cert)
-    want = min(w_hand_size(J, w, q), int(w.cards["card_live"].sum()) + k_m) + n_cert
+    deck = int(w.cards["card_live"].sum()) + k_m
+    want = min(hs, deck) + n_cert
+    grow = _heart_pick(c, tag, p, q, J, w)
+    want += min(grow, deck - min(hs, deck)) if hs + grow > 1 else 0
     npeq(c, f"{tag}: the opening hand", int(np.asarray(q.hand_valid).sum()), want)
-    _heart_pick(c, tag, p, q, J, w)
     _check_draw_end(c, tag, q, J)
     return J
 
@@ -968,7 +984,7 @@ def _heart_pick(c, tag, p, q, J, w):
     """Crimson Heart after the first draw / a PLAY: a random joker (not the one before, if
     there are 2 or more), read from q; its discards go with it."""
     if boss_on(q) != "Crimson Heart" or not J:
-        return
+        return 0
     new = [k for k in range(len(J)) if bool(q.joker_debuff[k])]
     c.eq(f"{tag}: Crimson Heart: one joker disabled", len(new), 1)
     old = [k for k, x in enumerate(J) if x.get("deb")]
@@ -976,8 +992,11 @@ def _heart_pick(c, tag, p, q, J, w):
         c.check(f"{tag}: Crimson Heart: not the same joker again", new[0] not in old, new, old)
     back = sum(R.D_SIZE.get(J[k]["name"], 0) for k in old) - sum(R.D_SIZE.get(J[k]["name"], 0) for k in new)
     w.f["discards"] = max(w.f["discards"] + back, 0)
+    h = lambda x: R.H_SIZE.get(x["name"], 0) + (int(x["v"]) if x["name"] == "Turtle Bean" else 0)
+    grow = max(sum(h(J[k]) for k in old), 0) + max(-sum(h(J[k]) for k in new), 0)
     for k, x in enumerate(J):
         x["deb"] = k in new
+    return grow
 
 
 def check_step(c, tag, p, a, q, reward, out=None):
@@ -1035,6 +1054,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
             if extra["trading"]:
                 w.cards["card_live"][dcards[0].i] = False
                 _bump(J, "Canio", 1.0 * R.is_face(dcards[0], m))
+                _bump(J, "Glass Joker", 0.75 * (dcards[0].enh == R.GLASS))
             J = _drop(J, gone)
             w.f["money"] += money
     if verb == V_PLAY:
@@ -1053,7 +1073,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
         g = ref_g(p)
         g.update(money=w.f["money"], levels={HAND_NAMES[k]: int(w.level[k]) for k in range(N_HAND_TYPES)},
                  hand_debuffed=debuffed, flint=boss == "The Flint", boss_trigger=arm or ox,
-                 discards=max(int(p.discards), 0))
+                 discards=max(int(p.discards), 0), card_room=int((~w.cards["card_live"]).sum()))
         if "Observatory" in w.vouchers:
             obs = Counter(HAND_NAMES[_PARAM[x]] for x in w.cons if _KIND[x] == CK_PLANET)
             g["observatory"] = obs
@@ -1067,10 +1087,14 @@ def check_step(c, tag, p, a, q, reward, out=None):
                          glass=lambda k: bool(out.glass_roll[k]),
                          space=lambda j: bool(out.space_roll[j]))
         got = int(q.chips_scored) - int(p.chips_scored)
-        ok = exact(got, res["score"], res["chips"] * res["mult"])
+        capped = min(int(p.chips_scored) + min(res["score"], SCORE_CAP), INT32_MAX) - int(p.chips_scored)
+        if capped == res["score"]:
+            ok = exact(got, res["score"], res["chips"] * res["mult"])
+        else:                                                # past int32: the score and the sum stop
+            ok = got == capped
         c.check(f"{tag}: PLAY {res['hand']} scores {res['score']} ({res['chips']} x {res['mult']})",
-                ok, got, res["score"])
-        total = int(p.chips_scored) + (got if ok else res["score"])
+                ok, got, capped)
+        total = int(p.chips_scored) + (got if ok else capped)
         played = np.array([res["played"][h] for h in HAND_NAMES])
         in_round = np.array([res["round"][h] for h in HAND_NAMES])
         hi = HAND_NAMES.index(res["hand"])
@@ -1078,37 +1102,40 @@ def check_step(c, tag, p, a, q, reward, out=None):
         w.f["last_hand"] = hi
         if boss == "The Mouth" and int(p.boss_hand) < 0:
             w.f["boss_hand"] = hi
-        for card in res["cards"]:
+        for k, card in enumerate(res["cards"]):
             w.cards["card_enh"][card.i] = card.enh
             w.cards["card_bonus"][card.i] = card.bonus
-            w.cards["card_played_ante"][card.i] = True
+            w.cards["card_played_ante"][card.i] = k not in res["reset"]   # Midas / Vampire: set_ability
         first = int(np.asarray(p.hand_round).sum()) == 0
+        after = res["cards"]                                 # the cards after BEFORE (Midas, Vampire)
         sixth = ("Sixth Sense" in R.acting_names(J) and first and len(cards) == 1 and not debuffed
-                 and R.rank(cards[0]) == R.SIX)
+                 and R.rank(after[0]) == R.SIX)
         dead = {k for k in res["broken"]} | ({0} if sixth else set())
         for k in dead:
             w.cards["card_live"][cards[k].i] = False
-        _bump(J, "Glass Joker", 0.75 * sum(cards[k].enh == R.GLASS for k in dead))
-        _bump(J, "Canio", 1.0 * sum(R.is_face(cards[k], m) for k in dead))
+        _bump(J, "Glass Joker", 0.75 * sum(after[k].enh == R.GLASS for k in dead))
+        _bump(J, "Canio", 1.0 * sum(R.is_face(after[k], m) for k in dead))
         astro = "Astronomer" in R.acting_names(J)
         w.spawn_seq([CK_TAROT if s == "tarot" else CK_SPECTRAL for s in res["spawns"]]
                     + ([CK_SPECTRAL] if sixth else []), astro=astro)
-        # DNA: the 1st hand of the round is one card -> a copy into deck and hand
+        # DNA: the 1st hand of the round is one card -> a copy into deck and hand (ref_play made it a
+        # held card of this hand and gave Hologram its X0.25)
         if first and len(cards) == 1 and not debuffed:
-            k = min(len(res["dna"]), 2, int((~w.cards["card_live"]).sum()))
-            for src in res["dna"][:k]:                          # each DNA copies the card as it saw it
+            for src in res["dna"]:                              # each DNA copies the card as it saw it
                 w.new_cards.append((True, dict(card_rank=src.r, card_suit=src.s, card_enh=src.enh,
                                                card_ed=src.ed, card_seal=src.seal,
-                                               card_bonus=cards[0].bonus)))
+                                               card_bonus=cards[0].bonus, card_played_ante=float(src.mark))))
                 held_cards.append(R.Card(-1, src.r, src.s, src.enh, src.ed, src.seal))
-            _bump(J, "Hologram", 0.25 * k)
         J = _drop(J, res["gone"])
         w.f.update(chips_scored=total, hands=int(p.hands) - 1)
         w.f["money"] += int(res["money"])
         held_after = len(held_cards)
         deck_left = int(p.deck_size) - int(p.deck_ptr)
         stuck = held_after == 0 and deck_left == 0
-        if total >= int(p.blind_target) or int(p.hands) - 1 <= 0 or stuck:
+        over = total >= int(p.blind_target) or int(p.hands) - 1 <= 0
+        if not over and held_after == 0 and w_hand_size(J, w, q) <= 0:
+            w.f["game_stage"] = STAGE_LOST                      # the draw at hand size 0: GAME_OVER
+        elif over or stuck:
             todo = {id(x) for x in J if x["name"] == "To Do List" and not x.get("deb")}   # a debuffed one misses it
             J, want_reward, shop_fresh = _end_round(c, tag, p, q, J, w, held_cards, total, played)
             if w.f["game_stage"] != STAGE_LOST:
@@ -1120,7 +1147,9 @@ def check_step(c, tag, p, a, q, reward, out=None):
         w.f.update(discards=w.f["discards"] - 1, discards_used=int(p.discards_used) + 1)
         held_after = int(np.asarray(p.hand_valid).sum()) - len(lanes)
         deck_left = int(p.deck_size) - int(p.deck_ptr)
-        if held_after == 0 and deck_left == 0:
+        if held_after == 0 and w_hand_size(J, w, q) <= 0:
+            w.f["game_stage"] = STAGE_LOST                      # the draw at hand size 0: GAME_OVER
+        elif held_after == 0 and deck_left == 0:
             J, want_reward, shop_fresh = _end_round(c, tag, p, q, J, w, [], int(p.chips_scored))
         else:
             _check_draw_end(c, tag, q, J)
@@ -1141,7 +1170,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
         if 0 <= t < MAX_SHOP_SLOTS and bool(p.shop_free[t]):
             cost = 0
         floor = -20 * R.acting_names(J).count("Credit Card")
-        if 0 <= t < int(p.shop_size) and item >= 0 and int(p.money) - cost >= floor and room:
+        if 0 <= t < int(p.shop_size) and item >= 0 and (cost <= 0 or int(p.money) - cost >= floor) and room:
             if kind == IK_JOKER:
                 nm = NAME[item]
                 st = int(sum(p.hand_played)) if nm == "Loyalty Card" else 0
@@ -1201,9 +1230,11 @@ def check_step(c, tag, p, a, q, reward, out=None):
                     x["v"] += 0.25
             w.f["money"] += int(p.joker_sell_value[t])
             acts = not x0.get("deb")
-            if acts and nm == "Luchador":
+            tgt = R.effective(J)[t]                         # a copier: its target's selling_self
+            en = J[tgt]["name"] if tgt is not None else None
+            if acts and en == "Luchador":
                 _disable(c, tag, p, w, J)
-            if acts and nm == "Diet Cola":
+            if acts and en == "Diet Cola":
                 _add_tag(w, "Double Tag", 0)
             dup = None
             if acts and nm == "Invisible Joker" and x0["v"] >= 2 and n > 1:
@@ -1232,9 +1263,12 @@ def check_step(c, tag, p, a, q, reward, out=None):
     elif verb == V_REROLL and stage == STAGE_SHOP:
         free = int(p.free_rerolls) > 0
         cost = 0 if free else int(p.reroll_cost)
-        if free or int(p.money) - cost >= -20 * R.acting_names(J).count("Credit Card"):
-            w.f.update(money=int(p.money) - cost, reroll_cost=int(p.reroll_cost) + (not free),
-                       free_rerolls=int(p.free_rerolls) - free)
+        if free or cost <= 0 or int(p.money) - cost >= -20 * R.acting_names(J).count("Credit Card"):
+            v = w.vouchers                                  # calculate_reroll_cost: (D6 ? 0 : base) + paid ones
+            base = 0 if bool(p.reroll_d6) else 5 - 2 * ("Reroll Surplus" in v) - 2 * ("Reroll Glut" in v)
+            w.f.update(money=int(p.money) - cost, free_rerolls=int(p.free_rerolls) - free,
+                       reroll_cost=int(p.reroll_cost) if free else base + int(p.reroll_inc) + 1,
+                       reroll_inc=int(p.reroll_inc) + (not free))
             _bump(J, "Flash Card", 2)
             _check_shop(c, tag, q, w, fresh=False)
     elif verb == V_REROLL:                                  # the blind select: the boss
@@ -1272,7 +1306,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
             J.insert(d, J.pop(t))
     elif verb == V_MOVE_CARD:                               # INSERT lane t at lane d
         hand, valid, down = list(p.hand), list(p.hand_valid), list(p.hand_down)
-        size = int(p.hand_size)
+        size = max(int(p.hand_size), max([l for l in range(MAX_HAND_SIZE) if valid[l]] + [-1]) + 1)
         if 0 <= t < size and 0 <= d < size and t != d and valid[t]:
             for arr in (hand, valid, down):
                 arr.insert(d, arr.pop(t))
@@ -1283,8 +1317,11 @@ def check_step(c, tag, p, a, q, reward, out=None):
         cons = [int(x) for x in p.consumables if x >= 0]
         cid = cons[t] if 0 <= t < len(cons) else -1
         if cid >= 0 and _can_use(p, J, w, cid, sel, True):
+            w.extra_room = int(w.cons_ed[t] == 4)
             w.drop_cons(t)
             J = _apply_cons(c, tag, p, q, J, w, cid, sel)
+            w.extra_room = 0
+            _redraw_ref(c, tag, p, J, w, cid, sel)
             if "Chicot" in R.acting_names(J) and "Chicot" not in R.acting_names(records(p)):
                 _disable(c, tag, p, w, J)
     elif verb == V_SELL_CONS:
@@ -1298,7 +1335,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
         if pid >= 0:
             astro = "Astronomer" in R.acting_names(J)
             cost = 0 if (bool(p.pack_free[t]) or (_PKIND[pid] == PK_CELESTIAL and astro)) else R.cost(int(PACK_COST[pid]), w.disc)
-            if int(p.money) - cost >= -20 * R.acting_names(J).count("Credit Card"):
+            if cost <= 0 or int(p.money) - cost >= -20 * R.acting_names(J).count("Credit Card"):
                 w.f.update(money=int(p.money) - cost, game_stage=STAGE_PACK, pack_id=pid,
                            pack_left=int(PACK_CHOOSE[pid]), pack_return=STAGE_SHOP)
                 npeq(c, f"{tag}: OPEN: the pack slot is used", q.pack_slots[t], -1)
@@ -1396,6 +1433,23 @@ def check_step(c, tag, p, a, q, reward, out=None):
     return verb
 
 
+def _redraw_ref(c, tag, p, J, w, cid, sel):
+    """The Hanged Man / Immolate emptied the hand in a round with cards in the deck: the env
+    draws a new hand (game.lua DRAW_TO_HAND). Before any play or discard it is the first
+    hand: Certificate adds its card (first_hand_drawn)."""
+    if int(p.game_stage) != STAGE_BLIND or _USE[cid] not in (U_HANGED, U_IMMOLATE):
+        return
+    held = int(np.asarray(p.hand_valid).sum())
+    gone = len(_sel(p, sel, cid)[0]) if _USE[cid] == U_HANGED else min(_PARAM[cid], held)
+    if held - gone > 0 or int(p.deck_size) - int(p.deck_ptr) <= 0 or w_hand_size(J, w, p) <= 0:
+        return
+    if int(np.asarray(p.hand_round).sum()) == 0 and int(p.discards_used) == 0:
+        n_cert = min(_eff_count(J, "Certificate"), 3, int((~w.cards["card_live"]).sum()))
+        for _ in range(n_cert):
+            w.new_cards.append((True, dict(card_enh=0, card_ed=0)))
+        _bump(J, "Hologram", 0.25 * n_cert)
+
+
 def _add_tag(w, tag, hand):
     """add_tag: each held Double Tag gives a copy (of a tag that is not a Double Tag) and goes."""
     doubles = sum(t == "Double Tag" for t, _ in w.tags)
@@ -1421,7 +1475,7 @@ def _end_round(c, tag, p, q, J, w, held_cards, total, played=None):
     saved = not beaten and bones and total >= 0.25 * w.f["blind_target"]
     if beaten or saved:
         if saved:
-            J = _drop(J, set(bones))
+            J = _drop(J, {bones[0]})
         J, _ = _clear_round(c, tag, p, J, w, held_cards, bool(saved), played)
         J, gros = _deaths(c, tag, J, q)
         w.f["gros_extinct"] = bool(p.gros_extinct) or gros

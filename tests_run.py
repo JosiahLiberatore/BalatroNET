@@ -18,7 +18,7 @@ from env import (balatroAction, env_step, deal, reset, explain_play, preview, ac
                  STAGE_BLIND, STAGE_SHOP, STAGE_LOST, STAGE_WON, STAGE_SELECT, STAGE_NAMES, N_VERBS,
                  BLIND_SMALL, BLIND_BIG, BLIND_BOSS)
 from items import BOSS_MIN_ANTE, BOSS_SHOWDOWN, TAG_MIN_ANTE
-from jokers import JOKER_ID, J_EMPTY, MAX_JOKERS, N_JOKERS
+from jokers import JOKER_ID, J_EMPTY, MAX_JOKERS, N_JOKERS, COMMON
 from fixtures import state, select, mask_lanes, diff_states, report
 
 J_GREEN = JOKER_ID["Green Joker"]
@@ -169,11 +169,14 @@ def run_blind_end_test():
     c.check("held jokers never rolled", not (seen & {int(j) for j in trio}), sorted(seen))
 
     # the table holds more jokers than MAX_JOKERS, so the pool tests pass a
-    # `taken` mask. Pool of one: the last joker; an empty pool: a Joker.
+    # `taken` mask. Pool of one: the last joker of its rarity; a roll of another rarity (none
+    # left) and an empty pool give a Joker.
     greedy = JOKER_ID["Greedy Joker"]
     all_but = jnp.arange(N_JOKERS) != greedy
-    jid, _ = roll_joker(jax.random.key(0), pre, jax.random.key(1), all_but)
+    jid, _ = roll_joker(jax.random.key(0), pre, jax.random.key(1), all_but, rarity=COMMON)
     c.eq("pool of one", jid, greedy)
+    got = {int(roll_joker(jax.random.key(k), pre, jax.random.key(1), all_but)[0]) for k in range(40)}
+    c.check("pool of one, any rarity: it or a Joker", got == {greedy, J_JOKER}, sorted(got))
     jid, _ = roll_joker(jax.random.key(0), pre, jax.random.key(1), jnp.ones(N_JOKERS, bool))
     c.eq("empty pool: fallback Joker", jid, J_JOKER)
     roll = roll_shop(jax.random.key(0), pre)

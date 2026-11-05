@@ -318,34 +318,35 @@ VOUCHER_NEEDS = jnp.array([i - 1 if i % 2 else -1 for i in range(N_VOUCHERS)], j
 MAX_SHOP_VOUCHERS = 4          # the ante's voucher + up to 3 Voucher Tags (more are dropped)
 
 # --- tags (P_TAGS, in order; min ante; tag.lua apply_to_run) -----------------------------------------
+# min ante 0 = none (P_TAGS min_ante nil: any ante, also ante 0 after Hieroglyph / Petroglyph); 2 = from ante 2
 TG_UNCOMMON, TG_RARE, TG_NEGATIVE, TG_FOIL, TG_HOLO, TG_POLY, TG_INVESTMENT, TG_VOUCHER, TG_BOSS, \
     TG_STANDARD, TG_CHARM, TG_METEOR, TG_BUFFOON, TG_HANDY, TG_GARBAGE, TG_ETHEREAL, TG_COUPON, \
     TG_DOUBLE, TG_JUGGLE, TG_D6, TG_TOP_UP, TG_SKIP, TG_ORBITAL, TG_ECONOMY = range(24)
 TAG_TABLE = [
-    ("Uncommon Tag", 1, "Shop has a free Uncommon Joker"),
-    ("Rare Tag", 1, "Shop has a free Rare Joker"),
+    ("Uncommon Tag", 0, "Shop has a free Uncommon Joker"),
+    ("Rare Tag", 0, "Shop has a free Rare Joker"),
     ("Negative Tag", 2, "Next base edition shop Joker is free and becomes Negative"),
-    ("Foil Tag", 1, "Next base edition shop Joker is free and becomes Foil"),
-    ("Holographic Tag", 1, "Next base edition shop Joker is free and becomes Holographic"),
-    ("Polychrome Tag", 1, "Next base edition shop Joker is free and becomes Polychrome"),
-    ("Investment Tag", 1, "Gain $25 after defeating the next Boss Blind"),
-    ("Voucher Tag", 1, "Adds one Voucher to the next shop"),
-    ("Boss Tag", 1, "Rerolls the Boss Blind"),
+    ("Foil Tag", 0, "Next base edition shop Joker is free and becomes Foil"),
+    ("Holographic Tag", 0, "Next base edition shop Joker is free and becomes Holographic"),
+    ("Polychrome Tag", 0, "Next base edition shop Joker is free and becomes Polychrome"),
+    ("Investment Tag", 0, "Gain $25 after defeating the next Boss Blind"),
+    ("Voucher Tag", 0, "Adds one Voucher to the next shop"),
+    ("Boss Tag", 0, "Rerolls the Boss Blind"),
     ("Standard Tag", 2, "Gives a free Mega Standard Pack"),
-    ("Charm Tag", 1, "Gives a free Mega Arcana Pack"),
+    ("Charm Tag", 0, "Gives a free Mega Arcana Pack"),
     ("Meteor Tag", 2, "Gives a free Mega Celestial Pack"),
     ("Buffoon Tag", 2, "Gives a free Mega Buffoon Pack"),
     ("Handy Tag", 2, "Gives $1 per played hand this run"),
     ("Garbage Tag", 2, "Gives $1 per unused discard this run"),
     ("Ethereal Tag", 2, "Gives a free Spectral Pack"),
-    ("Coupon Tag", 1, "Initial cards and booster packs in next shop are free"),
-    ("Double Tag", 1, "Gives a copy of the next selected Tag (Double Tag excluded)"),
-    ("Juggle Tag", 1, "+3 hand size next round"),
-    ("D6 Tag", 1, "Rerolls in next shop start at $0"),
+    ("Coupon Tag", 0, "Initial cards and booster packs in next shop are free"),
+    ("Double Tag", 0, "Gives a copy of the next selected Tag (Double Tag excluded)"),
+    ("Juggle Tag", 0, "+3 hand size next round"),
+    ("D6 Tag", 0, "Rerolls in next shop start at $0"),
     ("Top-up Tag", 2, "Create up to 2 Common Jokers (Must have room)"),
-    ("Skip Tag", 1, "Gives $5 per skipped Blind this run"),
+    ("Skip Tag", 0, "Gives $5 per skipped Blind this run"),
     ("Orbital Tag", 2, "Upgrade a poker hand by 3 levels"),
-    ("Economy Tag", 1, "Doubles your money (Max of $40)"),
+    ("Economy Tag", 0, "Doubles your money (Max of $40)"),
 ]
 N_TAGS = len(TAG_TABLE)
 TAG_NAMES = [n for n, _, _ in TAG_TABLE]

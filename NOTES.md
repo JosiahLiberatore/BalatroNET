@@ -371,6 +371,53 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
         ref_balatro.PAIRS_ORDER. A continued run (save + load) rebuilds the table in another order.
       Scenarios: Play / Discard with no card (Rules), 16 slots and the cap (Negative), To Do List
       secret hands with pick rates, two Ox ties.
+- [x] Lua review fixes (2026-11-04). A full review of the env against the 1.0.1o Lua (10 review
+      agents by area; every finding checked again in the Lua; the list with the Lua lines and the
+      decisions is the claude.ai doc "BalatroNET Env Review"). ENV RULES:
+      - An empty hand with cards left in the deck is drawn again in a round (game.lua 2544:
+        SELECTING_HAND with no card -> DRAW_TO_HAND; The Serpent: 3 once a hand was played; before
+        any play or discard it is still the first hand: The House, Certificate). Was: the round
+        could not go on: The Hanged Man / Immolate could empty the hand, and since the empty-PLAY
+        no-op of the fix above, Play and Discard did nothing there (an endless episode).
+      - chips_scored stops at 2^31 - 1 (was: an int32 wrap made a won blind a loss).
+      - The run starts with the Red Deck, the game's default deck: 4 discards (was 3, no real deck).
+        The fixtures keep their own values (a mid-round blind() has 3 discards per round).
+      - create_card('Joker'): the rarity first (70 / 25 / 5 %), then a joker uniform among the
+        available ones of it; none left: Joker (was one weighted draw: held, shown and gated jokers
+        moved the shares, 70.4 / 24.4 / 5.2 at the run start). Shops, Buffoon packs, Judgement.
+      - Overstock / Overstock Plus refill every empty card slot, a bought one too (change_shop_size).
+      - MOVE_CARD reaches every card (env.card_lanes: the hand size, or up to the last card past it).
+      - A larger hand size in a round draws the new cards at once (CardArea:change_size): a sold Merry
+        Andy / Stuntman, an Invisible Joker's copy of a hand-size joker, Crimson Heart letting a
+        Juggler go (or disabling a Stuntman), The Manacle disabled by a sale (+1, and its own draw:
+        2 cards). A consumable's new joker (Judgement, The Soul) does not draw (state PLAY_TAROT).
+      - A tag's free pack moves state.key: a Double Tag's second pack is new when the first is skipped.
+      - DNA: the copy joins the end of the hand in BEFORE (G.hand:emplace): a held card in its own hand
+        (Steel, Baron, Raised Fist, Blackboard, Mime), Erosion counts it, Hologram gains at once;
+        every DNA effect makes one (Blueprint + DNA + Brainstorm: 3; was at most 2).
+      - The Pillar's mark lives in card.ability: Midas Mask, Vampire and the enhancement Tarots clear
+        it (set_ability builds a new table), Death, Cryptid and DNA copy it (copy_card).
+      - A $0 buy / pack / reroll works at any money (can_buy / can_open / can_reroll: cost > 0 to refuse).
+      - Rerolls: (D6 Tag ? $0 : the base) + the paid rerolls of this shop (new state reroll_inc,
+        reroll_d6); Reroll Surplus / Glut in a D6 shop take $2 off the next reroll only.
+      - Joker Stencil gives X1 at 1 or less (more jokers than slots; was X0).
+      - Selling a Blueprint / Brainstorm runs the copied joker's sale ability (Luchador, Diet Cola).
+      - A Glass card Trading Card destroys shatters: Glass Joker gains.
+      - A Negative Emperor / High Priestess / Fool keeps its own slot while it acts.
+      - Two Mr. Bones: only the first saves the run and goes.
+      - The 15 tags with no minimum ante (P_TAGS min_ante nil) also come at ante 0 (was: the Uncommon
+        Tag only). items.TAG_TABLE min ante 0.
+      - Sixth Sense and the Glass check read the cards after BEFORE (a Stone 6 a Vampire strips).
+      - Burglar takes the discards before a Riff-raff Drunkard adds its +1 (1 discard, was 0).
+      - Hand size 0 with no card: the draw ends the run (GAME_OVER) before Certificate and Mr. Bones.
+      - A card added to the hand goes to its end (the cards close up, order kept), as G.hand:emplace.
+      - Invariants: jokers <= slots + 1 (a charged Negative Invisible Joker sold at full slots),
+        consumables <= slots + Negatives + 1 (a Negative Emperor's / Fool's cards).
+      AGENT (no training change): the legal mask follows the env ($0 items; a couponed card or pack
+      costs $0 there; MOVE_CARD over env.card_lanes). The obs still shows a couponed card's full price.
+      TESTS: 36 new scenarios (Rules: Deck, Draw, Hand size, Move, Chips, Shop; the jokers, Tarots,
+      bosses, tags and vouchers above); the reference model (ref_balatro.ref_play, tests_jokers.
+      check_step) follows every change.
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -403,6 +450,22 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - a bought Tarot / Planet goes to a slot (no "buy and use"; a human convenience, kept out)
 - The Ox: a tie uses the pairs() order of a new run; after a save + continue the game uses another
 - at most 8 held tags (MAX_TAGS)
+- one deck only: the Red Deck (the game's default, 4 discards); White Stake; no endless mode
+- the round's chips stop at 2^31 - 1, a hand's score at 2,147,483,520 (int32; the game: a double,
+  up to ~1e308). No result changes: the run ends at ante 8, whose largest target is 300,000
+- found in the Lua review (2026-11-04), kept as they are:
+  - The Emperor can make The Emperor (the game: never, the used card still counts as present)
+  - each Arcana / Spectral pack deals from a fresh shuffle (the game: the next cards from the deck
+    top; the hand goes back to the bottom; shuffles only at the run start, cash out, blind start)
+  - the score floor is float32 (+-1 chip only at an exact target); retrigger caps 12 scored /
+    6 held (only Showman duplicates or long copy chains pass them)
+  - no cash-out screen: USE / SELL before the first shop roll cannot change its pool
+  - a USE with too many cards selected takes the first ones (the game turns the button off)
+- open (no decision yet): Midas Mask / Vampire do not check the boss debuff again in BEFORE;
+  Showman duplicates (two Trading Cards pay $3 in all, an Invisible copy of an Invisible Joker keeps
+  its count); a card played in the Pillar blind counts as debuffed at once (Canio); the Orbital
+  Tag's hand when an ante number comes back, The Needle with 0 base hands, Crimson Heart on
+  Astronomer
 - face-down cards and jokers (boss blinds): in the env state (hand_down, joker_down) since
   2026-11-02, but the obs does not hide them yet (agent work). The plan: state keeps true rank/suit
   (env must score them), obs gets a face_down flag and zeroes that card's rank/suit lanes -> POMDP.

@@ -784,7 +784,8 @@ class App:
         h = self.h
         if int(h.game_stage) not in (STAGE_BLIND, STAGE_PACK):
             return
-        n = int(h.hand_size)
+        valid = [l for l in range(len(h.hand_valid)) if bool(h.hand_valid[l])]
+        n = max(int(h.hand_size), valid[-1] + 1 if valid else 0)          # env.card_lanes
         cards = [int(h.hand[l]) if bool(h.hand_valid[l]) else None for l in range(n)]
         rk = lambda i: -1 if int(h.card_enh[i]) == 6 else int(h.card_rank[i])      # Stone: last
         st = lambda i: int(h.card_suit[i])

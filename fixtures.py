@@ -216,7 +216,8 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           skips=0, played_ante=(), forced_card=None, hand_down=(), joker_debuff=(), ante_voucher=-1,
           shop_vouchers=(), cons_ed=(), ecto_minus=1, boss_hand=-1, ox_hand=None, unused_discards=0,
           round_hand_bonus=0, pack_return=None, shop_free=(), pack_free=(), shop_rank=(), shop_suit=(),
-          shop_enh=(), bosses_used=(), boss_rerolled=False, boss_sub=0, orbital_hands=(11, 11)):
+          shop_enh=(), bosses_used=(), boss_rerolled=False, boss_sub=0, orbital_hands=(11, 11),
+          reroll_inc=0, reroll_d6=False):
     """Author a balatroEnvState from the fields the scenario is actually about.
 
     hand        card-name string, or a list of ids. '.' is an empty lane.
@@ -244,6 +245,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
     played_ante card names played this ante (The Pillar); forced_card: Cerulean Bell's card
     hand_down / joker_debuff  lanes / slots (0/1 lists): face down / disabled by Crimson Heart
     shop_vouchers voucher names in the shop; ante_voucher: this ante's voucher (a name or -1)
+    reroll_inc / reroll_d6  paid rerolls in this shop / a D6 Tag made them start at $0
     """
     ids = cards(hand)
     jids = joker_ids(jokers)
@@ -324,6 +326,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         shop_enh=lanes(list(shop_enh), MAX_SHOP_SLOTS, 0),
         bosses_used=lanes(list(bosses_used), len(BOSS_ID), 0) if bosses_used else rf["bosses_used"],
         boss_rerolled=jnp.bool_(boss_rerolled), boss_sub=jnp.int32(boss_sub),
+        reroll_inc=jnp.int32(reroll_inc), reroll_d6=jnp.bool_(reroll_d6),
     )
 
     return balatroEnvState(

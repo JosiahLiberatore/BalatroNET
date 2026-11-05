@@ -63,7 +63,7 @@ from env import (balatroAction, balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, M
                  STAGE_BLIND, STAGE_SHOP, STAGE_PACK, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL,
                  V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, V_USE, V_SELL_CONS, V_OPEN, V_PICK, V_SKIP,
                  WIN_ANTE, live_v, bankrupt_at, reroll_price, item_cost, pack_cost, cons_room,
-                 can_use_base, pick_ok, deck_counts)
+                 can_use_base, pick_ok, deck_counts, affordable, shop_item_cost, card_lanes)
 from items import (N_HAND_TYPES, N_CONS, CONS_KIND, CONS_USE, CONS_PARAM, CONS_LO, CONS_HI, N_ENH,
                    N_ED, N_SEAL, N_PACKS, PACK_KIND, PACK_SLOTS, MAX_PACK, PK_ARCANA, IK_JOKER,
                    MAX_JOKER_SLOTS, ED_NEG, U_ENHANCE, U_SUIT, U_PLANET, MAX_PICK_USE)
@@ -167,19 +167,18 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
     shop = state.game_stage == STAGE_SHOP
     pack = state.game_stage == STAGE_PACK
     held = (state.jokers != J_EMPTY)
-    floor = bankrupt_at(state)                    # 0, or below with Credit Card
 
     slots = jnp.arange(MAX_SHOP_SLOTS)
     item, kind, ed = state.shop_slots, state.shop_kind, state.shop_ed
-    cost = item_cost(state, kind, item, ed)
+    cost = jax.vmap(lambda k: shop_item_cost(state, k))(slots)          # a couponed card is $0
     neg = (ed == ED_NEG) & (state.joker_slots < MAX_JOKER_SLOTS)
     room = jnp.where(kind == IK_JOKER, held.sum() < state.joker_slots + neg, cons_room(state) > 0)
-    buy = shop & (slots < state.shop_size) & (item >= 0) & (state.money - cost >= floor) & room
+    buy = shop & (slots < state.shop_size) & (item >= 0) & affordable(state, cost) & room
     sell = (blind | shop | pack) & held
     move = (blind | shop | pack) & (held.sum() >= 2)
-    move_card = (blind | pack) & (state.hand_size >= 2) & state.hand_valid.any()
+    move_card = (blind | pack) & (card_lanes(state) >= 2) & state.hand_valid.any()
     pid = state.pack_slots
-    opn = shop & (pid >= 0) & (state.money - jax.vmap(lambda p: pack_cost(state, p))(pid) >= floor)
+    opn = shop & (pid >= 0) & affordable(state, jax.vmap(lambda p, f: pack_cost(state, p, f))(pid, state.pack_free))
     cons = state.consumables[:K_CONS]
     present = cons >= 0
     use = (blind | shop | pack) & present & jax.vmap(lambda c: can_use_base(state, c, True))(cons)
@@ -191,7 +190,7 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
         buy,
         sell,
         jnp.stack([move, move_card]),
-        jnp.stack([shop & ((state.free_rerolls > 0) | (state.money - reroll_price(state) >= floor)), shop]),
+        jnp.stack([shop & ((state.free_rerolls > 0) | affordable(state, reroll_price(state))), shop]),
         opn, use, sell_c, pick, jnp.stack([pack]),
     ])
     return legal.at[A_NEXT].set(legal[A_NEXT] | ~legal.any())
@@ -202,10 +201,11 @@ def move_masks(state: balatroEnvState) -> jax.Array:
 
     The dst rows are the slots a move may END at; dst_mask() also removes src.
     Joker: any held slot (held jokers are packed). Card: src must hold a card,
-    dst is any lane < hand_size (holes shift like cards).
+    dst is any lane < env.card_lanes (the hand size, or up to the last card past it;
+    holes shift like cards).
     """
     held = state.jokers != J_EMPTY
-    lanes = jnp.arange(N_PTR) < state.hand_size
+    lanes = jnp.arange(N_PTR) < card_lanes(state)
     return jnp.stack([held, held, state.hand_valid & lanes, lanes])
 
 

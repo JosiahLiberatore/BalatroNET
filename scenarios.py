@@ -598,6 +598,13 @@ def _lvl2(hand):
 
 
 JOKERS = [
+    S("Jokers", "Joker Stencil", "more jokers than slots: X1, not X0",
+      """Joker Stencil's X Mult = empty slots (+1 for each Stencil). At 1 or less it gives nothing
+      (joker_main needs x_mult > 1). 6 jokers in 5 slots (a sold Negative Invisible Joker can do
+      it): KD KC = 30 x (2 + 5 x 4) = 660, not 0.""",
+      blind(jokers=("Joker",) * 5 + ("Joker Stencil",)),
+      [play("KD KC")],
+      [C("score", lambda r: int(r.play(0).score), 660)]),
     # --- counters that grow or shrink -------------------------------------------------
     S("Jokers", "Green Joker", "+1 Mult per hand, -1 per discard",
       """Green Joker gains +1 Mult before each hand scores and loses 1 Mult per discard, never
@@ -731,12 +738,12 @@ JOKERS = [
       30 x (2 + 15) = 510, then Gros Michel is destroyed and marked extinct: from now on a shop
       can have Cavendish and never Gros Michel. With this seed, the shop after the round has a
       Cavendish; buy it for $4.""",
-      blind(clear=True, jokers=("Gros Michel",) + ("Oops! All 6s",) * 3, key=22),
+      blind(clear=True, jokers=("Gros Michel",) + ("Oops! All 6s",) * 3, key=81),
       [play("KD KC"), buy(0)],
       [C("the Pair: mult 2 + 15", lambda r: float(r.play(0).mult), 17.0),
        C("jokers after the round", lambda r: r[1].jokers, ["Oops! All 6s"] * 3),
        C("Gros Michel is extinct", lambda r: bool(r[1].h.gros_extinct), True),
-       C("the shop after the round", lambda r: r[1].shop, ["Cavendish", "Splash"]),
+       C("the shop after the round", lambda r: r[1].shop, ["Cavendish", "Card Sharp"]),
        C("2000 shops after the round: a Cavendish", lambda r: in_shops(r.raw[1], "Cavendish"), True),
        C("2000 shops after the round: a Gros Michel", lambda r: in_shops(r.raw[1], "Gros Michel"), False),
        C("jokers after the buy", lambda r: r[2].jokers, ["Oops! All 6s"] * 3 + ["Cavendish"])]),
@@ -949,6 +956,14 @@ JOKERS = [
        C("money after the 2nd discard", lambda r: r[2].money, 3),
        C("3S still in the deck", lambda r: r[2].card("3S").live, True)]),
 
+    S("Jokers", "Trading Card", "a Glass card it destroys shatters: Glass Joker gains",
+      """The card Trading Card destroys shatters when it is a Glass card, and Glass Joker counts every
+      shattered card: X1 -> X1.75.""",
+      blind(jokers=("Trading Card", "Glass Joker"), cards_mod={"2H": dict(enh=4)}),
+      [discard("2H")],
+      [C("Glass Joker", lambda r: r[1].jv(1), 1.75), C("2H destroyed", lambda r: r[1].card("2H").live, False),
+       C("money", lambda r: r[1].money, 3)]),
+
     # --- hand size, hands, discards, slots --------------------------------------------------
     S("Jokers", "Juggler", "+1 hand size",
       """Juggler gives +1 hand size. Buy it ($4), start the blind: 9 cards are dealt.""",
@@ -965,6 +980,12 @@ JOKERS = [
       shop(shop_slots=("Merry Andy",)),
       [buy(0), next_blind(), play_blind()],
       [C("discards", lambda r: r[3].discards, 6), C("hand size", lambda r: r[3].hand_size, 7)]),
+    S("Jokers", "Merry Andy", "sold in a round: 1 card is drawn at once",
+      """A larger hand size in a round draws the new cards at once (CardArea:change_size). Sell Merry
+      Andy with 7 cards in hand: hand size 8, and the 8th card is drawn.""",
+      blind(hand="KD KC 2H 3S 4C 6D 7H", jokers=("Merry Andy",)),
+      [sell(0)],
+      [C("hand size", lambda r: r[1].hand_size, 8), C("cards in hand", lambda r: r[1].in_hand, 8)]),
     S("Jokers", "Troubadour", "+2 hand size, -1 hand",
       """Troubadour gives +2 hand size and -1 hand each round: 10 cards, 3 hands.""",
       shop(shop_slots=("Troubadour",)),
@@ -986,12 +1007,26 @@ JOKERS = [
       shop(shop_slots=("Stuntman",)),
       [buy(0), next_blind(), play_blind()],
       [C("hand size", lambda r: r[3].hand_size, 6)]),
+    S("Jokers", "Stuntman", "sold in a round: 2 cards are drawn at once",
+      """Sell Stuntman (-2 hand size) with 6 cards in hand: hand size 8, 2 cards drawn at once.""",
+      blind(hand="KD KC 2H 3S 4C 6D", jokers=("Stuntman",)),
+      [sell(0)],
+      [C("hand size", lambda r: r[1].hand_size, 8), C("cards in hand", lambda r: r[1].in_hand, 8)]),
     S("Jokers", "Burglar", "+3 hands, no discards",
       """When the blind starts, Burglar gives +3 hands and removes all discards: 7 hands, 0
       discards.""",
       shop(jokers=("Burglar",)),
       [next_blind(), play_blind()],
       [C("hands", lambda r: r[2].hands, 7), C("discards", lambda r: r[2].discards, 0)]),
+
+    S("Jokers", "Burglar", "a Drunkard from Riff-raff keeps its +1 discard",
+      """Burglar takes every discard, and a Drunkard that Riff-raff makes at the same blind start adds
+      its +1 after that (the ease_discard events end at 1 in either slot order). With this seed
+      Riff-raff makes a Drunkard: 1 discard, 4 + 3 = 7 hands.""",
+      shop(jokers=("Burglar", "Riff-raff"), key=1),
+      [next_blind(), play_blind()],
+      [C("Riff-raff made a Drunkard", lambda r: "Drunkard" in r[2].jokers, True),
+       C("discards", lambda r: r[2].discards, 1), C("hands", lambda r: r[2].hands, 7)]),
 
     # --- cards, Tarots, Planets, packs -----------------------------------------------------
     S("Jokers", "Marble Joker", "a Stone card into the deck at each blind",
@@ -1026,6 +1061,38 @@ JOKERS = [
       blind(jokers=("DNA",)),
       [play("KD KC"), play("2C")],
       [C("deck size", lambda r: r[2].deck_size, 52)]),
+    S("Jokers", "DNA", "the copy is a held card in its own hand",
+      """DNA's copy goes into the hand in the BEFORE step (G.hand:emplace), so it is already a held
+      card when the hand scores. Play a Steel KD alone with Baron: High Card 15 chips; the held copy
+      (Steel) gives X1.5 and Baron X1.5: 15 x 2.25 = 33.""",
+      blind(hand="KD 2H 3S 4C 6D 7H 8S 9C", jokers=("DNA", "Baron"), cards_mod={"KD": dict(enh=5)}),
+      [play("KD")],
+      [C("score", lambda r: int(r.play(0).score), 33), C("the copy at the end of the hand", lambda r: r[1].hand[-1], "KD"),
+       C("deck size", lambda r: r[1].deck_size, 53)]),
+    S("Jokers", "DNA", "Hologram counts the copy at once",
+      """The copy is added to the deck in the BEFORE step, and Hologram gains X0.25 at once
+      (playing_card_joker_effects): KD alone = 15 x 1.25 = 18.""",
+      blind(jokers=("DNA", "Hologram")),
+      [play("KD")],
+      [C("score", lambda r: int(r.play(0).score), 18), C("Hologram after", lambda r: r[1].jv(1), 1.25)]),
+    S("Jokers", "DNA", "Erosion counts the copy",
+      """Erosion: +4 Mult per card below 52 in the full deck. A 50-card deck: the copy makes it 51
+      before Erosion scores: KD alone = 15 x (1 + 4) = 75.""",
+      blind(jokers=("DNA", "Erosion"), deck_size=50),
+      [play("KD")],
+      [C("score", lambda r: int(r.play(0).score), 75)]),
+    S("Jokers", "DNA", "Blueprint and Brainstorm: 3 copies",
+      """Blueprint copies DNA to its right, and Brainstorm copies the leftmost joker, the Blueprint:
+      3 DNA effects, 3 copies (no Showman needed). The deck has 55 cards.""",
+      blind(jokers=("Blueprint", "DNA", "Brainstorm")),
+      [play("KD")],
+      [C("deck size", lambda r: r[1].deck_size, 55), C("Kings of Diamonds in hand", lambda r: r[1].hand.count("KD"), 3)]),
+    S("Jokers", "DNA", "the copy keeps The Pillar's mark",
+      """copy_card copies the card's ability table, and the played card already has its "played this
+      ante" mark: the copy has it too (The Pillar will debuff both).""",
+      blind(jokers=("DNA",)),
+      [play("KD")],
+      [C("marked cards (KD and its copy)", lambda r: r[1].played_ante, 2)]),
     S("Jokers", "Hiker", "+5 permanent Chips on each scored card",
       """Every played card that scores gains +5 Chips for good. This hand scores 30 chips (the
       bonus counts from the next time); then KD and KC each have +5.""",
@@ -1265,6 +1332,12 @@ TAROTS = [
       [use(0), use(0)],
       [C("after the 1st Fool", lambda r: r[1].cons, ["The Fool", "The Hermit"]),
        C("after the 2nd Fool", lambda r: r[2].cons, ["The Fool", "The Hermit"])]),
+    S("Tarots", "The Fool", "a Negative one keeps its slot while it acts",
+      """A Negative Fool with Mercury and Venus in 2 slots: its slot still counts, so The Fool makes
+      The Magician (the last card used): 3 cards held.""",
+      blind(consumables=("The Fool", "Mercury", "Venus"), cons_ed=(4, 0, 0), last_cons=CONS_ID["The Magician"]),
+      [use(0)],
+      [C("consumables", lambda r: r[1].cons, ["Mercury", "Venus", "The Magician"])]),
     S("Tarots", "The Magician", "2 cards become Lucky",
       """The Magician enhances up to 2 selected cards into Lucky cards.""",
       blind(consumables=("The Magician",)),
@@ -1287,6 +1360,12 @@ TAROTS = [
       blind(consumables=("The Emperor",)),
       [use(0)],
       [C("Tarots held", lambda r: r[1].n_cons(CK_TAROT), 2)]),
+    S("Tarots", "The Emperor", "a Negative one keeps its slot while it acts",
+      """A used card leaves its slot at once, but a Negative card's +1 slot stays until it dissolves.
+      A Negative Emperor (from Perkeo) with The Magician in 2 slots: room for 2 new Tarots, 3 held.""",
+      blind(consumables=("The Emperor", "The Magician"), cons_ed=(4, 0)),
+      [use(0)],
+      [C("Tarots held", lambda r: r[1].n_cons(CK_TAROT), 3)]),
     S("Tarots", "The Hierophant", "2 cards become Bonus cards",
       """The Hierophant enhances up to 2 selected cards into Bonus cards (+30 Chips).""",
       blind(consumables=("The Hierophant",)),
@@ -1633,7 +1712,107 @@ def _todo_share(hand_played, old, hand, n=4000):
     return float((np.asarray(got) == HAND_NAMES.index(hand)).mean())
 
 
+def _rarity_shares(s, n=8000):
+    """(Common, Uncommon, Rare) shares of the jokers in n fresh shops of s."""
+    ids, kinds, _, _ = _shop_arrays(s, n)
+    r = np.asarray(JOKER_RARITY)[ids[kinds == IK_JOKER]]
+    return tuple(round(float((r == k).mean()), 3) for k in (1, 2, 3))
+
+
+def _one_common_left(n=8000):
+    """The share of Common jokers create_card makes when every Common but Joker is taken:
+    the rarity comes first (70 %), and that one Common then gets every Common roll."""
+    from env import roll_joker
+    s = state()
+    common = np.asarray(JOKER_RARITY) == 1
+    taken = jnp.asarray(common & (np.arange(len(common)) != JOKER_ID["Joker"]))
+    keys = jax.random.split(jax.random.key(5), n)
+    ids = jax.vmap(lambda k: roll_joker(k, s, k, taken)[0])(keys)
+    return round(float((np.asarray(ids) == JOKER_ID["Joker"]).mean()), 3)
+
+
+def _ante0_tags(n=6000):
+    """The Small / Big Blind tags rolled at ante 0 (a boss beaten at ante -1): -> (share of the
+    Uncommon Tag, the number of different tags)."""
+    from env import new_ante_rolls
+    s = state(ante=0)
+    tags = jax.vmap(lambda k: new_ante_rolls(k, s).blind_tags)(jax.random.split(jax.random.key(7), n))
+    t = np.asarray(tags).ravel()
+    return round(float((t == TAG_ID["Uncommon Tag"]).mean()), 3), len(set(t.tolist()))
+
+
+def _new_run():
+    from env import reset
+    return reset(jax.random.key(0), 52, 8)
+
+
+def _debuffed_inst(v, i):
+    """Is card instance i debuffed by the boss in View v?"""
+    from env import card_debuffed
+    return bool(card_debuffed(v.h, i))
+
+
 RULES = [
+    S("Rules", "Deck", "a new run uses the Red Deck",
+      """Every run needs a deck, and the game's default one is the Red Deck: +1 discard. A new run
+      starts with 4 hands, 4 discards, $4, a hand size of 8, 5 joker slots and 2 consumable slots,
+      at the Small Blind's select. (Other decks are not in the env.)""",
+      _new_run,
+      [],
+      [C("hands", lambda r: r[0].hands, 4), C("discards", lambda r: r[0].discards, 4),
+       C("discards per round", lambda r: int(r[0].h.discardcount), 4), C("money", lambda r: r[0].money, 4),
+       C("hand size", lambda r: r[0].hand_size, 8), C("joker slots", lambda r: r[0].joker_slots, 5),
+       C("consumable slots", lambda r: int(r[0].h.consumable_slots), 2), C("stage", lambda r: r[0].stage, "SELECT")]),
+    S("Rules", "Draw", "an emptied hand is drawn again",
+      """When a Tarot or Spectral card destroys the last cards in hand and the deck still has cards,
+      the game deals a new hand (SELECTING_HAND with no card -> DRAW_TO_HAND). The Hanged Man on the
+      last 2 cards: a new hand of 8 from the 44 left. (Before: the round could not go on.)""",
+      blind(hand="KD KC", hand_size=8, consumables=("The Hanged Man",)),
+      [use(0, "KD KC")],
+      [C("cards in hand", lambda r: r[1].in_hand, 8), C("cards left in the deck", lambda r: r[1].deck_size - r[1].h.deck_ptr, 36),
+       C("stage", lambda r: r[1].stage, "BLIND"), C("hands left", lambda r: r[1].hands, 3)]),
+    S("Rules", "Draw", "The Serpent: an emptied hand gets 3 cards",
+      """After a hand was played, The Serpent draws only 3 cards, this new hand too.""",
+      blind(hand="KD KC", hand_size=8, consumables=("The Hanged Man",), hand_round=_counts(pair=1),
+            boss="The Serpent", blind_index=2, ante=5),
+      [use(0, "KD KC")],
+      [C("cards in hand", lambda r: r[1].in_hand, 3)]),
+    S("Rules", "Hand size", "hand size 0 at the blind start: the run is lost",
+      """A draw at hand size 0 with no card in hand ends the run (draw_from_deck_to_hand: GAME_OVER),
+      before first_hand_drawn: Certificate makes no card, and Mr. Bones cannot save it.""",
+      dict(hand="", hand_size=0, base_hand_size=0, deck_ptr=0, game_stage=STAGE_SELECT, money=10,
+           jokers=("Certificate", "Mr. Bones")),
+      [play_blind()],
+      [C("stage", lambda r: r[1].stage, "LOST"), C("cards in hand", lambda r: r[1].in_hand, 0),
+       C("deck size", lambda r: r[1].deck_size, 52), C("jokers", lambda r: r[1].jokers, ["Certificate", "Mr. Bones"])]),
+    S("Rules", "Move", "a card past the hand size can move",
+      """Certificate, DNA and the like put a card at the end of the hand, past the hand size. The game
+      lets you drag every card: move the 9th card (lane 8) to the front.""",
+      blind(hand="KD KC 2H 3S 4C 6D 7H 8S 9C", hand_size=8, deck_ptr=9),
+      [Step(V_MOVE_CARD, "", 8, 0)],
+      [C("the hand", lambda r: r[1].hand, ["9C", "KD", "KC", "2H", "3S", "4C", "6D", "7H", "8S"])]),
+    S("Rules", "Chips", "the round's chips stop at 2^31 - 1",
+      """The game adds the chips in a double; the env stops the round's total at 2,147,483,647 (int32),
+      so it never wraps to a negative number. 1,000 chips scored, then a hand far past 2^31 (a Vampire
+      at X100,000,000): the total is 2,147,483,647 and the blind (1,000,000,000) is beaten.""",
+      blind(jokers=("Vampire",), joker_value=(1e8,), chips_scored=1000, blind_target=10 ** 9),
+      [play("KD KC")],
+      [C("chips scored", lambda r: r[1].chips_scored, 2147483647), C("stage", lambda r: r[1].stage, "SHOP")]),
+    S("Rules", "Shop", "joker rarities: 70 / 25 / 5 %",
+      """create_card rolls the rarity first: Common 70 %, Uncommon 25 %, Rare 5 % (> 0.7, > 0.95),
+      then a joker of that rarity. The 6 jokers that need an Enhanced card or an extinct Gros Michel
+      do not move these shares (8000 shops).""",
+      lambda: state(),
+      [],
+      [C("Common", lambda r: _rarity_shares(r.raw[0])[0], Between(0.685, 0.715)),
+       C("Uncommon", lambda r: _rarity_shares(r.raw[0])[1], Between(0.235, 0.265)),
+       C("Rare", lambda r: _rarity_shares(r.raw[0])[2], Between(0.04, 0.06))]),
+    S("Rules", "Shop", "the rarity comes first: one Common left still gets 70 %",
+      """When every Common joker but Joker is taken, a roll that lands on Common gives Joker: Joker
+      comes up 70 % of the time (8000 rolls). (Before: about 4 %, the other rarities took the rest.)""",
+      lambda: state(),
+      [],
+      [C("share of Joker", lambda r: _one_common_left(), Between(0.68, 0.72))]),
     S("Rules", "Play", "Play needs a card",
       """The game turns the Play Hand button off when no card is selected. In the env a PLAY with
       no card is a no-op: no hand is used, nothing scores, the state stays the same.""",
@@ -1925,6 +2104,12 @@ BOSSES = [
       boss_select("The Manacle"),
       [play_blind()],
       [C("hand size", lambda r: r[1].hand_size, 7), C("cards in hand", lambda r: r[1].in_hand, 7)]),
+    S("Bosses", "The Manacle", "a sold Luchador: 2 cards drawn",
+      """Disabled in a round, The Manacle gives back its -1 hand size (change_size draws 1 card) and
+      draws 1 card more (draw_from_deck_to_hand(1)): 7 cards -> 9.""",
+      boss("The Manacle", hand="KD KC 2H 3S 4C 6D 7H", hand_size=7, base_hand_size=8, jokers=("Luchador",)),
+      [sell(0)],
+      [C("cards in hand", lambda r: r[1].in_hand, 9), C("hand size", lambda r: r[1].hand_size, 8)]),
     S("Bosses", "The Eye", "a hand type played this round scores nothing",
       """The Eye: no poker hand type may be played twice in a round. A Pair was played this round,
       so KD KC is debuffed: 0.""",
@@ -1965,6 +2150,25 @@ BOSSES = [
       boss("The Pillar", played_ante=("KD",)),
       [play("KD KC")],
       [C("score", _score(), 40)]),
+    S("Bosses", "The Pillar", "Midas Mask's Gold cards lose the mark",
+      """The mark is a key of the card's ability table. Midas Mask calls set_ability, which builds a
+      new table: KD KC played in the Small Blind become Gold and are not marked.""",
+      blind(jokers=("Midas Mask",)),
+      [play("KD KC")],
+      [C("marked cards", lambda r: r[1].played_ante, 0), C("KD", lambda r: r[1].card("KD").enh, "Gold")]),
+    S("Bosses", "The Pillar", "an enhanced card is no longer debuffed",
+      """The Empress (set_ability) clears KD's mark, so The Pillar lets it score: KD alone = (5 + 10)
+      x (1 + 4) = 75.""",
+      boss("The Pillar", played_ante=("KD",), consumables=("The Empress",)),
+      [use(0, "KD"), play("KD")],
+      [C("KD debuffed before", lambda r: r[0].debuffed("KD"), True), C("KD debuffed after", lambda r: r[1].debuffed("KD"), False),
+       C("score", _score(1), 75)]),
+    S("Bosses", "The Pillar", "Death copies the mark",
+      """Death makes the left card a copy of the right one, its mark too (copy_card). KD (not marked)
+      and 2H (marked): KD becomes a marked 2H, debuffed in The Pillar.""",
+      boss("The Pillar", played_ante=("2H",), consumables=("Death",)),
+      [use(0, "KD 2H")],
+      [C("KD's card is now 2H", lambda r: r[1].card("KD").name, "2H"), C("debuffed", lambda r: r[1].debuffed("KD"), True)]),
     S("Bosses", "The Needle", "only 1 hand, x1 blind",
       """The Needle: 1 hand only, and the blind is small: 1 x the base. Ante 2: 800 chips.""",
       boss_select("The Needle"),
@@ -2029,6 +2233,14 @@ BOSSES = [
       boss("Crimson Heart", jokers=("Joker",), joker_debuff=(1,)),
       [play("KD KC")],
       [C("score", _score(), 60), C("disabled again", lambda r: r[1].jdeb(0), True)]),
+    S("Bosses", "Crimson Heart", "a Juggler let go draws 1 card at once",
+      """Each hand Crimson Heart lets the old joker go (its +1 hand size comes back: 1 card is drawn at
+      once) and disables one again; with 1 joker it is the same Juggler. After the hand the draw fills
+      8 cards, then the Juggler's card makes 9 held at hand size 8.""",
+      boss("Crimson Heart", jokers=("Juggler",), joker_debuff=(1,), hand_size=8, base_hand_size=8),
+      [play("KD KC")],
+      [C("cards in hand", lambda r: r[1].in_hand, 9), C("hand size", lambda r: r[1].hand_size, 8),
+       C("Juggler disabled again", lambda r: r[1].jdeb(0), True)]),
     S("Bosses", "Cerulean Bell", "one card is always selected",
       """Cerulean Bell: one card in hand is forced into every hand played. 2H is forced: play KD
       KC and 2H is played too (a kicker; the Pair scores 60). A new forced card is picked after the
@@ -2049,6 +2261,11 @@ BOSSES = [
       boss("The Club", jokers=("Luchador",)),
       [sell(0), play("KD KC")],
       [C("boss disabled", lambda r: r[1].boss_disabled, True), C("score", _score(1), 60)]),
+    S("Bosses", "Luchador", "a sold Blueprint copying it disables the boss",
+      """Selling a Blueprint runs Luchador's sale ability too: The Club is disabled.""",
+      boss("The Club", jokers=("Blueprint", "Luchador")),
+      [sell(0)],
+      [C("boss disabled", lambda r: r[1].boss_disabled, True), C("jokers", lambda r: r[1].jokers, ["Luchador"])]),
     S("Bosses", "Matador", "$8 when the hand triggers the boss",
       """Matador earns $8 when the played hand triggers the Boss Blind's ability. The Club
       debuffs KC in KD KC: +$8.""",
@@ -2123,6 +2340,14 @@ TAGS = [
       [play("KD KC")],
       [C("shop slot 1", lambda r: r[1].shop_rarity(0), "Uncommon"), C("its price", lambda r: r[1].shop_price(0), 0),
        C("tags left", lambda r: r[1].tags, [])]),
+    S("Tags", "Uncommon Tag", "ante 0: any of the 15 tags",
+      """The 15 tags with no minimum ante (P_TAGS min_ante nil) can come at ante 0 too (a boss beaten
+      at ante -1). The blind tags rolled there: the Uncommon Tag 1 time in 15, and all 15 tags
+      (6000 rolls). (Before: always the Uncommon Tag.)""",
+      lambda: state(),
+      [],
+      [C("share of the Uncommon Tag", lambda r: _ante0_tags()[0], Between(0.055, 0.08)),
+       C("different tags", lambda r: _ante0_tags()[1], 15)]),
     S("Tags", "Rare Tag", "a free Rare joker in the next shop",
       """Rare Tag: the next shop's first card is a Rare joker, and it is free.""",
       blind(clear=True, tags=("Rare Tag",)),
@@ -2209,12 +2434,25 @@ TAGS = [
       [C("card prices", lambda r: [r[1].shop_price(i) for i in range(2)], [0, 0]),
        C("pack prices", lambda r: [r[1].pack_price(i) for i in range(2)], [0, 0]),
        C("tags left", lambda r: r[1].tags, [])]),
+    S("Tags", "Coupon Tag", "a free card can be taken below $0",
+      """can_buy refuses only a card that costs more than $0: a couponed joker is bought even at -$3
+      (The Tooth can leave the money below $0).""",
+      shop(shop_slots=("Joker", "Bull"), shop_free=(1, 0), money=-3),
+      [buy(0)],
+      [C("jokers", lambda r: r[1].jokers, ["Joker"]), C("money", lambda r: r[1].money, -3)]),
     S("Tags", "Double Tag", "a copy of the next tag",
       """Double Tag: the next tag taken comes twice (a Double Tag is not copied). Skip for a
       Coupon Tag with a Double Tag held: two Coupon Tags.""",
       _skip_tag("Coupon Tag", tags=("Double Tag",)),
       [skip_blind()],
       [C("tags", lambda r: r[1].tags, ["Coupon Tag", "Coupon Tag"])]),
+    S("Tags", "Double Tag", "two free packs: the second one is new",
+      """A Double Tag copies a Charm Tag: two free Mega Arcana Packs. Skip the first one: the second
+      is a new pack (new cards), not the same one again.""",
+      _skip_tag("Charm Tag", tags=("Double Tag",)),
+      [skip_blind(), skip()],
+      [C("a second pack", lambda r: r[2].pack_name, "Mega Arcana Pack"),
+       C("new cards", lambda r: list(r[2].h.pack_items) != list(r[1].h.pack_items), True)]),
     S("Tags", "Juggle Tag", "+3 hand size next round",
       """Juggle Tag: +3 hand size for the next round only. Skip the Small Blind, play the Big
       Blind: 11 cards.""",
@@ -2228,6 +2466,13 @@ TAGS = [
       [play("KD KC"), reroll()],
       [C("reroll price", lambda r: r[1].reroll_cost, 0), C("money after a reroll", lambda r: r[2].money, lambda r: r[1].money),
        C("the next reroll", lambda r: r[2].reroll_cost, 1)]),
+    S("Tags", "D6 Tag", "a $0 reroll works below $0",
+      """can_reroll refuses only a reroll that costs more than $0: in a D6 shop the $0 reroll works at
+      -$3; the next one costs $1.""",
+      shop(shop_slots=("Joker", "Bull"), money=-3, reroll_cost=0, reroll_d6=True),
+      [reroll()],
+      [C("rerolled", lambda r: r[1].shop != ["Joker", "Bull"], True), C("money", lambda r: r[1].money, -3),
+       C("the next reroll", lambda r: r[1].reroll_cost, 1)]),
     S("Tags", "Top-up Tag", "2 Common jokers",
       """Top-up Tag: up to 2 Common jokers, if there is room.""",
       _skip_tag("Top-up Tag"),
@@ -2275,6 +2520,12 @@ VOUCHERS = [
       [redeem(0)],
       [C("money", lambda r: r[1].money, 0), C("shop size", lambda r: r[1].shop_size, 3),
        C("cards in the shop", lambda r: len(r[1].shop), 3), C("vouchers", lambda r: r[1].vouchers, ["Overstock"])]),
+    S("Vouchers", "Overstock", "the bought slots are refilled too",
+      """change_shop_size fills joker_max - #cards slots: every empty one, not only the new one. Buy
+      the Joker, then redeem Overstock: Bull + 2 new cards.""",
+      _redeem_shop("Overstock", shop_slots=("Joker", "Bull"), money=30),
+      [buy(0), redeem(0)],
+      [C("cards in the shop", lambda r: len(r[2].shop), 3), C("Bull is still there", lambda r: "Bull" in r[2].shop, True)]),
     S("Vouchers", "Overstock Plus", "+1 more card slot",
       """Overstock Plus (needs Overstock): +1 more card slot: 4.""",
       _redeem_shop("Overstock Plus", vouchers=("Overstock",), shop_size=3, shop_slots=("Joker", "Bull", "Banner")),
@@ -2319,6 +2570,14 @@ VOUCHERS = [
       blind(clear=True, vouchers=("Reroll Surplus",)),
       [play("KD KC")],
       [C("reroll price", lambda r: r[1].reroll_cost, 3)]),
+    S("Vouchers", "Reroll Surplus", "in a D6 shop: $2 off the next reroll only",
+      """A reroll costs (the D6 Tag's $0, else the base) + the paid rerolls so far. Reroll Surplus
+      takes $2 off the price shown and off the base, but the D6 Tag's $0 hides the base. After 2 paid
+      rerolls ($0, $1) the price is $2; Surplus: $0; reroll; the next costs 0 + 3 = $3.""",
+      _redeem_shop("Reroll Surplus", reroll_cost=2, reroll_inc=2, reroll_d6=True, money=20),
+      [redeem(0), reroll(), reroll()],
+      [C("price after Surplus", lambda r: r[1].reroll_cost, 0), C("money after the $0 reroll", lambda r: r[2].money, 10),
+       C("the next price", lambda r: r[2].reroll_cost, 3), C("money after that", lambda r: r[3].money, 7)]),
     S("Vouchers", "Reroll Glut", "rerolls cost $2 less again",
       """Reroll Glut (needs Reroll Surplus): $2 less again: $3 -> $1.""",
       _redeem_shop("Reroll Glut", vouchers=("Reroll Surplus",), reroll_cost=3),
@@ -2572,6 +2831,12 @@ SPECTRALS = [
       [use(0, "KD")],
       [C("deck size", lambda r: r[1].deck_size, 54), C("cards in hand", lambda r: r[1].in_hand, 10),
        C("Mult Kings of Diamonds with a Gold Seal", lambda r: r[1].n_cards(rank=11, suit=1, enh="Mult", seal="Gold"), 3)]),
+    S("Spectrals", "Cryptid", "the copies keep The Pillar's mark",
+      """copy_card copies the mark: 2H (played earlier this ante) gives 2 copies that The Pillar
+      debuffs too.""",
+      boss("The Pillar", played_ante=("2H",), consumables=("Cryptid",)),
+      [use(0, "2H")],
+      [C("copies debuffed", lambda r: [_debuffed_inst(r[1], 52), _debuffed_inst(r[1], 53)], [True, True])]),
     S("Spectrals", "The Soul", "a Legendary joker",
       """The Soul: creates a random Legendary joker (Canio, Triboulet, Yorick, Chicot, Perkeo).""",
       blind(consumables=("The Soul",)),
@@ -2640,6 +2905,12 @@ NEW_JOKERS = [
       blind("6D KC 2H 3S 4C 7D 7H 8S", jokers=("Sixth Sense",), hand_round=_counts(pair=1)),
       [play("6D")],
       [C("6D destroyed", lambda r: r[1].card("6D").live, True), C("Spectral cards held", lambda r: r[1].n_cons(CK_SPECTRAL), 0)]),
+    S("Jokers", "Sixth Sense", "a Stone 6 that Vampire strips counts",
+      """Sixth Sense reads the card after the BEFORE step: Vampire strips a Stone 6D, which is then a
+      6. As the first hand, alone: 6D is destroyed and a Spectral card is made.""",
+      blind(hand="6D KC 2H 3S 4C 7D 7H 8S", jokers=("Vampire", "Sixth Sense"), cards_mod={"6D": dict(enh=6)}),
+      [play("6D")],
+      [C("6D destroyed", lambda r: r[1].card("6D").live, False), C("Spectral cards", lambda r: r[1].n_cons(CK_SPECTRAL), 1)]),
     S("Jokers", "Madness", "X0.5 more and destroys a random joker",
       """Madness: when a Small or Big Blind is selected, it gains X0.5 Mult and destroys a random
       other joker. X1 -> X1.5.""",
@@ -2672,6 +2943,12 @@ NEW_JOKERS = [
       shop(jokers=("Diet Cola",)),
       [sell(0)],
       [C("tags", lambda r: r[1].tags, ["Double Tag"]), C("money", lambda r: r[1].money, 13)]),
+    S("Jokers", "Diet Cola", "a sold Blueprint copying it gives a Double Tag",
+      """Selling a Blueprint runs its target's own sale ability (selling_self; Diet Cola has no
+      blueprint guard): a Double Tag, and Diet Cola stays.""",
+      blind(jokers=("Blueprint", "Diet Cola")),
+      [sell(0)],
+      [C("tags", lambda r: r[1].tags, ["Double Tag"]), C("jokers", lambda r: r[1].jokers, ["Diet Cola"])]),
     S("Jokers", "Mr. Bones", "saves the run at 25% of the blind",
       """Mr. Bones: if the last hand ends with at least 25% of the blind's chips, the run goes on
       and Mr. Bones is destroyed. The blind pays no $3. 20 + 60 = 80 of 300 (>= 75).""",
@@ -2684,6 +2961,12 @@ NEW_JOKERS = [
       blind(hands=1, blind_target=300, jokers=("Mr. Bones",)),
       [play("KD KC")],
       [C("stage", lambda r: r[1].stage, "LOST")]),
+    S("Jokers", "Mr. Bones", "two Mr. Bones: only one goes",
+      """With two Mr. Bones (Showman or an Invisible Joker copy), the first one saves the run; then
+      game_over is false and the second does not act: it stays.""",
+      blind(jokers=("Mr. Bones", "Mr. Bones"), hands=1, chips_scored=100, blind_target=300),
+      [play("2H")],
+      [C("stage", lambda r: r[1].stage, "SHOP"), C("jokers", lambda r: r[1].jokers, ["Mr. Bones"])]),
     S("Jokers", "Throwback", "X0.25 Mult per blind skipped",
       """Throwback: X0.25 Mult for each blind skipped this run. 2 skipped: X1.5. 30 x 2 x 1.5 = 90.""",
       blind(jokers=("Throwback",), skips=2),
