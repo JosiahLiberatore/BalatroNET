@@ -11,13 +11,17 @@ reward, faster target scaling, -1 discard, Eternal / Perishable / Rental shop jo
     STAGE_SELECT NEXT (play the blind) / SKIP (Small or Big: take its tag) / REROLL
                  (the boss: Director's Cut, Retcon) / SELL / USE / SELL_CONS / MOVE_JOKER
     STAGE_BLIND  PLAY / DISCARD / SELL / USE / SELL_CONS / MOVE
-                 clear -> cashout -> STAGE_SHOP; out of hands -> STAGE_LOST
+                 clear -> the end of the round -> STAGE_CASHOUT; out of hands -> STAGE_LOST;
+                 a clear when the joker order can change the end of the round -> STAGE_END
+    STAGE_END    MOVE_JOKER / NEXT (the end of the round runs with the new joker order)
+    STAGE_CASHOUT  USE / SELL / SELL_CONS / MOVE_JOKER; NEXT (Cash Out): the $, the deck is
+                 shuffled, the shop opens -> STAGE_SHOP
     STAGE_SHOP   BUY / REDEEM / OPEN / SELL / USE / SELL_CONS / REROLL / MOVE_JOKER
                  NEXT -> STAGE_SELECT (the next blind); OPEN -> STAGE_PACK
     STAGE_PACK   PICK / SKIP / USE / SELL_CONS / SELL / MOVE
                  -> back to the shop, or to STAGE_SELECT (a tag's free pack)
     STAGE_LOST / STAGE_WON                 every verb is a no-op
-The ante goes up when its boss is beaten (in the cash out), and the next
+The ante goes up when its boss is beaten (at the end of the round), and the next
 ante's boss, tags and voucher are rolled then.
 
 CARDS are INSTANCES (NOTES: "card-instance migration"): slot i of the card_*
@@ -26,17 +30,20 @@ bonus chips). deck and hand hold instance indices. deck[:deck_size] are the
 live cards in draw order (deck[:deck_ptr] already dealt); the rest of deck are
 the free slots. A copied card (Death, DNA, a Standard pack) takes a free slot;
 a destroyed card (Glass, The Hanged Man, Trading Card) frees its slot. The
-standard deck is instances 0..51 with rank = i % 13, suit = i // 13.
+standard deck is instances 0..51 with rank = i % 13, suit = i // 13. The deck is
+shuffled only at the run start, at Cash Out and at the blind start; an Arcana /
+Spectral pack deals its hand from the top and puts it back at the bottom.
 
-BOSS BLINDS act only while their round is on (STAGE_BLIND) and not disabled
+BOSS BLINDS act only while their round is on (STAGE_BLIND, STAGE_END) and not disabled
 (Chicot, Luchador, a sold joker in Verdant Leaf). A debuffed card is a pure
 function of the boss and the card (card_debuffed), so it needs no state; The
 Pillar reads card_played_ante. Face-down cards (hand_down, joker_down) change
 nothing in the env: only what a player sees.
 
 The return contract (NOTES: "reward = CASHOUT dollars"):
-    reward = the cashout $ on the step that clears a blind, else 0
-             (a failed blind pays $0; chips are never reward)
+    reward = the cashout $ on the step that runs the end of a won round (the PLAY that
+             clears the blind, or NEXT in STAGE_END), else 0. The $ goes to the money at
+             Cash Out (a failed blind pays $0; chips are never reward)
     done   = this step ended the RUN (game_stage became STAGE_LOST or STAGE_WON)
 
 target_scale is the curriculum dial: every blind target is multiplied by it
@@ -88,7 +95,7 @@ from items import (HAND_NAMES, N_HAND_TYPES, SECRET_HANDS, OX_PAIRS_POS, N_CONS,
                    N_STAKES, ST_NO_SMALL_REWARD, ST_SCALING_2, ST_ETERNAL, ST_DISCARD, ST_SCALING_3, ST_PERISH,
                    ST_RENTAL, STK_ETERNAL, STK_PERISH, STK_RENTAL, STICKER_POLL, PERISH_POLL, PERISH_ROUNDS,
                    RENTAL_RATE, RENTAL_COST)
-from jokers import MAX_JOKERS, J_EMPTY, N_JOKERS, JOKERS, JOKER_COST, JOKER_RARITY, JOKER_ID
+from jokers import MAX_JOKERS, J_EMPTY, N_JOKERS, JOKERS, JOKER_COST, JOKER_RARITY, JOKER_ID, J_BLUEPRINT, J_BRAINSTORM
 from jokers import JOKER_ETERNAL_OK, JOKER_PERISH_OK
 from jokers import (N_QUERY_KINDS, Q_MONEY_DIV_5, Q_EMPTY_JOKER_SLOTS, Q_DECK_NINE_COUNT,
                     Q_DISCARDS_LEFT, Q_NO_DISCARDS_LEFT, Q_DECK_LEFT, Q_JOKER_COUNT, Q_MONEY,
@@ -172,7 +179,9 @@ STAGE_LOST   = 2
 STAGE_WON    = 3
 STAGE_PACK   = 4
 STAGE_SELECT = 5
-STAGE_NAMES = ["BLIND", "SHOP", "LOST", "WON", "PACK", "SELECT"]
+STAGE_END    = 6     # after the hand that ends a round, before the end of the round: MOVE_JOKER
+STAGE_CASHOUT = 7    # the cash-out screen (ROUND_EVAL): the $ is paid at NEXT, then the shop
+STAGE_NAMES = ["BLIND", "SHOP", "LOST", "WON", "PACK", "SELECT", "END", "CASH OUT"]
 
 # LEGAL[stage, verb]: which verbs each stage accepts. Everything else is a no-op.
 LEGAL = jnp.array([
@@ -183,6 +192,10 @@ LEGAL = jnp.array([
     [False] * N_VERBS,                                                                                    # WON
     [False, False, False, True,  False, False, True,  True,  True,  True,  False, True,  True,  False],  # PACK
     [False, False, False, True,  True,  True,  True,  False, True,  True,  False, False, True,  False],  # SELECT
+    # END: the hand is scoring, so the game blocks a sale and a use (can_sell_card / can_use_consumeable:
+    # cards in G.play); a joker can be dragged (no lock)
+    [False, False, False, False, False, True,  True,  False, False, False, False, False, False, False],  # END
+    [False, False, False, True,  False, True,  True,  False, True,  True,  False, False, False, False],  # CASH OUT
 ])
 
 # --- blinds --------------------------------------------------------------------
@@ -212,6 +225,7 @@ BASE_DISCARDS = 4    # the Red Deck (the game's default deck): 3 + 1 discard (ba
 # Shop odds for a joker (roll_joker): a rarity 70 / 25 / 5 %, then a joker uniform among the
 # available ones of that rarity. Legendaries never appear in the shop (only The Soul makes one).
 J_FALLBACK = JOKER_ID["Joker"]   # what the shop offers when the pool is empty
+J_MIME = JOKER_ID["Mime"]
 # an empty Tarot / Planet / Spectral pool
 CONS_FALLBACK = jnp.array([CONS_ID["Strength"], CONS_ID["Pluto"], CONS_ID["Incantation"]], jnp.int32)
 _IS_TAROT = jnp.asarray(TAROTS)
@@ -222,6 +236,7 @@ _SPECTRAL_POOL = jnp.asarray(SPECTRAL_POOL)
 # fold_in purposes for state.key
 K_PLAY, K_ROUND, K_ACQUIRE, K_USE, K_PACK, K_BLIND, K_SHOP = 1, 2, 3, 4, 5, 6, 7
 K_SKIP, K_BOSS, K_TAG, K_VOUCHER, K_HOOK, K_DRAW, K_SELL, K_SHOP_EXIT = 8, 9, 10, 11, 12, 13, 14, 15
+K_CASHOUT = 16
 
 
 class balatroEnvState(NamedTuple):
@@ -523,8 +538,10 @@ def add_card(state, rank, suit, enh, ed, seal, bonus=0.0, to_hand=False, ok=True
 # THE BOSS — is it on, which cards and jokers it debuffs
 # ---------------------------------------------------------------------------
 def boss_active(state):
-    """The boss's ability is on: its round is being played and it is not disabled."""
-    return (state.game_stage == STAGE_BLIND) & (state.blind_index == BLIND_BOSS) & ~state.boss_disabled
+    """The boss's ability is on: its round is being played (STAGE_END too: the end of the round
+    comes before evaluate_round's Blind:defeat) and it is not disabled."""
+    in_round = (state.game_stage == STAGE_BLIND) | (state.game_stage == STAGE_END)
+    return in_round & (state.blind_index == BLIND_BOSS) & ~state.boss_disabled
 
 
 def boss_is(state, b):
@@ -793,7 +810,8 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     action = action._replace(verb=verb, target=jnp.asarray(action.target, jnp.int32),
                              dest=jnp.asarray(action.dest, jnp.int32))
     nxt, _, _ = jax.lax.switch(branch, _HANDLERS, state, action)
-    nxt, reward, over = _settle(nxt)
+    go_end = legal & (verb == V_NEXT) & (state.game_stage == STAGE_END)
+    nxt, reward, over = _settle(nxt, legal & (verb == V_PLAY), go_end)
     was_over = (state.game_stage == STAGE_LOST) | (state.game_stage == STAGE_WON)
     return nxt, reward, over & ~was_over
 
@@ -1043,16 +1061,17 @@ def give_cons(state, cid, ok=True, ed=ED_NONE, extra=0):
     return tree_where(ok, got, state)
 
 
-def spawn_kinds(state, kinds, n, key, extra=0):
-    """Create up to n random cards, the i-th of kind kinds[i] (each needs room). n <= 8."""
+def spawn_kinds(state, kinds, n, key, extra=0, exclude=None):
+    """Create up to n random cards, the i-th of kind kinds[i] (each needs room). n <= 8.
+    exclude: (N_CONS,) more cards that count as existing (the card being used)."""
     def body(i, s):
-        return give_cons(s, roll_cons(jax.random.fold_in(key, i), s, kinds[i]), i < n, extra=extra)
+        return give_cons(s, roll_cons(jax.random.fold_in(key, i), s, kinds[i], exclude), i < n, extra=extra)
     return jax.lax.fori_loop(0, 8, body, state)
 
 
-def spawn_cons(state, kind, n, key, extra=0):
+def spawn_cons(state, kind, n, key, extra=0, exclude=None):
     """Create up to n random cards of kind (each needs room). n is small (<= 8)."""
-    return spawn_kinds(state, jnp.full(8, kind, jnp.int32), n, key, extra)
+    return spawn_kinds(state, jnp.full(8, kind, jnp.int32), n, key, extra, exclude)
 
 
 def take_cons(state, slot):
@@ -1158,9 +1177,12 @@ def set_joker_edition(state, j, ed):
 def apply_cons(state, cid, select, key, extra=0):
     """use_consumeable: the effect of Tarot / Planet / Spectral cid on state (the card has
     already left its slot). Call it only when can_use holds. extra: 1 when the used card is
-    Negative (its slot counts until it dissolves: The Emperor, The High Priestess, The Fool)."""
+    Negative (its slot counts until it dissolves: The Emperor, The High Priestess, The Fool).
+    The used card still exists while it acts (G.GAME.used_jokers keeps it until Card:remove
+    after the dissolve), so The Emperor never makes The Emperor unless Showman is held."""
     c = jnp.clip(cid, 0, N_CONS - 1)
     use, param = CONS_USE[c], CONS_PARAM[c]
+    me = (jnp.arange(N_CONS) == cid) & (cid >= 0)        # the used card, for the new cards' pool
     sel, _ = use_sel(state, select, cid)
     inst = jnp.clip(state.hand, 0, MAX_DECK_SIZE - 1)
     on = jnp.zeros(MAX_DECK_SIZE, bool).at[inst].max(sel)            # (128,) the selected instances
@@ -1202,10 +1224,10 @@ def apply_cons(state, cid, select, key, extra=0):
         return s._replace(money=s.money + jnp.minimum(jnp.where(held, s.joker_sell_value, 0).sum(), param))
 
     def spawn_t(s):
-        return spawn_cons(s, CK_TAROT, jnp.minimum(param, cons_room(s) + extra), k1, extra)
+        return spawn_cons(s, CK_TAROT, jnp.minimum(param, cons_room(s) + extra), k1, extra, me)
 
     def spawn_p(s):
-        return spawn_cons(s, CK_PLANET, jnp.minimum(param, cons_room(s) + extra), k1, extra)
+        return spawn_cons(s, CK_PLANET, jnp.minimum(param, cons_room(s) + extra), k1, extra, me)
 
     def wheel(s):
         elig = _editionless(s)
@@ -1383,11 +1405,13 @@ def _discard_cards(state, cards, valid, hook, key):
     burnt = _effects(state, T_ON_DISCARD, E_LEVEL_UP).sum() * first_discard * ~hook
     dhand = detect(pr, ps, valid, mods, jnp.where(deb & (pe == ENH_WILD), ENH_NONE, pe)).handtype
     purple = (valid & (pseal == SEAL_PURPLE) & ~deb).sum()
-    trading = (ids == J_TRADING).any() & first_discard & (valid.sum() == 1)
+    # Trading Card (not its copies): each one pays $3; the card is destroyed once
+    n_trading = (ids == J_TRADING).sum()
+    trading = (n_trading > 0) & first_discard & (valid.sum() == 1)
     idx = jnp.where(valid, cards, MAX_DECK_SIZE)
     gone = jnp.zeros(MAX_DECK_SIZE, bool).at[idx].set(valid & trading, mode="drop")
     s = state._replace(joker_value=dsc.joker_value, joker_state=dsc.joker_state,
-                       money=state.money + jnp.floor(dsc.money + 3 * trading).astype(jnp.int32),
+                       money=state.money + jnp.floor(dsc.money + 3 * n_trading * trading).astype(jnp.int32),
                        hand_level=state.hand_level.at[dhand].add(burnt))
     s = spawn_cons(s, CK_TAROT, purple, key)
     glass = (gone & state.card_live & (state.card_enh == ENH_GLASS)).sum()   # it shatters: Glass Joker
@@ -1642,9 +1666,11 @@ def _held_end_of_round(state: balatroEnvState, key):
 
 
 def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
-    """End of round: the held cards, the END_OF_ROUND jokers, the cashout, then the shop (or
-    the win). saved: Mr. Bones (the blind pays $0). The boss is still on here (a debuffed
-    Gold card pays nothing, Crimson Heart's joker misses it all); it is gone after."""
+    """End of round: the held cards, the END_OF_ROUND jokers, the cash-out rows
+    (evaluate_round: last_cashout), then the cash-out screen (STAGE_CASHOUT: the $ is paid at
+    NEXT, _cash_out) or the win (paid at once: the run ends). saved: Mr. Bones (the blind pays
+    $0). The boss is still on here (a debuffed Gold card pays nothing, Crimson Heart's joker
+    misses it all); it is gone after."""
     k_eor, k_todo, k_tg, k_shop, k_held, k_ante, key = jax.random.split(jax.random.fold_in(state.key, K_ROUND), 7)
     ids = acting(state)
     rows, active = rows_for(ids), ids != J_EMPTY
@@ -1709,13 +1735,13 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
     state = state._replace(
         tags=compact(jnp.where(invest, -1, state.tags), ~invest & (state.tags >= 0)),
         tag_hand=compact(state.tag_hand, ~invest & (state.tags >= 0)),
-        money=state.money + cashout,
+        money=state.money + jnp.where(won, cashout, 0),     # else paid at Cash Out
         last_cashout=cashout,
         unused_discards=state.unused_discards + jnp.maximum(state.discards, 0),
         ox_hand=jnp.where(is_boss, most, state.ox_hand),
         ante=ante, blind_index=nxt,
         card_played_ante=jnp.where(is_boss, False, state.card_played_ante),
-        game_stage=jnp.where(won, STAGE_WON, STAGE_SHOP),
+        game_stage=jnp.where(won, STAGE_WON, STAGE_CASHOUT),
         reroll_cost=reroll_base(state), reroll_inc=jnp.int32(0), reroll_d6=jnp.bool_(False),
         idol_card=tg.idol_card, mail_rank=tg.mail_rank,
         ancient_suit=tg.ancient_suit, castle_suit=tg.castle_suit,
@@ -1728,9 +1754,40 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
     )
     state = apply_budget(state)
     new_ante = new_ante_rolls(kb, state)
-    state = tree_where(is_boss & ~won,
-                       new_ante._replace(ante_voucher=roll_voucher(kv, state, jnp.zeros(N_VOUCHERS, bool))), state)
-    return tree_where(won, state, open_shop(k_shop, state))   # the win ends the run: no new ante, no shop
+    # the win ends the run: no new ante, no shop; else the shop opens at Cash Out (k_shop is
+    # not used: the cash out has its own keys)
+    return tree_where(is_boss & ~won,
+                      new_ante._replace(ante_voucher=roll_voucher(kv, state, jnp.zeros(N_VOUCHERS, bool))), state)
+
+
+def _cash_out(state: balatroEnvState) -> balatroEnvState:
+    """NEXT at the cash-out screen (G.FUNCS.cash_out): the rows' $ (last_cashout) is paid, the
+    deck is shuffled ('cashout'), then the shop opens (update_shop). A USE or SELL on the
+    screen came before it, so it changes the first shop's pool."""
+    k_deck, k_shop, key = jax.random.split(jax.random.fold_in(state.key, K_CASHOUT), 3)
+    deck, _, _, n = _fresh_deal(k_deck, state.card_live, 0)
+    s = state._replace(money=state.money + state.last_cashout, deck=deck, deck_size=n, deck_ptr=jnp.int32(0),
+                       game_stage=jnp.int32(STAGE_SHOP), key=key)
+    return open_shop(k_shop, s)
+
+
+def end_window(state: balatroEnvState) -> jax.Array:
+    """After the hand that ends a round: can the joker order still change the end of the round?
+    In the game a joker can be dragged while the hand scores (the joker area has no lock), and
+    end_round reads the order after the score animation. Blueprint and Brainstorm copy no
+    end-of-round effect but Mime's retrigger of a held card (card.lua: every other one has
+    `not context.blueprint`), and Mime retriggers only a card that does something. So: the
+    round is won (or Mr. Bones saves it), Mime acts, Blueprint or Brainstorm acts, and a held
+    card has an end-of-round effect (a Gold card, or a Blue Seal with a free consumable slot;
+    not debuffed)."""
+    ids = acting(state)
+    beaten = state.chips_scored >= state.blind_target
+    bones = (ids == J_MR_BONES).any() & (state.chips_scored >= BONES_SHARE * state.blind_target)
+    _, _, e, _, seal, _ = _gather(state, state.hand)
+    ok = state.hand_valid & ~card_debuffed(state, state.hand)
+    eff = ok & ((e == ENH_GOLD) | ((seal == SEAL_BLUE) & (cons_room(state) > 0)))
+    copier = ((ids == J_BLUEPRINT) | (ids == J_BRAINSTORM)).any()
+    return (beaten | bones) & (ids == J_MIME).any() & copier & eff.any()
 
 
 def new_targets(key, state) -> Targets:
@@ -1759,13 +1816,16 @@ def joker_money(state: balatroEnvState, joker_value) -> jax.Array:
     return jnp.floor(jnp.where(pays, v, 0.0).sum()).astype(jnp.int32)
 
 
-def _settle(state: balatroEnvState):
+def _settle(state: balatroEnvState, played=False, go_end=False):
     """After every action. At the blind select: the tags that act there (enter_select). In a
     blind, the round ends when the target is reached (a PLAY, or a boss disabled by a sale)
     or the hands ran out. Else an empty hand is drawn again (game.lua: SELECTING_HAND with no
     card and a deck -> DRAW_TO_HAND; a Tarot or Spectral card can empty it), and with no card
     in the deck either the round ends. A draw at hand size 0 with no card loses the run at
-    once (draw_from_deck_to_hand: GAME_OVER, so Mr. Bones cannot save it). -> (state, reward, done)"""
+    once (draw_from_deck_to_hand: GAME_OVER, so Mr. Bones cannot save it). played: the step
+    was a PLAY; when it ends a won round and the joker order can still change the end of the
+    round (end_window), the round waits in STAGE_END; go_end: NEXT there runs it.
+    -> (state, reward, done)"""
     state = tree_where(state.game_stage == STAGE_SELECT, enter_select(state), state)
     blind = state.game_stage == STAGE_BLIND
     hand_empty = ~state.hand_valid.any()
@@ -1775,10 +1835,12 @@ def _settle(state: balatroEnvState):
     redraw = blind & ~scored_out & ~dead & hand_empty & deck_left
     state = tree_where(redraw, _redraw(state), state)
     ends = blind & ~dead & (scored_out | (~state.hand_valid.any() & (state.deck_ptr >= state.deck_size)))
+    window = ends & played & end_window(state)
+    run = (ends & ~window) | go_end
     ended = end_round(state)
-    s = tree_where(ends, ended, state)
-    s = s._replace(game_stage=jnp.where(dead, STAGE_LOST, s.game_stage))
-    reward = jnp.where(ends & (s.game_stage != STAGE_LOST), s.last_cashout, 0).astype(jnp.int32)
+    s = tree_where(run, ended, state)
+    s = s._replace(game_stage=jnp.where(window, STAGE_END, jnp.where(dead, STAGE_LOST, s.game_stage)))
+    reward = jnp.where(run & (s.game_stage != STAGE_LOST), s.last_cashout, 0).astype(jnp.int32)
     done = (s.game_stage == STAGE_LOST) | (s.game_stage == STAGE_WON)
     return s, reward, done
 
@@ -2096,7 +2158,13 @@ def _sell(state: balatroEnvState, action: balatroAction):
     others = (s.jokers != J_EMPTY) & ~gone
     dup = (eff == E_DUPLICATE) & (state.joker_value[slot] >= JOKERS.VALUE2[jnp.clip(jid, 0, N_JOKERS - 1)]) \
         & others.any()
-    s = tree_where(dup, copy_joker(s, _random_slot(k1, others)), s)
+    # the copy of an Invisible Joker starts at 0 rounds (card.lua: invis_rounds = 0; Ankh's copy keeps them)
+    n_held = (s.jokers != J_EMPTY).sum()
+    copied = copy_joker(s, _random_slot(k1, others))
+    fresh = copied.jokers[n_held] == J_INVISIBLE
+    copied = copied._replace(joker_value=copied.joker_value.at[n_held].set(
+        jnp.where(fresh, 0.0, copied.joker_value[n_held])))
+    s = tree_where(dup, copied, s)
     sold = remove_jokers(s._replace(money=s.money + state.joker_sell_value[slot]), gone)
     sold = tree_where(boss_is(sold, BK_LEAF), disable_boss(sold), sold)
     # in a round a larger hand size draws at once (Merry Andy / Stuntman sold, a Juggler copied,
@@ -2207,17 +2275,22 @@ def roll_pack_cards(key, state, pid):
     return items, eds, rank, suit, enh, seal, stks
 
 
-def _deal_arcana_hand(state, key):
-    """An Arcana / Spectral pack draws a hand from the (shuffled) full deck to use the cards on."""
-    deck, hand, hand_valid, n = _fresh_deal(key, state.card_live, state.hand_size)
-    return state._replace(deck=deck, deck_size=n, deck_ptr=jnp.minimum(state.hand_size, n),
-                          hand=hand, hand_valid=hand_valid, hand_down=jnp.zeros(MAX_HAND_SIZE, bool))
+def _deal_arcana_hand(state):
+    """An Arcana / Spectral pack draws a hand to use the cards on: the next hand-size cards
+    from the top of the deck (draw_from_deck_to_hand; no shuffle: the deck is shuffled only at
+    the run start, Cash Out and the blind start, so a second pack deals the next cards)."""
+    lanes = jnp.arange(MAX_HAND_SIZE)
+    n = jnp.clip(jnp.minimum(state.hand_size, state.deck_size - state.deck_ptr), 0, MAX_HAND_SIZE)
+    hand_valid = lanes < n
+    hand = jnp.where(hand_valid, state.deck[jnp.clip(state.deck_ptr + lanes, 0, MAX_DECK_SIZE - 1)], -1)
+    return state._replace(hand=hand, hand_valid=hand_valid, hand_down=jnp.zeros(MAX_HAND_SIZE, bool),
+                          deck_ptr=state.deck_ptr + n)
 
 
 def open_pack(state, pid, key, back):
     """Card:open of pack pid: its cards, STAGE_PACK (back to `back` when it closes); an Arcana
     or Spectral pack deals a hand; Hallucination (copies too): 1 in 2 a Tarot."""
-    k_cards, k_hand, k_hall = jax.random.split(key, 3)
+    k_cards, _, k_hall = jax.random.split(key, 3)        # (the 2nd key dealt the hand from a new shuffle)
     p = jnp.clip(pid, 0, N_PACKS - 1)
     items, eds, rank, suit, enh, seal, stks = roll_pack_cards(k_cards, state, pid)
     opened = state._replace(game_stage=jnp.int32(STAGE_PACK), pack_id=jnp.asarray(pid, jnp.int32),
@@ -2225,7 +2298,7 @@ def open_pack(state, pid, key, back):
                             pack_rank=rank, pack_suit=suit, pack_enh=enh, pack_seal=seal, pack_sticker=stks,
                             pack_return=jnp.asarray(back, jnp.int32))
     deals = (PACK_KIND[p] == PK_ARCANA) | (PACK_KIND[p] == PK_SPECTRAL)
-    opened = tree_where(deals, _deal_arcana_hand(opened, k_hand), opened)
+    opened = tree_where(deals, _deal_arcana_hand(opened), opened)
     hall = _effects(state, T_ON_PACK_OPEN, E_SPAWN_CONSUMABLE)
     erows, _, _, _ = effective(acting(state), state.joker_value, state.joker_state)
     hits = (hall & (jax.random.uniform(k_hall, (MAX_JOKERS,)) < _odds(erows, mods_of(state)))).sum()
@@ -2246,11 +2319,23 @@ def _open(state: balatroEnvState, action: balatroAction):
 
 
 def _close_pack(state):
-    """Back to the shop or the blind select: the drawn hand goes back to the deck. At the
-    blind select the next pack tag (or Boss Tag) acts (end_consumeable): _settle does it."""
+    """Back to the shop or the blind select: the drawn hand goes back to the bottom of the deck
+    (draw_from_hand_to_deck: the leftmost card first, each one emplaced at the bottom), so the
+    undealt cards come next. At the blind select the next pack tag (or Boss Tag) acts
+    (end_consumeable): _settle does it."""
+    pos = jnp.arange(MAX_DECK_SIZE)
+    undealt = (pos >= state.deck_ptr) & (pos < state.deck_size)
+    # the hand's cards in lane order (the cards a Tarot made in the hand are dealt too)
+    rank = jnp.cumsum(state.hand_valid) - 1
+    lane_of = jnp.full(MAX_DECK_SIZE, -1, jnp.int32).at[jnp.where(state.hand_valid, state.hand, MAX_DECK_SIZE)].set(
+        rank.astype(jnp.int32), mode="drop")
+    back = lane_of[state.deck]
+    keys = jnp.where(undealt, pos - state.deck_ptr,
+                     jnp.where(back >= 0, state.deck_size - state.deck_ptr + back, MAX_DECK_SIZE + pos))
+    deck = state.deck[jnp.argsort(keys)]
     return state._replace(game_stage=state.pack_return, pack_id=jnp.int32(-1),
                           pack_left=jnp.int32(0), pack_items=jnp.full(MAX_PACK, -1, jnp.int32),
-                          pack_sticker=jnp.zeros(MAX_PACK, jnp.int32),
+                          pack_sticker=jnp.zeros(MAX_PACK, jnp.int32), deck=deck,
                           hand_valid=jnp.zeros(MAX_HAND_SIZE, bool), hand_down=jnp.zeros(MAX_HAND_SIZE, bool),
                           hand=jnp.full(MAX_HAND_SIZE, -1, jnp.int32), deck_ptr=jnp.int32(0))
 
@@ -2588,8 +2673,11 @@ def _first_hand_drawn(s, key):
 
 
 def _next(state: balatroEnvState, action: balatroAction):
-    """NEXT: leave the shop (to the blind select), or play the blind on deck."""
-    return tree_where(state.game_stage == STAGE_SHOP, _leave_shop(state), _start_blind(state)), \
+    """NEXT: leave the shop (to the blind select), play the blind on deck, or Cash Out. In
+    STAGE_END the end of the round runs in _settle, with the joker order the player left."""
+    st = state.game_stage
+    branch = jnp.select([st == STAGE_SHOP, st == STAGE_CASHOUT, st == STAGE_END], [0, 2, 3], 1)
+    return jax.lax.switch(branch, [_leave_shop, _start_blind, _cash_out, lambda s: s], state), \
         jnp.int32(0), jnp.bool_(False)
 
 
@@ -2932,7 +3020,7 @@ def invariant_errors(state: balatroEnvState):
     neg = sum(1 for i, j in enumerate(jokers) if j >= 0 and int(state.joker_ed[i]) == ED_NEG)
     antimatter = int(bool(state.vouchers[V_ANTIMATTER]))
     stage = int(state.game_stage)
-    manacle = (stage in (STAGE_BLIND, STAGE_LOST) and int(state.blind_index) == BLIND_BOSS
+    manacle = (stage in (STAGE_BLIND, STAGE_END, STAGE_LOST) and int(state.blind_index) == BLIND_BOSS
                and not bool(state.boss_disabled) and int(state.boss) == BK_MANACLE)   # a lost run keeps it
     tags = [int(t) for t in state.tags]
     checks = [
@@ -2994,7 +3082,7 @@ def invariant_errors(state: balatroEnvState):
         ("tags compact", tags[:len([t for t in tags if t >= 0])] == [t for t in tags if t >= 0]),
         ("blind_index is Small / Big / Boss", 0 <= int(state.blind_index) <= 2),
         ("only a boss round has boss state (a lost run keeps it)",
-         stage in (STAGE_BLIND, STAGE_LOST)
+         stage in (STAGE_BLIND, STAGE_END, STAGE_LOST)
          or (not any(debuff) and int(state.forced_card) < 0 and not any(bool(x) for x in state.hand_down))),
     ]
     return [name for name, ok in checks if not ok]

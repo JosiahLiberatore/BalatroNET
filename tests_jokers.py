@@ -37,8 +37,8 @@ from env import (balatroAction, env_step, explain_play, reset, invariant_errors,
                  apply_budget, roll_shop, roll_joker, acquire, MAX_HAND_SIZE, MAX_SHOP_SLOTS,
                  MAX_DECK_SIZE, MAX_CONSUMABLES, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL, V_NEXT,
                  V_MOVE_JOKER, V_MOVE_CARD, V_USE, V_SELL_CONS, V_OPEN, V_PICK, V_SKIP, V_REDEEM, STAGE_BLIND,
-                 STAGE_SHOP, STAGE_LOST, STAGE_WON, STAGE_PACK, STAGE_SELECT, BLIND_BOSS, N_VERBS,
-                 K_HOOK, _hooked, _hook_discard)
+                 STAGE_SHOP, STAGE_LOST, STAGE_WON, STAGE_PACK, STAGE_SELECT, STAGE_END, STAGE_CASHOUT,
+                 BLIND_BOSS, N_VERBS, K_HOOK, _hooked, _hook_discard)
 from env import CONS_SELL
 from items import (CONS_NAMES, CONS_ID, CONS_KIND, CONS_USE, CONS_PARAM, CONS_LO, CONS_HI, CONS_NEED,
                    CONS_RANKS, CK_TAROT, CK_PLANET, CK_SPECTRAL, U_ENHANCE, U_SUIT, U_STRENGTH, U_HANGED,
@@ -151,8 +151,10 @@ LEGAL_NP = np.array([
     [_F] * 14, [_F] * 14,                                                          # LOST, WON
     [_F,  _F,  _F,  _T,  _F,   _F,  _T,   _T,   _T,  _T,   _F,  _T,  _T,  _F],   # PACK
     [_F,  _F,  _F,  _T,  _T,   _T,  _T,   _F,   _T,  _T,   _F,  _F,  _T,  _F],   # SELECT
+    [_F,  _F,  _F,  _F,  _F,   _T,  _T,   _F,   _F,  _F,   _F,  _F,  _F,  _F],   # END: drag a joker, NEXT
+    [_F,  _F,  _F,  _T,  _F,   _T,  _T,   _F,   _T,  _T,   _F,  _F,  _F,  _F],   # CASH OUT
 ])
-STAGES = 6
+STAGES = 8
 
 
 def npeq(c, name, got, want):
@@ -195,9 +197,9 @@ def _bump(J, name, dv, copies=False):
 
 
 def boss_on(p):
-    """The boss whose ability is on in this state (its round, not disabled), or None."""
-    if int(p.game_stage) != STAGE_BLIND or int(p.blind_index) != BLIND_BOSS or bool(p.boss_disabled) \
-            or int(p.boss) < 0:
+    """The boss whose ability is on in this state (its round, STAGE_END too; not disabled), or None."""
+    if int(p.game_stage) not in (STAGE_BLIND, STAGE_END) or int(p.blind_index) != BLIND_BOSS \
+            or bool(p.boss_disabled) or int(p.boss) < 0:
         return None
     return BOSS_NAMES[int(p.boss)]
 
@@ -532,10 +534,22 @@ def _apply_cons(c, tag, p, q, J, w, cid, sel):
         w.f["money"] += max(0, min(w.f["money"], prm))
     elif u == U_TEMPERANCE:
         w.f["money"] += min(sum(x["sell"] for x in J), prm)
-    elif u == U_SPAWN_TAROT:
-        w.spawn(CK_TAROT, prm)
-    elif u == U_SPAWN_PLANET:
-        w.spawn(CK_PLANET, prm, astro=astro)
+    elif u in (U_SPAWN_TAROT, U_SPAWN_PLANET):
+        if u == U_SPAWN_TAROT:
+            w.spawn(CK_TAROT, prm)
+        else:
+            w.spawn(CK_PLANET, prm, astro=astro)
+        # the new cards: none that exists (held, in the shop, in the open pack, and the used card
+        # itself: used_jokers keeps it until it dissolves), none twice; Showman allows them all
+        if "Showman" not in R.acting_names(J):
+            shop_c = {int(p.shop_slots[i]) for i in range(MAX_SHOP_SLOTS)
+                      if int(p.shop_slots[i]) >= 0 and int(p.shop_kind[i]) in (IK_TAROT, IK_PLANET)}
+            pk = _PKIND[int(p.pack_id)] if int(p.pack_id) >= 0 else -1
+            pack_c = {int(x) for x in p.pack_items if int(x) >= 0} if pk in (PK_ARCANA, PK_CELESTIAL, PK_SPECTRAL) else set()
+            new = [int(x) for x in q.consumables if x >= 0][len(w.cons):]
+            old = set(w.cons) | shop_c | pack_c | {cid}
+            c.check(f"{tag}: {CONS_NAMES[cid]} makes no card that exists (itself too), none twice",
+                    not set(new) & old and len(set(new)) == len(new), [CONS_NAMES[x] for x in new])
     elif u == U_WHEEL:
         changed = [i for i, x in enumerate(J) if int(q.joker_ed[i]) != x["ed"]]
         c.check(f"{tag}: Wheel: at most one joker changes", len(changed) <= 1, changed)
@@ -649,9 +663,10 @@ def _apply_cons(c, tag, p, q, J, w, cid, sel):
 
 
 def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
-    """The end of the round (end_round + evaluate_round + cash_out): held Gold / Blue Seal
-    cards, the END_OF_ROUND jokers (not a debuffed one), the cashout, the next blind on deck;
-    after a boss the next ante. -> (J, cashout); the caller checks the new shop."""
+    """The end of the round (end_round + evaluate_round): held Gold / Blue Seal cards, the
+    END_OF_ROUND jokers (not a debuffed one), the cash-out rows, the next blind on deck; after
+    a boss the next ante. The cash-out screen follows (the $ is paid at its NEXT); the win
+    pays at once. -> (J, cashout)"""
     g = ref_g(p)
     g.update(discards=max(int(p.discards), 0), is_boss=int(p.blind_index) == BLIND_BOSS)
     acting = [x for x in J if not x.get("deb")]
@@ -690,7 +705,7 @@ def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
     pay = 0 if saved else R.blind_pay(int(p.blind_index), boss if is_boss else None, int(p.stake))
     cashout = pay + w.f["hands"] + interest + int(R.ref_dollar_bonus(J, g)) + 25 * invest
     won = is_boss and int(p.ante) >= R.WIN_ANTE
-    w.f.update(money=money + cashout, last_cashout=cashout, game_stage=STAGE_WON if won else STAGE_SHOP,
+    w.f.update(money=money + (cashout if won else 0), last_cashout=cashout, game_stage=STAGE_WON if won else STAGE_CASHOUT,
                unused_discards=w.f["unused_discards"] + max(w.f["discards"], 0), round_hand_bonus=0,
                boss_disabled=False)
     w.f.update(reroll_cost=5 - 2 * ("Reroll Surplus" in v) - 2 * ("Reroll Glut" in v), reroll_inc=0,
@@ -909,6 +924,15 @@ def _check_pack(c, tag, p, q, w, J, pid):
     if kind in (PK_ARCANA, PK_SPECTRAL):
         want_n = min(w_hand_size(J, w, q), int(np.asarray(q.card_live).sum()))
         npeq(c, f"{tag}: OPEN: an Arcana / Spectral pack deals a hand", int(np.asarray(q.hand_valid).sum()), want_n)
+        # from the top of the deck, no shuffle: the cards after the ones p had dealt (a pack that
+        # closed in this step put its hand back at the bottom)
+        n = int(np.asarray(q.hand_valid).sum())
+        hand = [int(x) for x in q.hand[:n]]
+        npeq(c, f"{tag}: OPEN: the hand is the top of the deck", hand, [int(x) for x in q.deck[:n]])
+        npeq(c, f"{tag}: OPEN: the hand's cards are dealt", int(q.deck_ptr), n)
+        ptr, size = int(p.deck_ptr), int(p.deck_size)
+        if ptr + n <= size:
+            npeq(c, f"{tag}: OPEN: the next cards of the deck", hand, [int(x) for x in p.deck[ptr:ptr + n]])
 
 
 def w_hand_size(J, w, q):
@@ -917,7 +941,7 @@ def w_hand_size(J, w, q):
 
 
 def _manacle(q):
-    return int(int(q.game_stage) in (STAGE_BLIND, STAGE_LOST) and int(q.blind_index) == BLIND_BOSS
+    return int(int(q.game_stage) in (STAGE_BLIND, STAGE_END, STAGE_LOST) and int(q.blind_index) == BLIND_BOSS
                and not bool(q.boss_disabled) and int(q.boss) == BOSS_NAMES.index("The Manacle"))
 
 
@@ -1216,6 +1240,8 @@ def check_step(c, tag, p, a, q, reward, out=None):
         over = total >= int(p.blind_target) or int(p.hands) - 1 <= 0
         if not over and held_after == 0 and w_hand_size(J, w, q) <= 0:
             w.f["game_stage"] = STAGE_LOST                      # the draw at hand size 0: GAME_OVER
+        elif (over or stuck) and _end_window(p, J, w, held_cards, total):
+            w.f["game_stage"] = STAGE_END                       # the joker order can still change the end
         elif over or stuck:
             todo = {id(x) for x in J if x["name"] == "To Do List" and not x.get("deb")}   # a debuffed one misses it
             J, want_reward, shop_fresh = _end_round(c, tag, p, q, J, w, held_cards, total, played)
@@ -1334,11 +1360,13 @@ def check_step(c, tag, p, a, q, reward, out=None):
                 # the copy (copy_card): the stickers and rounds left too; read which one from q
                 src_c = [y for y in J if y["name"] == dup]
                 k = len(J)
+                invis = dup == "Invisible Joker"                  # its copy starts at 0 rounds (invis_rounds = 0)
                 src = ([y for y in src_c if y["stk"] == int(q.joker_sticker[k]) and y["left"] == int(q.joker_perish[k])
-                        and abs(y["v"] - float(q.joker_value[k])) < 1e-4] or src_c)[0]
+                        and (invis or abs(y["v"] - float(q.joker_value[k])) < 1e-4)] or src_c)[0]
                 ced = 0 if src["ed"] == 4 else src["ed"]
                 extra = src["sell"] - joker_sell(dup, src["ed"], w.disc, src["stk"])
-                J.append(dict(src, ed=ced, sell=joker_sell(dup, ced, w.disc, src["stk"]) + extra, deb=_perished(src)))
+                J.append(dict(src, ed=ced, sell=joker_sell(dup, ced, w.disc, src["stk"]) + extra, deb=_perished(src),
+                              v=0.0 if invis else src["v"]))
                 if not _perished(src):                      # a perished copy adds nothing (env.copy_joker)
                     w.f["free_rerolls"] += dup == "Chaos the Clown"
                     w.f["discards"] += R.D_SIZE.get(dup, 0)
@@ -1387,6 +1415,16 @@ def check_step(c, tag, p, a, q, reward, out=None):
                 w.cons_ed.append(4)
                 w.cons_sell.append(seen if seen in opts else opts[0])
         w.f["game_stage"] = STAGE_SELECT
+    elif verb == V_NEXT and stage == STAGE_END:             # the end of the round, with this joker order
+        held_cards = [card_of(p, p.hand[l], boss, m) for l in range(MAX_HAND_SIZE) if p.hand_valid[l]]
+        todo = {id(x) for x in J if x["name"] == "To Do List" and not x.get("deb")}
+        J, want_reward, shop_fresh = _end_round(c, tag, p, q, J, w, held_cards, int(p.chips_scored))
+        if w.f["game_stage"] != STAGE_LOST:
+            observe_state = {i for i, x in enumerate(J) if id(x) in todo}
+    elif verb == V_NEXT and stage == STAGE_CASHOUT:         # Cash Out: the $, a shuffled deck, the shop
+        w.f.update(money=w.f["money"] + int(p.last_cashout), game_stage=STAGE_SHOP)
+        npeq(c, f"{tag}: Cash Out: the whole deck, shuffled", int(q.deck_ptr), 0)
+        shop_fresh = True
     elif verb == V_NEXT:                                    # the blind select: play the blind
         J = _blind_start(c, tag, p, q, J, w)
         in_round = np.zeros(N_HAND_TYPES, np.int64)
@@ -1469,7 +1507,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
                 npeq(c, f"{tag}: PICK: the card is taken", q.pack_items[t], -1)
     elif verb == V_SKIP and stage == STAGE_PACK:
         _bump(J, "Red Card", 3)
-        _close(c, tag, p, q, w)
+        _close(c, tag, p, q, w, skip=True)
     elif verb == V_SKIP:                                    # the blind select: skip it
         if int(p.blind_index) < BLIND_BOSS:
             b = int(p.blind_index)
@@ -1490,7 +1528,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
         if i < len(J):
             c.check(f"{tag}: To Do List hand visible", 0 <= qs[i] < N_HAND_TYPES
                     and R.HAND_ORDER[qs[i]] in R.visible_hands(q.hand_played), qs[i])
-            if verb == V_PLAY:
+            if verb == V_PLAY or (verb == V_NEXT and stage == STAGE_END):
                 c.check(f"{tag}: To Do List hand changes", qs[i] != J[i]["st"], qs[i], J[i]["st"])
             J[i]["st"] = qs[i]
     k = len(J)
@@ -1553,15 +1591,39 @@ def _add_tag(w, tag, hand):
     w.tags = (w.tags + [(tag, hand)] * n)[:8]
 
 
-def _close(c, tag, p, q, w):
-    """A pack closes: back to where it was opened; the drawn hand goes back."""
+def _close(c, tag, p, q, w, skip=False):
+    """A pack closes: back to where it was opened; the drawn hand goes back to the bottom of
+    the deck (the undealt cards stay on top, in order). skip: SKIP closed it (the hand is p's)."""
     w.f.update(game_stage=int(p.pack_return), pack_id=-1, pack_left=0)
     c.check(f"{tag}: the pack closes", int(q.pack_id) == -1 or int(q.game_stage) == STAGE_PACK)
+    ptr, size = int(p.deck_ptr), int(p.deck_size)
+    top = [int(x) for x in p.deck[ptr:size]]
+    npeq(c, f"{tag}: close: the undealt cards on top", [int(x) for x in q.deck[:len(top)]], top)
+    rest = [int(x) for x in q.deck[len(top):int(q.deck_size)]]
+    live = {i for i in range(MAX_DECK_SIZE) if q.card_live[i]}
+    c.check(f"{tag}: close: the hand at the bottom", set(rest) == live - set(top), rest)
+    held = [int(p.hand[l]) for l in range(MAX_HAND_SIZE) if p.hand_valid[l]]
+    if skip and all(q.card_live[i] for i in held):
+        npeq(c, f"{tag}: close: the hand in lane order (the leftmost first)", rest[:len(held)], held)
+
+
+def _end_window(p, J, w, held_cards, total):
+    """env.end_window: after the PLAY that ends a round, the round waits in STAGE_END when the
+    joker order can still change its end: won (or Mr. Bones saves it), Mime and Blueprint /
+    Brainstorm act, a held card has an end-of-round effect (Gold; a Blue Seal with room)."""
+    names = R.acting_names(J)
+    beaten = total >= w.f["blind_target"]
+    bones = "Mr. Bones" in names and total >= 0.25 * w.f["blind_target"]
+    eff = any(not R.as_card(cd).deb and (R.as_card(cd).enh == R.GOLD
+                                         or (R.as_card(cd).seal == R.BLUE_SEAL and w.room() > 0))
+              for cd in held_cards)
+    return bool((beaten or bones) and "Mime" in names and ("Blueprint" in names or "Brainstorm" in names) and eff)
 
 
 def _end_round(c, tag, p, q, J, w, held_cards, total, played=None):
-    """end_round after a PLAY / DISCARD / disable: beaten -> the cash out; else Mr. Bones
-    (>= 25 %: destroyed, the blind pays $0) or the run is lost. -> (J, reward, a new shop)"""
+    """end_round after a PLAY / DISCARD / disable / NEXT in STAGE_END: beaten -> the cash-out
+    screen; else Mr. Bones (>= 25 %: destroyed, the blind pays $0) or the run is lost.
+    -> (J, reward, a new shop: never, the shop opens at Cash Out)"""
     beaten = total >= w.f["blind_target"]
     bones = [i for i, x in enumerate(J) if x["name"] == "Mr. Bones" and not x.get("deb")]
     saved = not beaten and bones and total >= 0.25 * w.f["blind_target"]
@@ -2366,7 +2428,7 @@ def run_life_test():
              s.last_cashout, R.BLIND_PAY[int(pre.blind_index)] + int(pre.hands) - 1
              + min(int(pre.money) // 5, 5) + 8)
         pops.append(float(s.joker_value[0]) if int(s.jokers[0]) == JOKER_ID["Popcorn"] else None)
-        s = drive(c, f"round {r} next", s, [act(V_NEXT)])
+        s = drive(c, f"round {r} next", s, [act(V_NEXT), act(V_NEXT)])      # Cash Out, then leave the shop
         s = drive(c, f"round {r} select", s._replace(boss=jnp.int32(-1)), [act(V_NEXT)])
     want_pops = [16.0, 12.0, 8.0, 4.0, None, None]
     c.check("popcorn values, then eaten", pops == want_pops, pops, want_pops)
@@ -2523,6 +2585,22 @@ def _policy(p, rng):
         if u < 0.8:
             return V_SELL, sel, int(rng.integers(-1, held + 1)), 0
         return V_SKIP, sel, 0, 0
+    if stage == STAGE_END:
+        if u < 0.5:
+            return V_MOVE_JOKER, sel, int(rng.integers(-1, held + 1)), int(rng.integers(-1, held + 1))
+        if u < 0.55:
+            return V_SELL, sel, int(rng.integers(-1, held + 1)), 0      # illegal there: a no-op
+        return V_NEXT, sel, 0, 0
+    if stage == STAGE_CASHOUT:
+        if u < 0.1:
+            return V_SELL, sel, int(rng.integers(-1, held + 1)), 0
+        if u < 0.22:
+            return V_USE, sel, int(rng.integers(-1, n_cons + 1)), 0
+        if u < 0.26:
+            return V_SELL_CONS, sel, int(rng.integers(-1, n_cons + 1)), 0
+        if u < 0.34:
+            return V_MOVE_JOKER, sel, int(rng.integers(-1, held + 1)), int(rng.integers(-1, held + 1))
+        return V_NEXT, sel, 0, 0
     return int(rng.integers(0, N_VERBS)), sel, 0, 0         # LOST / WON: all no-ops
 
 
@@ -2568,6 +2646,13 @@ def _soak_batch(rng, key, n_envs):
                 enh[i, x] = rng.integers(0, 9)
                 seal[i, x] = rng.integers(0, 5) if rng.random() < 0.3 else 0
                 ced[i, x] = rng.integers(0, 4) if rng.random() < 0.2 else 0
+        if rng.random() < 0.15:                              # the END window: Mime + a copier, Gold cards
+            for slot, nm in enumerate(("Mime", "Blueprint" if rng.random() < 0.6 else "Brainstorm")):
+                j = JOKER_ID[nm]
+                J[i, slot], S[i, slot], V[i, slot], E[i, slot] = j, max(1, int(JOKER_COST[j]) // 2), _seed(j), 0
+                STK[i, slot], LEFT[i, slot], T[i, slot] = 0, 0, 0
+            for x in rng.choice(52, 12, replace=False):
+                enh[i, x] = R.GOLD
     scale = rng.choice([0.01, 0.03, 0.1, 0.3], n_envs).astype(np.float32)
     # some vouchers already redeemed (the second of a pair only after the first)
     VCH = np.zeros((n_envs, len(VOUCHER_NAMES)), bool)
@@ -2643,8 +2728,12 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
                 for j in p.jokers:
                     if j >= 0:
                         held_at_play[NAME[j]] += 1
-                if int(q.game_stage) in (STAGE_SHOP, STAGE_WON):
+                if int(q.game_stage) in (STAGE_CASHOUT, STAGE_END, STAGE_WON):
                     stats["clears"] += 1
+                if int(q.game_stage) == STAGE_END:
+                    stats["end windows"] += 1
+            if int(p.game_stage) == STAGE_CASHOUT and verb not in (None, V_NEXT):
+                stats["cash-out actions"] += 1
             if int(q.game_stage) == STAGE_LOST and int(p.game_stage) != STAGE_LOST:
                 stats["lost"] += 1
             if int(q.game_stage) == STAGE_WON and int(p.game_stage) != STAGE_WON:
@@ -2655,7 +2744,7 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
                     and int(p.jokers[int(a_host.target[i])]) >= 0:
                 stats["eternal kept"] += 1
             stats["perished"] += _n_perished(q) > _n_perished(p)
-            if int(q.game_stage) in (STAGE_SHOP, STAGE_WON) and int(p.game_stage) == STAGE_BLIND \
+            if int(q.game_stage) in (STAGE_CASHOUT, STAGE_WON) and int(p.game_stage) in (STAGE_BLIND, STAGE_END) \
                     and (np.asarray(p.joker_sticker) & STK_RENTAL).any():
                 stats["rent paid"] += 1
             if verb in (V_BUY, V_PICK) and (np.asarray(q.joker_sticker) != 0).sum() > (np.asarray(p.joker_sticker) != 0).sum():
@@ -2674,6 +2763,9 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
     c.check("the soak met the stake stickers (Eternal SELL, perished, rent, a sticker joker in)",
             min(stats["eternal kept"], stats["perished"], stats["rent paid"], stats["sticker joker in"]) > 0,
             {k: stats[k] for k in ("eternal kept", "perished", "rent paid", "sticker joker in")})
+    c.check("the soak met the END window and acted on the cash-out screen",
+            min(stats["end windows"], stats["cash-out actions"]) > 0,
+            {k: stats[k] for k in ("end windows", "cash-out actions")})
     return c.done()
 
 

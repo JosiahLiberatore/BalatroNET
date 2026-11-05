@@ -57,7 +57,8 @@ import pygame
 
 from env import (balatroAction, env_step, reset, explain_play, preview, build_ctx, acquire,
                  give_cons, invariant_errors, MAX_HAND_SIZE, MAX_DECK_SIZE, STAGE_BLIND, STAGE_SHOP,
-                 STAGE_LOST, STAGE_WON, STAGE_PACK, STAGE_SELECT, BLIND_NAMES, BLIND_BOSS, V_PLAY, V_DISCARD,
+                 STAGE_LOST, STAGE_WON, STAGE_PACK, STAGE_SELECT, STAGE_END, STAGE_CASHOUT, BLIND_NAMES,
+                 BLIND_BOSS, V_PLAY, V_DISCARD,
                  V_BUY, V_SELL, V_MOVE_JOKER, V_MOVE_CARD, V_REROLL, V_NEXT, V_USE, V_SELL_CONS, V_OPEN,
                  V_PICK, V_SKIP, V_REDEEM, WIN_ANTE, RANK_CHARS, SUIT_CHARS,
                  live_v, bankrupt_at, reroll_price, item_cost, pack_cost, joker_cost, shop_item_cost,
@@ -732,6 +733,11 @@ class App:
         elif verb == V_REROLL:
             self.say(f"Rerolled for ${int(pre.money) - int(h.money)}." if int(h.money) != int(pre.money)
                      else "Not enough money to reroll.")
+        elif verb == V_NEXT and int(pre.game_stage) == STAGE_CASHOUT:
+            self.last_play = self.cashout = None
+            self.say(f"Cashed out ${int(pre.last_cashout)}. The shop.")
+        elif verb == V_NEXT and int(pre.game_stage) == STAGE_END:
+            pass                                       # the cash out's text follows
         elif verb == V_NEXT:
             self.last_play = None
             self.cashout = None
@@ -743,9 +749,15 @@ class App:
         if int(h.game_stage) == STAGE_SELECT and int(pre.game_stage) != STAGE_SELECT and verb != V_NEXT:
             self.say("Back at the blind select.")
 
-        if int(pre.game_stage) == STAGE_BLIND and int(h.game_stage) in (STAGE_SHOP, STAGE_WON):
-            res = self.last_play[0] if self.last_play is not None and verb == V_PLAY else None
-            beaten = res is not None and int(pre.chips_scored) + int(res.score) >= int(pre.blind_target)
+        if int(h.game_stage) == STAGE_END and int(pre.game_stage) == STAGE_BLIND:
+            self.say("Blind beaten. Move the jokers now: the end of the round (Gold cards, Blue Seals, "
+                     "Mime) reads their order. Then Next.")
+        if int(pre.game_stage) in (STAGE_BLIND, STAGE_END) and int(h.game_stage) in (STAGE_CASHOUT, STAGE_WON):
+            if int(pre.game_stage) == STAGE_END:
+                beaten = int(pre.chips_scored) >= int(pre.blind_target)
+            else:
+                res = self.last_play[0] if self.last_play is not None and verb == V_PLAY else None
+                beaten = res is not None and int(pre.chips_scored) + int(res.score) >= int(pre.blind_target)
             blind = int(blind_dollars(pre.blind_index, pre.boss, pre.stake)) if beaten else 0
             hands = int(h.hands)
             rest = int(h.last_cashout) - blind - hands
@@ -969,7 +981,7 @@ class App:
         if k > 0 and run.plays[k - 1] is not None:
             res, pre = run.plays[k - 1], run.views[k - 1].h
             self.last_play = (res, [inst_view(pre, c) for c, ok in zip(res.cards, res.valid) if ok])
-        if k > 0 and int(run.views[k - 1].h.game_stage) == STAGE_BLIND and int(h.game_stage) == STAGE_SHOP:
+        if int(h.game_stage) == STAGE_CASHOUT:
             self.cashout = f"Cash out ${int(h.last_cashout)}"
         self.refresh()
 
@@ -1175,6 +1187,10 @@ class App:
                                   1 <= n <= 5 and int(h.discards) > 0)
             b["sort_rank"] = Button((940, 668, 110, 40), "Sort Rank", PANEL_HI)
             b["sort_suit"] = Button((1060, 668, 110, 40), "Sort Suit", PANEL_HI)
+        if stage == STAGE_END:
+            b["end_next"] = Button((560, 660, 360, 54), "Next: the end of the round", BTN_PLAY)
+        if stage == STAGE_CASHOUT:
+            b["cash_out"] = Button((660, 470, 240, 64), f"Cash Out ${int(h.last_cashout)}", BTN_GREEN)
         if stage == STAGE_SHOP:
             b["next"] = Button((340, 250, 190, 70), "Next Round", BTN_DISC)
             b["reroll"] = Button((340, 334, 190, 70), f"Reroll ${self.reroll}", BTN_GREEN,
@@ -1197,11 +1213,11 @@ class App:
             if int(h.hand_valid.sum()):
                 b["sort_rank"] = Button((940, 668, 110, 40), "Sort Rank", PANEL_HI)
                 b["sort_suit"] = Button((1060, 668, 110, 40), "Sort Suit", PANEL_HI)
-        if self.cons_sel is not None and stage in (STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT):
+        if self.cons_sel is not None and stage in (STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT, STAGE_CASHOUT):
             r = dict(self.cons_rects())[self.cons_sel]
             b["use"] = Button((r.x, r.bottom + 6, 44, 30), "Use", BTN_PLAY)
             b["sell_cons"] = Button((r.x + 48, r.bottom + 6, 44, 30), f"${int(h.cons_sell[self.cons_sel])}", BTN_GREEN)
-        if self.joker_sel is not None and stage in (STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT):
+        if self.joker_sel is not None and stage in (STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT, STAGE_CASHOUT):
             for i, r in self.joker_rects():
                 if i == self.joker_sel:
                     b["sell"] = Button((r.x + 19, r.bottom + 6, 100, 34),
@@ -1235,7 +1251,7 @@ class App:
             return b
         # model panel
         x = GW + 14
-        live = stage in (STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT)
+        live = stage in (STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT, STAGE_END, STAGE_CASHOUT)
         b["ai_step"] = Button((x, 616, 140, 40), "Step (M)", BTN_PLAY, live)
         b["ai_auto"] = Button((x + 152, 616, 140, 40), "Stop (A)" if self.ai_auto else "Auto (A)",
                               BTN_DISC if self.ai_auto else BTN_GREEN, live)
@@ -1315,7 +1331,7 @@ class App:
             self.sort_hand("rank")
         elif name == "sort_suit":
             self.sort_hand("suit")
-        elif name == "next":
+        elif name in ("next", "end_next", "cash_out"):
             self.step(V_NEXT)
         elif name == "reroll":
             self.step(V_REROLL)
@@ -1525,7 +1541,9 @@ class App:
         else:
             name = blind_name(h, bi)
             text(s, fit(f, name, 260) if len(name) > 14 else f.big, name, TEXT, (162, 40), "midtop")
-            text(s, f.body, f"Score at least {int(h.blind_target):,}", TEXT, (162, 80), "midtop")
+            # the shop and the cash-out screen show the blind on deck: its own target
+            target = self.targets[bi] if stage in (STAGE_SHOP, STAGE_CASHOUT) else int(h.blind_target)
+            text(s, f.body, f"Score at least {target:,}", TEXT, (162, 80), "midtop")
 
         box(s, (24, 126, 276, 60), PANEL_HI, 10)
         text(s, f.body, "Round score", DIM, (36, 146))
@@ -1743,6 +1761,19 @@ class App:
             text(s, f.bold, f"${self.v_price}", MONEY_C if ok else DIM, (r.centerx, r.bottom - 26), "midtop")
         if self.cashout:
             text(s, f.body, self.cashout, MONEY_C, (782, 590), "midtop")
+
+    def draw_cashout(self):
+        """The cash-out screen: the round's $ (paid at Cash Out); USE / SELL still work here, and
+        they come before the shop is rolled."""
+        s, f, h = self.screen, self.fonts, self.h
+        box(s, (480, 240, 600, 310), PANEL, 14, MONEY_C, 3)
+        text(s, f.big, "Cash Out", MONEY_C, (780, 256), "midtop")
+        text(s, f.huge, f"${int(h.last_cashout)}", MONEY_C, (780, 300), "midtop")
+        if self.cashout:
+            for k, line in enumerate(wrap(f.small, self.cashout, 560)[:3]):
+                text(s, f.small, line, TEXT, (780, 380 + 18 * k), "midtop")
+        text(s, f.small, "You can still use or sell cards here: the shop is rolled at Cash Out.", DIM,
+             (780, 440), "midtop")
 
     def draw_select(self):
         """The blind select: the Small, Big and Boss Blind of the ante, their targets, rewards
@@ -2124,10 +2155,17 @@ class App:
             self.draw_pack()
             if bool(h.hand_valid.any()):
                 self.draw_hand()
+        elif stage == STAGE_CASHOUT:
+            self.draw_cashout()
         else:
             self.draw_play_area()
-            if stage == STAGE_BLIND:
+            if stage in (STAGE_BLIND, STAGE_END):
                 self.draw_hand()
+            if stage == STAGE_END:
+                text(self.screen, self.fonts.bold, "End of the round: move the jokers, then Next", AI_C,
+                     (780, 410), "midtop")
+                text(self.screen, self.fonts.small, "Gold cards and Blue Seals in hand act now; Mime "
+                     "repeats them, and Blueprint / Brainstorm can copy Mime", DIM, (780, 440), "midtop")
         buttons = self.buttons()
         if stage in (STAGE_LOST, STAGE_WON) and self.test_mode:
             text(s, self.fonts.big, "RUN LOST" if stage == STAGE_LOST else "RUN WON", MULT_C, (782, 600), "midtop")

@@ -16,8 +16,8 @@ from env import (balatroAction, env_step, deal, reset, explain_play, preview, ac
                  invariant_errors, blind_target, MAX_HAND_SIZE, MAX_SHOP_SLOTS,
                  V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD,
                  STAGE_BLIND, STAGE_SHOP, STAGE_LOST, STAGE_WON, STAGE_SELECT, STAGE_NAMES, N_VERBS,
-                 BLIND_SMALL, BLIND_BIG, BLIND_BOSS)
-from items import BOSS_MIN_ANTE, BOSS_SHOWDOWN, TAG_MIN_ANTE
+                 STAGE_END, STAGE_CASHOUT, BLIND_SMALL, BLIND_BIG, BLIND_BOSS)
+from items import BOSS_MIN_ANTE, BOSS_SHOWDOWN, TAG_MIN_ANTE, IK_JOKER
 from jokers import JOKER_ID, J_EMPTY, MAX_JOKERS, N_JOKERS, COMMON
 from fixtures import state, select, mask_lanes, diff_states, report
 
@@ -142,10 +142,16 @@ def run_blind_end_test():
     c.eq("chips + 60", got.chips_scored, 350)
     c.eq("reward = the cashout $", r, cashout)
     c.eq("a clear does not end the run", d, False)
-    c.eq("stage -> SHOP", got.game_stage, STAGE_SHOP)
+    c.eq("stage -> CASH OUT", got.game_stage, STAGE_CASHOUT)
     c.eq("last_cashout", got.last_cashout, cashout)
-    c.eq("money += cashout", got.money, 12 + cashout)
+    c.eq("the money waits for Cash Out", got.money, 12)
+    c.eq("no shop on the cash-out screen", [int(s) for s in got.shop_slots], [-1] * 4)
     c.eq("reroll cost back to base", got.reroll_cost, 5)
+    cashed, r2, _ = env_step(got, act(V_NEXT))
+    c.eq("Cash Out -> SHOP", cashed.game_stage, STAGE_SHOP)
+    c.eq("Cash Out: money += cashout", cashed.money, 12 + cashout)
+    c.eq("Cash Out: no second reward", r2, 0)
+    got = cashed
     shop = [int(s) for s in got.shop_slots]
     c.check("2 unlocked slots filled", all(0 <= s < N_JOKERS for s in shop[:2]), shop)
     c.check("locked slots empty", all(s == -1 for s in shop[2:]), shop)
@@ -165,6 +171,7 @@ def run_blind_end_test():
     seen = set()
     for k in range(20):
         got, _, _ = env_step(held._replace(key=jax.random.key(k)), act(V_PLAY, "11000000"))
+        got, _, _ = env_step(got, act(V_NEXT))                  # Cash Out: the shop opens
         seen |= {int(s) for s, k in zip(got.shop_slots[:2], got.shop_kind[:2]) if int(k) == 0}
     c.check("held jokers never rolled", not (seen & {int(j) for j in trio}), sorted(seen))
 
@@ -193,7 +200,7 @@ def run_blind_end_test():
     # clearing on the LAST hand is a clear, not a fail
     pre = state(hand="KD KC 2C 4H 6S 8D TC 3S", hands=1, chips_scored=290)
     got, _, _ = env_step(pre, act(V_PLAY, "11000000"))
-    c.eq("clear on the last hand -> SHOP", got.game_stage, STAGE_SHOP)
+    c.eq("clear on the last hand -> CASH OUT", got.game_stage, STAGE_CASHOUT)
     c.eq("clear on the last hand: $3 + 0 hands", got.last_cashout, 3)
 
     # win: the ante-8 boss
@@ -221,7 +228,8 @@ def run_blind_end_test():
         c.check(f"boss {k}: the tags fit ante 2",
                 all(0 <= int(t) < len(TAG_MIN_ANTE) and int(TAG_MIN_ANTE[int(t)]) <= 2 for t in got.blind_tags),
                 got.blind_tags)
-        c.check(f"boss {k}: a voucher in the shop", int(got.shop_vouchers[0]) >= 0, got.shop_vouchers)
+        cashed, _, _ = env_step(got, act(V_NEXT))             # Cash Out: the shop opens
+        c.check(f"boss {k}: a voucher in the shop", int(cashed.shop_vouchers[0]) >= 0, cashed.shop_vouchers)
     return c.done()
 
 
@@ -452,17 +460,24 @@ def run_full_run_test():
     s = reset(jax.random.key(7), 52, 8)
     green = None          # model of Green's value; None until bought
     clears, steps = 0, 0
-    while int(s.game_stage) in (STAGE_BLIND, STAGE_SHOP, STAGE_SELECT) and steps < 400:
+    while int(s.game_stage) in (STAGE_BLIND, STAGE_CASHOUT, STAGE_SHOP, STAGE_SELECT) and steps < 400:
         steps += 1
-        if int(s.game_stage) == STAGE_SELECT:
+        if int(s.game_stage) == STAGE_CASHOUT:
+            money, due = int(s.money), int(s.last_cashout)
+            s, r, _ = env_step(s, act(V_NEXT))
+            c.eq("Cash Out pays the round's $", s.money, money + due)
+            c.eq("Cash Out: the shop", s.game_stage, STAGE_SHOP)
+            c.eq("Cash Out: no reward (it came with the clear)", r, 0)
+        elif int(s.game_stage) == STAGE_SELECT:
             s, _, _ = env_step(s._replace(boss=jnp.int32(-1)), act(V_NEXT))
             c.eq("the blind starts", s.game_stage, STAGE_BLIND)
             s = s._replace(blind_target=jnp.int32(1))
         elif int(s.game_stage) == STAGE_SHOP:
             if green is None:
                 # stage the shop so Green is for sale, and afford it
-                s = s._replace(shop_slots=s.shop_slots.at[0].set(J_GREEN),
-                               money=jnp.maximum(s.money, 4))
+                s = s._replace(shop_slots=s.shop_slots.at[0].set(J_GREEN), shop_kind=s.shop_kind.at[0].set(IK_JOKER),
+                               shop_ed=s.shop_ed.at[0].set(0), shop_sticker=s.shop_sticker.at[0].set(0),
+                               shop_free=s.shop_free.at[0].set(False), money=jnp.maximum(s.money, 4))
                 s, _, _ = env_step(s, act(V_BUY, target=0))
                 c.eq("bought Green", s.jokers[0], J_GREEN)
                 green = 0.0
@@ -483,7 +498,7 @@ def run_full_run_test():
                 if green is not None:
                     green += 1.0
                 c.check(f"round {int(s.round)}: the play clears",
-                        int(s.game_stage) in (STAGE_SHOP, STAGE_WON))
+                        int(s.game_stage) in (STAGE_CASHOUT, STAGE_WON))
                 clears += 1
                 want = [3, 4, 5][bi] + hands_left + min(money // 5, 5)
                 c.eq(f"round {int(s.round)}: cashout", s.last_cashout, want)
@@ -536,6 +551,7 @@ def run_fuzz_test(n_envs=128, n_steps=120, seed=0):
                 c.check(f"step {t} env {i}", False, errs)
         c.check(f"step {t}: reward >= 0", bool((r >= 0).all()), r)
     c.check("the fuzz reached the shop", seen_stage[STAGE_SHOP] > 0, seen_stage)
+    c.check("the fuzz reached the cash-out screen", seen_stage[STAGE_CASHOUT] > 0, seen_stage)
     c.check("the fuzz reached LOST", seen_stage[STAGE_LOST] > 0, seen_stage)
     print(f"  fuzz stage visits {dict(zip(STAGE_NAMES, seen_stage.tolist()))}")
     return c.done()

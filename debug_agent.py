@@ -30,7 +30,7 @@ from env import BLIND_NAMES
 from agent import (init_params, act, action_name, masked_logits, legal_mask, move_masks, observe,
                    is_move, A_PLAY, A_DISCARD, A_MOVE_CARD, A_BUY, A_SELL, A_OPEN, A_USE, A_SELL_CONS,
                    N_ACTIONS)
-from env import STAGE_PACK, card_id
+from env import STAGE_PACK, STAGE_NAMES, card_id
 from items import CONS_NAMES, PACK_NAMES
 from jokers import JOKER_NAMES
 from scoring import HAND_NAMES
@@ -74,7 +74,7 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
         a = int(a)
         where = (f"A{int(state.ante)} {BLIND_NAMES[int(state.blind_index)][:5]}"
                  if int(state.game_stage) == STAGE_BLIND else
-                 f"A{int(state.ante)} {'pack ' if int(state.game_stage) == STAGE_PACK else 'shop '}")
+                 f"A{int(state.ante)} {STAGE_NAMES[int(state.game_stage)].lower()[:5]:5s}")
         name = action_name(a, src, dst) if is_move(a) else action_name(a)
         line = f" {step:3d} {where}  ${int(state.money):3d}  {name:12s} p={float(p[a]):.2f}"
         if a in (A_PLAY, A_DISCARD):

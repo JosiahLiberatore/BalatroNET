@@ -14,6 +14,7 @@ group, so the GUI shows those too.
 """
 
 import ast
+import functools
 import io
 import math
 import tokenize
@@ -25,7 +26,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from env import (balatroAction, env_step, explain_play, roll_shop, roll_pack_cards, _clear_blind, MAX_HAND_SIZE,
-                 STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT, STAGE_NAMES, VERB_NAMES, V_PLAY, V_DISCARD,
+                 STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT, STAGE_END, STAGE_CASHOUT, STAGE_NAMES,
+                 VERB_NAMES, V_PLAY, V_DISCARD,
                  V_BUY, V_SELL, V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, V_USE, V_SELL_CONS,
                  V_OPEN, V_PICK, V_SKIP, V_REDEEM, _hooked, _hook_discard, score_play, fix_select)
 from items import (CONS_ID, CONS_NAMES, CONS_KIND, CK_TAROT, CK_PLANET, PACK_NAMES, PACK_KIND,
@@ -126,6 +128,16 @@ def next_blind():
 
 def play_blind():
     """NEXT at the blind select: play the blind on deck."""
+    return Step(V_NEXT)
+
+
+def cash_out():
+    """NEXT at the cash-out screen: the round's $, a shuffled deck, the shop."""
+    return Step(V_NEXT)
+
+
+def end_round():
+    """NEXT in STAGE_END: the end of the round, with the joker order now."""
     return Step(V_NEXT)
 
 
@@ -303,6 +315,11 @@ class View:
     @property
     def in_hand(self):
         return int(np.asarray(self.h.hand_valid).sum())
+
+    @property
+    def deck(self):
+        """The live cards in draw order (the top first; the dealt ones too)."""
+        return [self.card(int(self.h.deck[k])).name for k in range(int(self.h.deck_size))]
 
     @property
     def hand(self):
@@ -497,7 +514,8 @@ def describe(step, h):
     if v == V_SKIP:
         return "SKIP the pack" if int(h.game_stage) == STAGE_PACK else f"SKIP the {on_deck}"
     if v == V_NEXT:
-        return "NEXT: to the blind select" if int(h.game_stage) == STAGE_SHOP else f"NEXT: play the {on_deck}"
+        return {STAGE_SHOP: "NEXT: to the blind select", STAGE_CASHOUT: "CASH OUT",
+                STAGE_END: "NEXT: the end of the round"}.get(int(h.game_stage), f"NEXT: play the {on_deck}")
     if v == V_REROLL:
         return "REROLL the shop" if int(h.game_stage) == STAGE_SHOP else "REROLL the boss"
     if v == V_REDEEM:
@@ -753,17 +771,17 @@ JOKERS = [
       """Gros Michel gives +15 Mult and has a 1 in 6 chance to be destroyed at the end of the
       round. Three Oops! All 6s make it 8 in 6, so it always happens. The Pair scores
       30 x (2 + 15) = 510, then Gros Michel is destroyed and marked extinct: from now on a shop
-      can have Cavendish and never Gros Michel. With this seed, the shop after the round has a
+      can have Cavendish and never Gros Michel. With this seed, the shop after Cash Out has a
       Cavendish; buy it for $4.""",
-      blind(clear=True, jokers=("Gros Michel",) + ("Oops! All 6s",) * 3, key=81),
-      [play("KD KC"), buy(0)],
+      blind(clear=True, jokers=("Gros Michel",) + ("Oops! All 6s",) * 3, key=39),
+      [play("KD KC"), cash_out(), buy(0)],
       [C("the Pair: mult 2 + 15", lambda r: float(r.play(0).mult), 17.0),
        C("jokers after the round", lambda r: r[1].jokers, ["Oops! All 6s"] * 3),
        C("Gros Michel is extinct", lambda r: bool(r[1].h.gros_extinct), True),
-       C("the shop after the round", lambda r: r[1].shop, ["Cavendish", "Card Sharp"]),
+       C("the shop after Cash Out", lambda r: r[2].shop, ["Cavendish", "Wee Joker"]),
        C("2000 shops after the round: a Cavendish", lambda r: in_shops(r.raw[1], "Cavendish"), True),
        C("2000 shops after the round: a Gros Michel", lambda r: in_shops(r.raw[1], "Gros Michel"), False),
-       C("jokers after the buy", lambda r: r[2].jokers, ["Oops! All 6s"] * 3 + ["Cavendish"])]),
+       C("jokers after the buy", lambda r: r[3].jokers, ["Oops! All 6s"] * 3 + ["Cavendish"])]),
     S("Jokers", "Gros Michel", "survives the roll 5 times in 6",
       """Without Oops! All 6s, Gros Michel is destroyed 1 time in 6. With this seed it survives
       ("Safe!"): it stays, it is not extinct, and no shop has a Cavendish. Over 6000 end-of-round
@@ -803,8 +821,8 @@ JOKERS = [
       """Golden Joker earns $4 at the end of the round. Cash out: $3 (Small Blind) + $2 (2 hands
       left) + $0 interest + $4 = $9.""",
       blind(clear=True, jokers=("Golden Joker",)),
-      [play("KD KC")],
-      [C("cash out", lambda r: r[1].last_cashout, 9), C("money", lambda r: r[1].money, 9)]),
+      [play("KD KC"), cash_out()],
+      [C("cash out", lambda r: r[1].last_cashout, 9), C("money", lambda r: r[2].money, 9)]),
     S("Jokers", "Cloud 9", "$1 per 9 in the full deck",
       """Cloud 9 earns $1 per 9 in the full deck at the end of the round. A standard deck has
       four 9s: cash out $3 + $2 + $4 = $9.""",
@@ -894,12 +912,13 @@ JOKERS = [
       [C("Egg sell value before", lambda r: r[0].jsell(0), 2), C("after", lambda r: r[1].jsell(0), 5)]),
     S("Jokers", "Gift Card", "+$1 sell value on every joker and consumable per round",
       """Gift Card adds $1 of sell value to every joker and every Tarot / Planet held at the end of
-      the round. Gift Card $3 -> $4, Joker $1 -> $2, The Hermit $1 -> $2. Cash out $3 + $2 = $5;
-      then sell The Hermit for $2: money $7.""",
+      the round. Gift Card $3 -> $4, Joker $1 -> $2, The Hermit $1 -> $2. On the cash-out screen
+      sell The Hermit for $2, then Cash Out $3 + $2 = $5: money $7.""",
       blind(clear=True, jokers=("Gift Card", "Joker"), consumables=("The Hermit",)),
-      [play("KD KC"), sell_cons(0)],
+      [play("KD KC"), sell_cons(0), cash_out()],
       [C("Gift Card sell value", lambda r: r[1].jsell(0), 4), C("Joker sell value", lambda r: r[1].jsell(1), 2),
-       C("The Hermit sell value", lambda r: r[1].csell(0), 2), C("money after selling it", lambda r: r[2].money, 7)]),
+       C("The Hermit sell value", lambda r: r[1].csell(0), 2), C("money after selling it", lambda r: r[2].money, 2),
+       C("money after Cash Out", lambda r: r[3].money, 7)]),
     S("Jokers", "Gift Card + Blue Seal", "a Planet made at the end of the round misses that round",
       """The jokers' end-of-round effects come before the held cards. A Blue Seal's Planet is made
       after Gift Card acted, so it sells for $1; The Hermit, held before, sells for $2.""",
@@ -921,8 +940,8 @@ JOKERS = [
       """To the Moon earns an extra $1 of interest for every $5 held. With $25: interest
       2 x 5 = $10. Cash out $3 + $2 + $10 = $15.""",
       blind(clear=True, jokers=("To the Moon",), money=25),
-      [play("KD KC")],
-      [C("cash out", lambda r: r[1].last_cashout, 15), C("money", lambda r: r[1].money, 40)]),
+      [play("KD KC"), cash_out()],
+      [C("cash out", lambda r: r[1].last_cashout, 15), C("money", lambda r: r[2].money, 40)]),
     S("Jokers", "Chaos the Clown", "1 free reroll per shop",
       """Chaos the Clown gives 1 free reroll in each shop. With $0, the first reroll is free and
       the price stays $5. The second reroll needs $5, so nothing happens.""",
@@ -1620,8 +1639,8 @@ PACKS = [
     S("Packs", "Buffoon Pack", "the first shop always has one",
       """The first shop of a run always offers a Buffoon Pack in its first pack slot.""",
       blind(clear=True, buffoon_given=False),
-      [play("KD KC")],
-      [C("pack slot 1", lambda r: r[1].packs[0], "Buffoon Pack")]),
+      [play("KD KC"), cash_out()],
+      [C("pack slot 1", lambda r: r[2].packs[0], "Buffoon Pack")]),
 ]
 
 CARDS = [
@@ -1629,8 +1648,9 @@ CARDS = [
       """A Gold card held in hand at the end of the round earns $3 (before interest). 2H is Gold
       and held: $3; then cash out $3 + $2 = $5. Money $8.""",
       blind(clear=True, cards_mod={"2H": dict(enh=7)}),
-      [play("KD KC")],
-      [C("money", lambda r: r[1].money, 8), C("cash out", lambda r: r[1].last_cashout, 5)]),
+      [play("KD KC"), cash_out()],
+      [C("money at the end of the round", lambda r: r[1].money, 3), C("cash out", lambda r: r[1].last_cashout, 5),
+       C("money after Cash Out", lambda r: r[2].money, 8)]),
     S("Cards", "Gold", "a played Gold card earns nothing",
       """A Gold card pays only when held at the end of the round, not when played.""",
       blind(cards_mod={"KD": dict(enh=7)}),
@@ -1814,7 +1834,7 @@ RULES = [
       at X100,000,000): the total is 2,147,483,647 and the blind (1,000,000,000) is beaten.""",
       blind(jokers=("Vampire",), joker_value=(1e8,), chips_scored=1000, blind_target=10 ** 9),
       [play("KD KC")],
-      [C("chips scored", lambda r: r[1].chips_scored, 2147483647), C("stage", lambda r: r[1].stage, "SHOP")]),
+      [C("chips scored", lambda r: r[1].chips_scored, 2147483647), C("stage", lambda r: r[1].stage, "CASH OUT")]),
     S("Rules", "Shop", "joker rarities: 70 / 25 / 5 %",
       """create_card rolls the rarity first: Common 70 %, Uncommon 25 %, Rare 5 % (> 0.7, > 0.95),
       then a joker of that rarity. The 6 jokers that need an Enhanced card or an extinct Gros Michel
@@ -1852,11 +1872,14 @@ RULES = [
       [C("hands left", lambda r: r[1].hands, 3), C("changed fields", _changed, ())]),
     S("Rules", "Cash out", "blind reward + $1 per hand left + interest",
       """Beating the Small Blind pays $3, +$1 per hand left, +$1 interest per $5 held (at most
-      $5). With $12 and 2 hands left: $3 + $2 + $2 = $7, money $19.""",
+      $5). With $12 and 2 hands left: $3 + $2 + $2 = $7 (the reward of the winning hand). The
+      cash-out screen comes first: the $7 goes to the money at Cash Out ($19), then the shop.""",
       blind(clear=True, money=12),
-      [play("KD KC")],
-      [C("cash out", lambda r: r[1].last_cashout, 7), C("money", lambda r: r[1].money, 19),
-       C("stage", lambda r: r[1].stage, "SHOP")]),
+      [play("KD KC"), cash_out()],
+      [C("cash out", lambda r: r[1].last_cashout, 7), C("reward", lambda r: r.rewards[0], 7),
+       C("the cash-out screen", lambda r: r[1].stage, "CASH OUT"), C("money before Cash Out", lambda r: r[1].money, 12),
+       C("money", lambda r: r[2].money, 19), C("stage", lambda r: r[2].stage, "SHOP"),
+       C("Cash Out gives no reward", lambda r: r.rewards[1], 0)]),
     S("Rules", "Cash out", "interest stops at $5",
       """Interest is at most $5 (at $25 or more). With $40: $3 + $2 + $5 = $10.""",
       blind(clear=True, money=40),
@@ -1904,22 +1927,23 @@ RULES = [
       [sell(0)],
       [C("money", lambda r: r[1].money, 3)]),
     S("Rules", "Next blind", "Small, Big, then Boss",
-      """Beating the Small Blind puts the Big Blind on deck. NEXT leaves the shop for the blind
-      select, NEXT there plays it: 300 x 1.5 = 450 chips to beat, 4 hands, 3 discards.""",
+      """Beating the Small Blind puts the Big Blind on deck. Cash Out opens the shop, NEXT leaves
+      it for the blind select, NEXT there plays it: 300 x 1.5 = 450 chips to beat, 4 hands, 3
+      discards.""",
       blind(clear=True, blind_index=0),
-      [play("KD KC"), next_blind(), play_blind()],
+      [play("KD KC"), cash_out(), next_blind(), play_blind()],
       [C("on deck after the Small Blind", lambda r: r[1].blind_index, 1),
-       C("the blind select", lambda r: r[2].stage, "SELECT"),
-       C("blind", lambda r: r[3].blind_index, 1), C("target", lambda r: r[3].blind_target, 450),
-       C("hands", lambda r: r[3].hands, 4), C("discards", lambda r: r[3].discards, 3)]),
+       C("the blind select", lambda r: r[3].stage, "SELECT"),
+       C("blind", lambda r: r[4].blind_index, 1), C("target", lambda r: r[4].blind_target, 450),
+       C("hands", lambda r: r[4].hands, 4), C("discards", lambda r: r[4].discards, 3)]),
     S("Rules", "Next blind", "after the Boss Blind, the next ante",
       """Beating the Boss Blind ends the ante (in the cash out): ante 2, the Small Blind on deck,
       a new boss for ante 2. Its target: 800 chips.""",
       blind(clear=True, blind_index=2, ante=1),
-      [play("KD KC"), next_blind(), play_blind()],
+      [play("KD KC"), cash_out(), next_blind(), play_blind()],
       [C("ante", lambda r: r[1].ante, 2), C("blind", lambda r: r[1].blind_index, 0),
        C("a boss for ante 2", lambda r: r[1].boss_fits, True),
-       C("target", lambda r: r[3].blind_target, 800)]),
+       C("target", lambda r: r[4].blind_target, 800)]),
     S("Rules", "Hands", "out of hands: the run is lost",
       """With 1 hand left, a hand that does not beat the blind loses the run.""",
       blind(hands=1),
@@ -2345,18 +2369,18 @@ def _free_shop_joker(tag, ed):
              f"""{tag}: the next joker in the shop without an edition becomes {ed}, and it is free. An
              Uncommon Tag makes the first shop card a joker.""",
              blind(clear=True, tags=("Uncommon Tag", tag)),
-             [play("KD KC")],
-             [C("shop slot 1's edition", lambda r: r[1].shop_ed(0), ed), C("its price", lambda r: r[1].shop_price(0), 0),
-              C("tags left", lambda r: r[1].tags, [])])
+             [play("KD KC"), cash_out()],
+             [C("shop slot 1's edition", lambda r: r[2].shop_ed(0), ed), C("its price", lambda r: r[2].shop_price(0), 0),
+              C("tags left", lambda r: r[2].tags, [])])
 
 
 TAGS = [
     S("Tags", "Uncommon Tag", "a free Uncommon joker in the next shop",
       """Uncommon Tag: the next shop's first card is an Uncommon joker, and it is free.""",
       blind(clear=True, tags=("Uncommon Tag",)),
-      [play("KD KC")],
-      [C("shop slot 1", lambda r: r[1].shop_rarity(0), "Uncommon"), C("its price", lambda r: r[1].shop_price(0), 0),
-       C("tags left", lambda r: r[1].tags, [])]),
+      [play("KD KC"), cash_out()],
+      [C("shop slot 1", lambda r: r[2].shop_rarity(0), "Uncommon"), C("its price", lambda r: r[2].shop_price(0), 0),
+       C("tags left", lambda r: r[2].tags, [])]),
     S("Tags", "Uncommon Tag", "ante 0: any of the 15 tags",
       """The 15 tags with no minimum ante (P_TAGS min_ante nil) can come at ante 0 too (a boss beaten
       at ante -1). The blind tags rolled there: the Uncommon Tag 1 time in 15, and all 15 tags
@@ -2368,8 +2392,8 @@ TAGS = [
     S("Tags", "Rare Tag", "a free Rare joker in the next shop",
       """Rare Tag: the next shop's first card is a Rare joker, and it is free.""",
       blind(clear=True, tags=("Rare Tag",)),
-      [play("KD KC")],
-      [C("shop slot 1", lambda r: r[1].shop_rarity(0), "Rare"), C("its price", lambda r: r[1].shop_price(0), 0)]),
+      [play("KD KC"), cash_out()],
+      [C("shop slot 1", lambda r: r[2].shop_rarity(0), "Rare"), C("its price", lambda r: r[2].shop_price(0), 0)]),
     _free_shop_joker("Negative Tag", "Negative"),
     _free_shop_joker("Foil Tag", "Foil"),
     _free_shop_joker("Holographic Tag", "Holographic"),
@@ -2389,10 +2413,10 @@ TAGS = [
     S("Tags", "Voucher Tag", "one more voucher in the next shop",
       """Voucher Tag: the next shop has one more voucher than the ante's voucher: 2.""",
       blind(clear=True, tags=("Voucher Tag",), ante_voucher="Grabber"),
-      [play("KD KC")],
-      [C("vouchers in the shop", lambda r: len(r[1].shop_vouchers), 2),
-       C("the ante's voucher first", lambda r: r[1].shop_vouchers[0], "Grabber"),
-       C("tags left", lambda r: r[1].tags, [])]),
+      [play("KD KC"), cash_out()],
+      [C("vouchers in the shop", lambda r: len(r[2].shop_vouchers), 2),
+       C("the ante's voucher first", lambda r: r[2].shop_vouchers[0], "Grabber"),
+       C("tags left", lambda r: r[2].tags, [])]),
     S("Tags", "Boss Tag", "a new boss",
       """Boss Tag: the Boss Blind of this ante is rerolled at once (free). The Wall was used; the
       new boss is another one that fits ante 2.""",
@@ -2447,10 +2471,10 @@ TAGS = [
     S("Tags", "Coupon Tag", "the next shop's cards and packs are free",
       """Coupon Tag: the cards and packs in the next shop are free (a reroll's cards are not).""",
       blind(clear=True, tags=("Coupon Tag",)),
-      [play("KD KC")],
-      [C("card prices", lambda r: [r[1].shop_price(i) for i in range(2)], [0, 0]),
-       C("pack prices", lambda r: [r[1].pack_price(i) for i in range(2)], [0, 0]),
-       C("tags left", lambda r: r[1].tags, [])]),
+      [play("KD KC"), cash_out()],
+      [C("card prices", lambda r: [r[2].shop_price(i) for i in range(2)], [0, 0]),
+       C("pack prices", lambda r: [r[2].pack_price(i) for i in range(2)], [0, 0]),
+       C("tags left", lambda r: r[2].tags, [])]),
     S("Tags", "Coupon Tag", "a free card can be taken below $0",
       """can_buy refuses only a card that costs more than $0: a couponed joker is bought even at -$3
       (The Tooth can leave the money below $0).""",
@@ -2480,9 +2504,9 @@ TAGS = [
     S("Tags", "D6 Tag", "rerolls in the next shop start at $0",
       """D6 Tag: in the next shop the rerolls start at $0 ($0, $1, $2 ...).""",
       blind(clear=True, tags=("D6 Tag",), money=10),
-      [play("KD KC"), reroll()],
-      [C("reroll price", lambda r: r[1].reroll_cost, 0), C("money after a reroll", lambda r: r[2].money, lambda r: r[1].money),
-       C("the next reroll", lambda r: r[2].reroll_cost, 1)]),
+      [play("KD KC"), cash_out(), reroll()],
+      [C("reroll price", lambda r: r[2].reroll_cost, 0), C("money after a reroll", lambda r: r[3].money, lambda r: r[2].money),
+       C("the next reroll", lambda r: r[3].reroll_cost, 1)]),
     S("Tags", "D6 Tag", "a $0 reroll works below $0",
       """can_reroll refuses only a reroll that costs more than $0: in a D6 shop the $0 reroll works at
       -$3; the next one costs $1.""",
@@ -2749,8 +2773,8 @@ VOUCHERS = [
       """The second voucher of a pair only comes after the first: with no voucher redeemed, a new
       ante's voucher is never a second one.""",
       blind(clear=True, blind_index=2, ante_voucher=-1),
-      [play("KD KC")],
-      [C("a first voucher", lambda r: VOUCHER_NAMES.index(r[1].shop_vouchers[0]) % 2 == 0, True)]),
+      [play("KD KC"), cash_out()],
+      [C("a first voucher", lambda r: VOUCHER_NAMES.index(r[2].shop_vouchers[0]) % 2 == 0, True)]),
 ]
 
 
@@ -2971,7 +2995,7 @@ NEW_JOKERS = [
       and Mr. Bones is destroyed. The blind pays no $3. 20 + 60 = 80 of 300 (>= 75).""",
       blind(hands=1, blind_target=300, chips_scored=20, jokers=("Mr. Bones",)),
       [play("KD KC")],
-      [C("stage", lambda r: r[1].stage, "SHOP"), C("jokers", lambda r: r[1].jokers, []),
+      [C("stage", lambda r: r[1].stage, "CASH OUT"), C("jokers", lambda r: r[1].jokers, []),
        C("cash out", lambda r: r[1].last_cashout, 0)]),
     S("Jokers", "Mr. Bones", "below 25%: the run is lost",
       """Mr. Bones does not save a hand below 25% of the blind: 60 of 300 (< 75). Lost.""",
@@ -2983,7 +3007,7 @@ NEW_JOKERS = [
       game_over is false and the second does not act: it stays.""",
       blind(jokers=("Mr. Bones", "Mr. Bones"), hands=1, chips_scored=100, blind_target=300),
       [play("2H")],
-      [C("stage", lambda r: r[1].stage, "SHOP"), C("jokers", lambda r: r[1].jokers, ["Mr. Bones"])]),
+      [C("stage", lambda r: r[1].stage, "CASH OUT"), C("jokers", lambda r: r[1].jokers, ["Mr. Bones"])]),
     S("Jokers", "Throwback", "X0.25 Mult per blind skipped",
       """Throwback: X0.25 Mult for each blind skipped this run. 2 skipped: X1.5. 30 x 2 x 1.5 = 90.""",
       blind(jokers=("Throwback",), skips=2),
@@ -3080,20 +3104,20 @@ SELECT_RULES = [
     S("Rules", "Vouchers", "the ante's voucher in each shop until it is redeemed",
       """Each shop of an ante offers the ante's voucher until it is redeemed.""",
       blind(clear=True, ante_voucher="Grabber"),
-      [play("KD KC")],
-      [C("vouchers in the shop", lambda r: r[1].shop_vouchers, ["Grabber"])]),
+      [play("KD KC"), cash_out()],
+      [C("vouchers in the shop", lambda r: r[2].shop_vouchers, ["Grabber"])]),
     S("Rules", "Vouchers", "redeemed: no voucher for the rest of the ante",
       """Once the ante's voucher is redeemed, the next shops of that ante have no voucher (a
       Voucher Tag still adds one).""",
       blind(clear=True, ante_voucher=-1),
-      [play("KD KC")],
-      [C("vouchers in the shop", lambda r: r[1].shop_vouchers, [])]),
+      [play("KD KC"), cash_out()],
+      [C("vouchers in the shop", lambda r: r[2].shop_vouchers, [])]),
     S("Rules", "Vouchers", "a new voucher with each ante",
       """Beating the Boss Blind brings a new voucher for the next ante (one not redeemed yet).""",
       blind(clear=True, blind_index=2, ante_voucher=-1, vouchers=("Grabber",)),
-      [play("KD KC")],
-      [C("vouchers in the shop", lambda r: len(r[1].shop_vouchers), 1),
-       C("not one redeemed", lambda r: r[1].shop_vouchers[0] != "Grabber", True)]),
+      [play("KD KC"), cash_out()],
+      [C("vouchers in the shop", lambda r: len(r[2].shop_vouchers), 1),
+       C("not one redeemed", lambda r: r[2].shop_vouchers[0] != "Grabber", True)]),
     S("Rules", "Hieroglyph", "ante 0 needs 100 chips",
       """Below ante 1 (Hieroglyph at ante 1), a Small Blind needs 100 chips.""",
       _redeem_shop("Hieroglyph", ante=1),
@@ -3177,8 +3201,8 @@ STAKES = [
       """Red Stake: the Small Blind gives no reward money (no_blind_reward.Small). Beat it with 2
       hands left and $0: the cash out is $0 + $2 for the hands = $2 (White Stake: $5).""",
       blind(clear=True, stake=2),
-      [play("KD KC")],
-      [C("cash out", lambda r: r[1].last_cashout, 2), C("money", lambda r: r[1].money, 2),
+      [play("KD KC"), cash_out()],
+      [C("cash out", lambda r: r[1].last_cashout, 2), C("money", lambda r: r[2].money, 2),
        C("reward", lambda r: r.rewards[0], 2)]),
     S("Stakes", "Red Stake", "the Big Blind still pays $4",
       """Red Stake takes only the Small Blind's reward: the Big Blind pays $4 + $2 for the hands.""",
@@ -3269,7 +3293,7 @@ STAKES = [
       -> 4. It still acts (+4 Mult: 30 x 6 = 180).""",
       blind(clear=True, stake=7, jokers=("Joker",), joker_sticker=("P",), joker_perish=(5,)),
       [play("KD KC")],
-      [C("score", _score(), 180), C("rounds left", lambda r: r[1].jleft(0), 4), C("stage", lambda r: r[1].stage, "SHOP")]),
+      [C("score", _score(), 180), C("rounds left", lambda r: r[1].jleft(0), 4), C("stage", lambda r: r[1].stage, "CASH OUT")]),
     S("Stakes", "Perishable", "after its last round it is debuffed for good",
       """With 1 round left the joker still acts in that round (30 x 6 = 180), then its count goes to
       0 and it is debuffed (set_debuff) for the rest of the run.""",
@@ -3338,14 +3362,16 @@ STAKES = [
       interest. $10 -> $7: interest $1. The Big Blind: $4 + $2 for the hands + $1 = $7 cash out,
       $14 in all (no Rental: $18).""",
       blind(clear=True, stake=8, blind_index=1, jokers=("Joker",), joker_sticker=("R",), money=10),
-      [play("KD KC")],
-      [C("cash out", lambda r: r[1].last_cashout, 7), C("money", lambda r: r[1].money, 14)]),
+      [play("KD KC"), cash_out()],
+      [C("money after the rent", lambda r: r[1].money, 7), C("cash out", lambda r: r[1].last_cashout, 7),
+       C("money", lambda r: r[2].money, 14)]),
     S("Stakes", "Rental", "the rent can take the money below $0",
       """ease_dollars has no floor: two Rental jokers take $6 from $2 (-$4), then the Small Blind's
       cash out (Gold Stake: $0) pays $2 for the hands: -$2.""",
       blind(clear=True, stake=8, jokers=("Joker", "Bull"), joker_sticker=("R", "R"), money=2),
-      [play("KD KC")],
-      [C("money", lambda r: r[1].money, -2), C("cash out", lambda r: r[1].last_cashout, 2)]),
+      [play("KD KC"), cash_out()],
+      [C("money after the rent", lambda r: r[1].money, -4), C("money", lambda r: r[2].money, -2),
+       C("cash out", lambda r: r[1].last_cashout, 2)]),
     S("Stakes", "Rental + Buffoon Pack", "a Buffoon pack joker can have stickers",
       """create_card for a pack joker polls the stickers too ('packetper', 'packssjr'): about 30 % of
       each at Gold Stake (4000 Buffoon Packs).""",
@@ -3372,8 +3398,138 @@ STAKES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# THE END OF THE ROUND, THE CASH-OUT SCREEN, PACK HANDS (2026-11-05)
+# ---------------------------------------------------------------------------
+GOLD2 = {"2H": dict(enh=7), "3S": dict(enh=7)}          # two Gold cards held after the Pair of Kings
+_use_slot0 = jax.jit(jax.vmap(
+    lambda k, s: env_step(s._replace(key=k), balatroAction(verb=jnp.int32(V_USE), select=jnp.zeros(MAX_HAND_SIZE, bool),
+                                                           target=jnp.int32(0), dest=jnp.int32(0)))[0].consumables,
+    in_axes=(0, None)))
+
+
+@functools.lru_cache(maxsize=None)
+def _emperor_new(jokers, n=3000, seed=3):
+    """n uses of a held Emperor in the shop (room for its 2 Tarots). -> (Emperors made, Tarots made)"""
+    s = state(**shop(consumables=("The Emperor",), consumable_slots=3, jokers=jokers))
+    got = np.asarray(_use_slot0(jax.random.split(jax.random.key(seed), n), s))
+    return int((got == CONS_ID["The Emperor"]).sum()), int((got >= 0).sum())
+
+
+ROUND_END = [
+    S("Rules", "Cash out + The Hermit", "a USE on the cash-out screen comes before the $",
+      """The cash-out screen comes before Cash Out pays. With $10, beat the Small Blind with 2 hands
+      left: the cash out is $3 + $2 + $2 = $7. Use The Hermit on the screen: $10 doubles to $20;
+      Cash Out: $27. (In the shop it would double $17: +$17, $34.)""",
+      blind(clear=True, money=10, consumables=("The Hermit",)),
+      [play("KD KC"), use(0), cash_out()],
+      [C("cash out", lambda r: r[1].last_cashout, 7), C("money after The Hermit", lambda r: r[2].money, 20),
+       C("money after Cash Out", lambda r: r[3].money, 27)]),
+    S("Rules", "Cash out + SELL", "a joker sold on the cash-out screen can come in the first shop",
+      """The first shop is rolled at Cash Out, after the screen. A joker sold there is no longer held,
+      so the shop can offer it again (2000 shops); held, it never comes. Joker sells for $1; the cash
+      out (counted before the sale) is $3 + $2 = $5: money $6.""",
+      blind(clear=True, jokers=("Joker",)),
+      [play("KD KC"), sell(0), cash_out()],
+      [C("2000 shops with Joker held", lambda r: in_shops(r.raw[1], "Joker"), False),
+       C("2000 shops after the sale", lambda r: in_shops(r.raw[2], "Joker"), True),
+       C("money after Cash Out", lambda r: r[3].money, 6)]),
+    S("Rules", "Cash out", "Cash Out shuffles the deck",
+      """G.FUNCS.cash_out shuffles the deck ('cashout'): the shop's packs deal from that order.""",
+      blind(clear=True),
+      [play("KD KC"), cash_out()],
+      [C("the whole deck, none dealt", lambda r: int(r[2].h.deck_ptr), 0),
+       C("a new order", lambda r: r[2].deck != r[1].deck, True)]),
+    S("Rules", "Mime + Blueprint", "after the last hand: move Blueprint to copy Mime",
+      """In the game a joker can be dragged while the winning hand scores, and the end of the round
+      reads the order after that. Mime repeats a held card's end-of-round effect; Blueprint copies
+      the joker to its right. Mime, Blueprint (it copies nothing) and two Gold cards held: the env
+      stops in END. Move Blueprint before Mime, then NEXT: each Gold card pays 3 times ($9), $18 in
+      all (as it was: $12). The cash out reads the new money: $3 + $2 + $3 = $8.""",
+      blind(clear=True, jokers=("Mime", "Blueprint"), cards_mod=GOLD2),
+      [play("KD KC"), Step(V_MOVE_JOKER, "", 1, 0), end_round(), cash_out()],
+      [C("stage after the hand", lambda r: r[1].stage, "END"), C("no reward yet", lambda r: r.rewards[0], 0),
+       C("jokers after the move", lambda r: r[2].jokers, ["Blueprint", "Mime"]),
+       C("money after the end of the round", lambda r: r[3].money, 18),
+       C("cash out", lambda r: r[3].last_cashout, 8), C("reward", lambda r: r.rewards[2], 8),
+       C("money after Cash Out", lambda r: r[4].money, 26)]),
+    S("Rules", "Mime + Brainstorm", "after the last hand: move Mime to the left for Brainstorm",
+      """Brainstorm copies the leftmost joker. Brainstorm, Mime and two Gold cards: move Mime to the
+      left, then NEXT: Brainstorm copies Mime, each Gold card pays 3 times: $18.""",
+      blind(clear=True, jokers=("Brainstorm", "Mime"), cards_mod=GOLD2),
+      [play("KD KC"), Step(V_MOVE_JOKER, "", 1, 0), end_round()],
+      [C("stage after the hand", lambda r: r[1].stage, "END"),
+       C("jokers after the move", lambda r: r[2].jokers, ["Mime", "Brainstorm"]),
+       C("money", lambda r: r[3].money, 18), C("stage", lambda r: r[3].stage, "CASH OUT")]),
+    S("Rules", "Blueprint + Gold", "no window when the joker order cannot matter",
+      """The END window comes only when the order can change the end of the round: Mime acts,
+      Blueprint or Brainstorm acts, and a Gold card or a Blue Seal (with a free slot) is in hand.
+      Blueprint and a Joker with two Gold cards: straight to the cash-out screen; the Gold cards pay
+      $6, the cash out $3 + $2 + $1 = $6.""",
+      blind(clear=True, jokers=("Blueprint", "Joker"), cards_mod=GOLD2),
+      [play("KD KC")],
+      [C("stage", lambda r: r[1].stage, "CASH OUT"), C("money", lambda r: r[1].money, 6),
+       C("reward", lambda r: r.rewards[0], 6)]),
+    S("Rules", "Mime + Blueprint + Blue Seal", "no window when the Blue Seal has no free slot",
+      """A Blue Seal makes a Planet only with a free consumable slot. With both slots full it does
+      nothing, so Mime has nothing to repeat and the order cannot matter: no END window.""",
+      blind(clear=True, jokers=("Mime", "Blueprint"), consumables=("The Hermit", "The Hermit"),
+            cards_mod={"2H": dict(seal=3)}),
+      [play("KD KC")],
+      [C("stage", lambda r: r[1].stage, "CASH OUT"), C("consumables", lambda r: r[1].cons, ["The Hermit"] * 2)]),
+    S("Rules", "Mime + Blueprint + Mr. Bones", "the window when Mr. Bones saves the round",
+      """Mr. Bones saves a lost last hand (25 % of the blind), and the held cards still act at the
+      end of the round, so the window comes too. 20 + 60 = 80 of 300. Move Blueprint before Mime,
+      then NEXT: Mr. Bones goes, the Gold cards pay $18, the blind pays $0: cash out $0 + 0 hands +
+      $3 interest = $3.""",
+      blind(hands=1, blind_target=300, chips_scored=20, jokers=("Mime", "Blueprint", "Mr. Bones"), cards_mod=GOLD2),
+      [play("KD KC"), Step(V_MOVE_JOKER, "", 1, 0), end_round()],
+      [C("stage after the hand", lambda r: r[1].stage, "END"),
+       C("jokers after the round", lambda r: r[3].jokers, ["Blueprint", "Mime"]),
+       C("money", lambda r: r[3].money, 18), C("cash out", lambda r: r[3].last_cashout, 3)]),
+    S("Rules", "Arcana Pack", "a second pack in one shop deals the next cards",
+      """The deck is shuffled only at the run start, at Cash Out and at the blind start. An Arcana
+      pack deals its hand from the top of the deck and puts it back at the bottom when it closes
+      (the leftmost card first). So a second Arcana pack in the same shop deals the next 8 cards.""",
+      shop(money=20, pack_slots=(PACK["Arcana Pack"], PACK["Arcana Pack"])),
+      [open_pack(0), skip(), open_pack(1)],
+      [C("the first hand: the top 8", lambda r: r[1].hand, "2C 3C 4C 5C 6C 7C 8C 9C".split()),
+       C("after the close: the first hand at the bottom", lambda r: r[2].deck[-8:], "2C 3C 4C 5C 6C 7C 8C 9C".split()),
+       C("the second hand: the next 8", lambda r: r[3].hand, "TC JC QC KC AC 2D 3D 4D".split())]),
+    S("Tarots", "The Emperor", "never makes The Emperor",
+      """The used card still exists while it acts (used_jokers keeps it until it dissolves), so The
+      Emperor never makes another Emperor. 3000 uses with room for 2 Tarots: 6000 Tarots, no
+      Emperor. (Before: about 1 in 21.)""",
+      shop(consumables=("The Emperor",), consumable_slots=3),
+      [use(0)],
+      [C("2 new Tarots", lambda r: r[1].n_cons(CK_TAROT), 2),
+       C("Emperors in 6000 new Tarots", lambda r: _emperor_new(())[0], 0),
+       C("new Tarots", lambda r: _emperor_new(())[1], 6000)]),
+    S("Tarots", "The Emperor + Showman", "with Showman The Emperor can make The Emperor",
+      """Showman lets any card come again: then The Emperor makes The Emperor about 1 time in 22
+      (6000 new Tarots: about 270).""",
+      shop(consumables=("The Emperor",), consumable_slots=3, jokers=("Showman",)),
+      [use(0)],
+      [C("Emperors in 6000 new Tarots", lambda r: _emperor_new(("Showman",))[0], Between(180, 380))]),
+    S("Jokers", "Trading Card + Showman", "two Trading Cards pay $3 each",
+      """Each Trading Card acts on the first discard of 1 card: the card is destroyed one time, and
+      each Trading Card pays $3. Two Trading Cards (Showman): $6.""",
+      blind(jokers=("Trading Card", "Trading Card", "Showman")),
+      [discard("2H")],
+      [C("money", lambda r: r[1].money, 6), C("2H destroyed", lambda r: r[1].card("2H").live, False),
+       C("cards in the deck", lambda r: r[1].n_cards(), 51)]),
+    S("Jokers", "Invisible Joker", "its copy of an Invisible Joker starts at 0 rounds",
+      """A sold Invisible Joker (2 rounds) copies a random other joker. When the copy is an Invisible
+      Joker it starts at 0 rounds (invis_rounds = 0): it needs 2 more rounds. Two Invisible Jokers
+      at 2 rounds; sell the first: the other one keeps 2, the copy has 0.""",
+      shop(jokers=("Invisible Joker", "Invisible Joker"), joker_value=(2.0, 2.0)),
+      [sell(0)],
+      [C("jokers", lambda r: r[1].jokers, ["Invisible Joker", "Invisible Joker"]),
+       C("rounds: the old one, the copy", lambda r: [r[1].jv(0), r[1].jv(1)], [2.0, 0.0])]),
+]
+
 SCENARIOS = (JOKERS + NEW_JOKERS + TAROTS + PLANETS + SPECTRALS + PACKS + SPECTRAL_PACKS + CARDS + BOSSES + TAGS
-             + VOUCHERS + RULES + SELECT_RULES + STAKES)
+             + VOUCHERS + RULES + SELECT_RULES + STAKES + ROUND_END)
 
 
 # ---------------------------------------------------------------------------

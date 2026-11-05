@@ -463,6 +463,52 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       28 scenarios in a new Stakes group (GUI test menu: Stakes); every stake and sticker needs one.
       GUI: K (or the stake button) starts the next stake; the stickers on held, shop and pack jokers
       (a perished joker crossed out); the stake in the sidebar; "No reward" on the Small Blind.
+- [x] The end of the round and the cash-out screen (2026-11-05), rules from the 1.0.1o Lua:
+      ENV RULES:
+      - The cash-out screen (ROUND_EVAL): new STAGE_CASHOUT after a won round. end_round and the
+        cash-out rows (evaluate_round: last_cashout) still run at the winning hand, and the reward
+        stays on that step; the $ goes to the money at NEXT (G.FUNCS.cash_out), which then shuffles
+        the deck ('cashout') and opens the shop. USE (cards that need no hand), SELL, SELL_CONS and
+        MOVE_JOKER work on the screen and come before the shop roll: a joker sold there can come in
+        the first shop, The Hermit there doubles the money before the $. The win (the ante 8 boss)
+        pays at once and ends the run. Each won round takes one more step (Cash Out).
+      - The window after the winning hand: new STAGE_END. In the game a joker can be dragged while
+        the hand scores (the joker area has no drag lock; with a mouse interrupt.focus is cleared
+        each frame), and end_round reads the joker order after the score animation. Only Mime's
+        retrigger of a held card can change with the order (card.lua: every other end-of-round
+        effect has `not context.blueprint`), so the env stops in END only when the order can matter
+        (env.end_window): the round is won or Mr. Bones saves it, Mime acts, Blueprint or Brainstorm
+        acts, and a held card has an end-of-round effect (a Gold card, or a Blue Seal with a free
+        slot; not debuffed). MOVE_JOKER and NEXT only (the game blocks a sale or a use while the
+        cards are in the play area); NEXT runs the end of the round, and that round's reward comes
+        on that NEXT. The boss is still on in END (boss_active, the Manacle's hand size).
+      - Pack hands from the deck: an Arcana / Spectral pack deals the next hand-size cards from the
+        top (draw_from_deck_to_hand) and puts the hand back at the bottom when it closes
+        (draw_from_hand_to_deck takes the leftmost card first; CardArea:emplace puts a deck card at
+        index 1, the bottom). The deck is shuffled only at the run start, at Cash Out and at the
+        blind start, so a second pack in one shop (or a tag's pack after it) deals the next cards.
+        Was: every pack dealt from a new shuffle.
+      - The Emperor never makes The Emperor: the used card stays in the pool's "exists" set while it
+        acts (used_jokers keeps it until Card:remove after the dissolve); Showman allows it. Was:
+        about 1 in 21 of its Tarots. Packs and shops already skipped existing cards.
+      - Trading Card: $3 for each acting Trading Card (two with Showman: $6; the card is destroyed
+        once). Was: $3 in all.
+      - Invisible Joker: its copy of an Invisible Joker starts at 0 rounds (invis_rounds = 0; Ankh's
+        copy keeps the count). Was: the copy kept the count and could be sold again at once.
+      AGENT (no training change): the legal mask allows MOVE_JOKER and NEXT in END, and USE / SELL /
+      SELL_CONS / MOVE_JOKER / NEXT on the cash-out screen; obs 2464 -> 2467 (the END and CASH OUT
+      flags, the cash out's $ on its screen). Old params do not load.
+      TESTS: the reference model follows every change (END and its NEXT, Cash Out and the shop it
+      opens, the pack deal from the top and the close order, the cards The Emperor / The High
+      Priestess make, Trading Card, the copy's count). The soak gives 15 % of its runs Mime +
+      Blueprint / Brainstorm and 12 Gold cards, and checks that it met the END window and acted on
+      the cash-out screen. 29 old scenarios changed (25 got a Cash Out step: the money and the
+      shop come after it; 4 expect the cash-out screen after the hand); 13 new ones (Rules: the
+      cash-out screen, the window, the pack deal; Tarots: The Emperor; Jokers: Trading Card,
+      Invisible Joker). tests_run: the blind end and the full run press Cash Out.
+      GUI: the cash-out screen (the $ and the Cash Out button; Use / Sell work there); END keeps the
+      hand on the table (drag the jokers, then "Next: the end of the round"); in the shop and on
+      the cash-out screen the sidebar shows the target of the blind on deck (it showed the old one).
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -503,18 +549,18 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - the round's chips stop at 2^31 - 1, a hand's score at 2,147,483,520 (int32; the game: a double,
   up to ~1e308). No result changes: the run ends at ante 8, whose largest target is 300,000
 - found in the Lua review (2026-11-04), kept as they are:
-  - The Emperor can make The Emperor (the game: never, the used card still counts as present)
-  - each Arcana / Spectral pack deals from a fresh shuffle (the game: the next cards from the deck
-    top; the hand goes back to the bottom; shuffles only at the run start, cash out, blind start)
   - the score floor is float32 (+-1 chip only at an exact target); retrigger caps 12 scored /
     6 held (only Showman duplicates or long copy chains pass them)
-  - no cash-out screen: USE / SELL before the first shop roll cannot change its pool
   - a USE with too many cards selected takes the first ones (the game turns the button off)
-- open (no decision yet): Midas Mask / Vampire do not check the boss debuff again in BEFORE;
-  Showman duplicates (two Trading Cards pay $3 in all, an Invisible copy of an Invisible Joker keeps
-  its count); a card played in the Pillar blind counts as debuffed at once (Canio); the Orbital
-  Tag's hand when an ante number comes back, The Needle with 0 base hands, Crimson Heart on
-  Astronomer
+- open (no decision yet): Midas Mask / Vampire do not check the boss debuff again in BEFORE; a
+  card played in the Pillar blind counts as debuffed at once (Canio); the Orbital Tag's hand when
+  an ante number comes back, The Needle with 0 base hands, Crimson Heart on Astronomer
+- a pack hand goes back to the bottom in lane order (the game: the hand's order, sorted by rank
+  unless the player moved cards); only a full pass through the deck between two shuffles shows it
+- the END window comes only after a PLAY (a round that a sale ends, a boss disabled by a sale,
+  has none); the next ante's boss and tags are rolled at the end of the round, not at Cash Out
+  (nothing on the cash-out screen changes them)
+- at most 4 vouchers in one shop (the ante's voucher and 3 from Voucher Tags; more are dropped)
 - face-down cards and jokers (boss blinds): in the env state (hand_down, joker_down) since
   2026-11-02, but the obs does not hide them yet (agent work). The plan: state keeps true rank/suit
   (env must score them), obs gets a face_down flag and zeroes that card's rank/suit lanes -> POMDP.

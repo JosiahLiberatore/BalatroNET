@@ -38,7 +38,8 @@ OBS LAYOUT — a union of DISJOINT blocks, in this order (offsets O_*):
     PACK SLOT   per pack slot: cost, affordable                           (0 outside the shop)
     PACK CARD   per pack card: present, a playing card's rank .. seal, a joker's edition and stickers
     CONS SLOT   per consumable slot: present
-    GLOBAL      money, ante, blind, stage, scale, the stake, round targets, hand counts and levels,
+    GLOBAL      money, ante, blind, stage (END and CASH OUT too; the cash out's $ on its screen),
+                scale, the stake, round targets, hand counts and levels,
                 Planets / Tarots used, budget; hands/discards left, chips vs target; the
                 undealt deck (rank x suit, enhancements) and the full deck's enhancements;
                 reroll cost; the open pack's kind and cards left
@@ -61,7 +62,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from env import (balatroAction, balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_SHOP_SLOTS,
-                 STAGE_BLIND, STAGE_SHOP, STAGE_PACK, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL,
+                 STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_END, STAGE_CASHOUT, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL,
                  V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, V_USE, V_SELL_CONS, V_OPEN, V_PICK, V_SKIP,
                  WIN_ANTE, live_v, bankrupt_at, reroll_price, pack_cost, cons_room,
                  can_use_base, pick_ok, deck_counts, affordable, shop_item_cost, card_lanes, eternal)
@@ -168,6 +169,8 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
     blind = state.game_stage == STAGE_BLIND
     shop = state.game_stage == STAGE_SHOP
     pack = state.game_stage == STAGE_PACK
+    end = state.game_stage == STAGE_END              # after the winning hand: MOVE_JOKER, NEXT
+    cash = state.game_stage == STAGE_CASHOUT         # the cash-out screen: USE, SELL, SELL_CONS, MOVE_JOKER, NEXT
     held = (state.jokers != J_EMPTY)
 
     slots = jnp.arange(MAX_SHOP_SLOTS)
@@ -176,15 +179,15 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
     neg = (ed == ED_NEG) & (state.joker_slots < MAX_JOKER_SLOTS)
     room = jnp.where(kind == IK_JOKER, held.sum() < state.joker_slots + neg, cons_room(state) > 0)
     buy = shop & (slots < state.shop_size) & (item >= 0) & affordable(state, cost) & room
-    sell = (blind | shop | pack) & held & ~eternal(state)      # an Eternal joker cannot be sold
-    move = (blind | shop | pack) & (held.sum() >= 2)
+    sell = (blind | shop | pack | cash) & held & ~eternal(state)      # an Eternal joker cannot be sold
+    move = (blind | shop | pack | end | cash) & (held.sum() >= 2)
     move_card = (blind | pack) & (card_lanes(state) >= 2) & state.hand_valid.any()
     pid = state.pack_slots
     opn = shop & (pid >= 0) & affordable(state, jax.vmap(lambda p, f: pack_cost(state, p, f))(pid, state.pack_free))
     cons = state.consumables[:K_CONS]
     present = cons >= 0
-    use = (blind | shop | pack) & present & jax.vmap(lambda c: can_use_base(state, c, True))(cons)
-    sell_c = (blind | shop | pack) & present
+    use = (blind | shop | pack | cash) & present & jax.vmap(lambda c: can_use_base(state, c, True))(cons)
+    sell_c = (blind | shop | pack | cash) & present
     pick = pack & jax.vmap(lambda t: pick_ok(state, t))(jnp.arange(MAX_PACK))
 
     legal = jnp.concatenate([
@@ -192,7 +195,7 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
         buy,
         sell,
         jnp.stack([move, move_card]),
-        jnp.stack([shop & ((state.free_rerolls > 0) | affordable(state, reroll_price(state))), shop]),
+        jnp.stack([shop & ((state.free_rerolls > 0) | affordable(state, reroll_price(state))), shop | end | cash]),
         opn, use, sell_c, pick, jnp.stack([pack]),
     ])
     return legal.at[A_NEXT].set(legal[A_NEXT] | ~legal.any())
@@ -273,13 +276,16 @@ def _shared_block(state: balatroEnvState) -> jax.Array:
     blind = (state.game_stage == STAGE_BLIND).astype(f32)
     shop = (state.game_stage == STAGE_SHOP).astype(f32)
     pack = (state.game_stage == STAGE_PACK).astype(f32)
+    end = (state.game_stage == STAGE_END).astype(f32)
+    cash = (state.game_stage == STAGE_CASHOUT).astype(f32)
     held = state.jokers != J_EMPTY
     pk = jnp.clip(state.pack_id, 0, N_PACKS - 1)
     shared = jnp.concatenate([
         jnp.stack([state.money / 25.0, jnp.log1p(jnp.maximum(state.money, 0)) / 4.0]),
         jax.nn.one_hot(jnp.clip(state.ante, 1, WIN_ANTE) - 1, WIN_ANTE),
         jax.nn.one_hot(state.blind_index, 3),
-        jnp.stack([blind, shop, pack, state.target_scale]),
+        # the stage; on the cash-out screen the $ that Cash Out pays (it is not in the money yet)
+        jnp.stack([blind, shop, pack, end, cash, state.last_cashout * cash / 25.0, state.target_scale]),
         jax.nn.one_hot(state.stake - 1, N_STAKES),
         jnp.stack([held.sum() / state.joker_slots, state.joker_slots / 5.0]),
         # the round targets (The Idol, Mail-In Rebate, Ancient Joker, Castle)

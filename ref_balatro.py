@@ -803,7 +803,7 @@ def ref_discard(J, cards, g, hook=False):
                 money += 5
     trading = "Trading Card" in names and first and len(cards) == 1
     if trading:
-        money += 3
+        money += 3 * names.count("Trading Card")              # each one pays (not its copies)
     extra = dict(burnt=(ref_hand(cards, m)[0], burnt) if burnt else None,
                  purple=sum(c.seal == PURPLE_SEAL and not c.deb for c in cards), trading=trading)
     return money, gone, extra
