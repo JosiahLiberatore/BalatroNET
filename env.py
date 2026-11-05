@@ -864,6 +864,14 @@ def remove_jokers(state: balatroEnvState, gone) -> balatroEnvState:
     return reprice(apply_budget(out), state)
 
 
+def round_hands(state):
+    """round_resets.hands: the base hands + every acting joker's (Troubadour: -1 each). It can be
+    0 or less; a round still starts with at least 1 hand (new_round: math.max(1, ...))."""
+    ids = acting(state)
+    rows, active = rows_for(ids), ids != J_EMPTY
+    return state.base_hands + jnp.where(active, rows.H_PLAYS, 0).sum()
+
+
 def apply_budget(state: balatroEnvState) -> balatroEnvState:
     """Hand size, hands and discards per round = the base + every acting joker
     (Juggler, Merry Andy, Troubadour, Turtle Bean ...) + Juggle Tag - The Manacle; joker
@@ -874,7 +882,6 @@ def apply_budget(state: balatroEnvState) -> balatroEnvState:
     h = (jnp.where(active, rows.H_SIZE, 0)
          + jnp.where(active & rows.HSIZE_V, state.joker_value, 0.0).astype(jnp.int32)).sum()
     d = jnp.where(active, rows.D_SIZE, 0).sum()
-    p = jnp.where(active, rows.H_PLAYS, 0).sum()
     neg = ((state.jokers != J_EMPTY) & (state.joker_ed == ED_NEG)).sum()
     manacle = boss_is(state, BK_MANACLE)
     slots = BASE_JOKER_SLOTS + state.vouchers[V_ANTIMATTER] + neg
@@ -883,7 +890,7 @@ def apply_budget(state: balatroEnvState) -> balatroEnvState:
         hand_size=jnp.clip(state.base_hand_size + h + state.round_hand_bonus - manacle, 0,
                            MAX_HAND_SIZE).astype(jnp.int32),
         discardcount=jnp.maximum(state.base_discards + d, 0).astype(jnp.int32),
-        handcount=jnp.maximum(state.base_hands + p, 1).astype(jnp.int32)))
+        handcount=jnp.maximum(round_hands(state), 1).astype(jnp.int32)))
 
 
 def fit_hand(state: balatroEnvState) -> balatroEnvState:
@@ -1575,12 +1582,14 @@ def deal(state: balatroEnvState):
 def disable_boss(state, draw_one=True):
     """blind.lua disable: The Water / The Needle give back what they took, The Wall /
     Violet Vessel go back to x2, The Manacle gives the hand size back (and draws 1 card),
-    Cerulean Bell lets go, every card and joker faces up, no debuffs."""
+    Cerulean Bell lets go, every card and joker faces up, no debuffs. The Needle's take can be
+    negative (0 base hands): then the hands go down, to 0 at least (the game goes below 0, but
+    the round still ends only after the next hand, so 0 gives the same play)."""
     on = boss_active(state)
     b = state.boss
     s = state._replace(
         discards=state.discards + jnp.where(b == BK_WATER, state.boss_sub, 0),
-        hands=state.hands + jnp.where(b == BK_NEEDLE, state.boss_sub, 0),
+        hands=jnp.maximum(state.hands + jnp.where(b == BK_NEEDLE, state.boss_sub, 0), 0),
         blind_target=blind_target(state.ante, BLIND_BOSS, state.target_scale, b, True, state.stake),
         forced_card=jnp.int32(-1), hand_down=jnp.zeros(MAX_HAND_SIZE, bool),
         joker_down=jnp.zeros(MAX_JOKERS, bool),
@@ -1626,7 +1635,7 @@ def _blind_action(state: balatroEnvState, action: balatroAction):
     glass_gone = (res.valid & (out.broken | sixth) & (out.enh == ENH_GLASS)).sum()
     marks = (pre.card_played_ante | on(res.valid & ~pillar)) & ~on(res.valid & out.reset)
     played = pre._replace(
-        hands=pre.hands - 1,
+        hands=jnp.maximum(pre.hands - 1, 0),            # a PLAY at 0 hands (The Needle's disable)
         hand_valid=pre.hand_valid & ~res.sel, hand_down=pre.hand_down & ~res.sel,
         chips_scored=jnp.minimum(pre.chips_scored, INT32_MAX - res.score) + res.score,   # no int32 wrap
         joker_value=out.joker_value, joker_state=out.joker_state,
@@ -1673,7 +1682,7 @@ def _blind_action(state: balatroEnvState, action: balatroAction):
 
     # the blind is beaten or the hands ran out: no draw (_settle ends the round); else draw
     cleared = new_state.chips_scored >= new_state.blind_target
-    out_of_hands = new_state.hands <= 0
+    out_of_hands = is_play & (new_state.hands <= 0)        # a DISCARD at 0 hands still draws
     drawn = draw(new_state, k_draw, after_play=is_play)
     return tree_where(cleared | out_of_hands, new_state, drawn), jnp.int32(0), jnp.bool_(False)
 
@@ -1865,7 +1874,9 @@ def joker_money(state: balatroEnvState, joker_value) -> jax.Array:
 def _settle(state: balatroEnvState, played=False, go_end=False):
     """After every action. At the blind select: the tags that act there (enter_select). In a
     blind, the round ends when the target is reached (a PLAY, or a boss disabled by a sale)
-    or the hands ran out. Else an empty hand is drawn again (game.lua: SELECTING_HAND with no
+    or a PLAY leaves no hands (update_hand_played checks the hands only after a hand: with 0
+    hands after The Needle's disable, one more hand can be played). Else an empty hand is drawn
+    again (game.lua: SELECTING_HAND with no
     card and a deck -> DRAW_TO_HAND; a Tarot or Spectral card can empty it), and with no card
     in the deck either the round ends. A draw at hand size 0 with no card loses the run at
     once (draw_from_deck_to_hand: GAME_OVER, so Mr. Bones cannot save it). played: the step
@@ -1876,7 +1887,7 @@ def _settle(state: balatroEnvState, played=False, go_end=False):
     blind = state.game_stage == STAGE_BLIND
     hand_empty = ~state.hand_valid.any()
     deck_left = state.deck_ptr < state.deck_size
-    scored_out = (state.chips_scored >= state.blind_target) | (state.hands <= 0)
+    scored_out = (state.chips_scored >= state.blind_target) | ((state.hands <= 0) & played)
     dead = blind & ~scored_out & hand_empty & (state.hand_size <= 0)
     redraw = blind & ~scored_out & ~dead & hand_empty & deck_left
     state = tree_where(redraw, _redraw(state), state)
@@ -2661,10 +2672,14 @@ def _start_blind(state):
         joker_debuff=jnp.zeros(MAX_JOKERS, bool), joker_down=jnp.zeros(MAX_JOKERS, bool),
         shop_slots=jnp.full(MAX_SHOP_SLOTS, -1, jnp.int32), pack_slots=jnp.full(PACK_SLOTS, -1, jnp.int32),
         shop_sticker=jnp.zeros(MAX_SHOP_SLOTS, jnp.int32), key=key)
-    # set_blind: The Water (no discards), The Needle (1 hand), Amber Acorn (the jokers face down)
+    # set_blind: The Water (no discards), The Needle, Amber Acorn (the jokers face down). The
+    # Needle takes round_resets.hands - 1 hands from the round's max(1, ...): 1 hand is left, but
+    # with 0 base hands or less (Troubadours) the take is negative: 0 base hands give 2 hands
     water, needle = boss_is(s, BK_WATER), boss_is(s, BK_NEEDLE)
-    s = s._replace(boss_sub=jnp.select([water, needle], [s.discards, s.handcount - 1], 0).astype(jnp.int32),
-                   discards=jnp.where(water, 0, s.discards), hands=jnp.where(needle, 1, s.hands),
+    r = round_hands(s)
+    sub = jnp.select([water, needle], [s.discards, r - 1], 0).astype(jnp.int32)
+    s = s._replace(boss_sub=sub, discards=jnp.where(water, 0, s.discards),
+                   hands=jnp.where(needle, jnp.maximum(r, 1) - sub, s.hands).astype(jnp.int32),
                    joker_down=boss_is(s, BK_ACORN) & (s.jokers != J_EMPTY))
     s = apply_budget(s)                                  # The Manacle: -1 hand size
     # T_ON_BLIND_SELECT update rules, then setting_blind in slot order

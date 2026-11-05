@@ -222,7 +222,7 @@ class Info(NamedTuple):
     handtype      : jax.Array
     contains      : jax.Array   # (N_HAND_TYPES,)
     n_played      : jax.Array
-    last_hand     : jax.Array   # bool: no hands left after this one
+    last_hand     : jax.Array   # bool: 0 hands left after this one (Dusk, Acrobat: hands_left == 0)
     hand_repeat   : jax.Array   # bool: played_this_round > 1 (Card Sharp)
     most_played   : jax.Array   # bool (Obelisk)
     scoring_face  : jax.Array   # bool (Ride the Bus)
@@ -522,7 +522,7 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     # (joker_main): they are set below, after BEFORE. Matador: the hand triggered the boss
     # (The Arm, The Ox, The Flint, a debuffed scoring card, a debuffed hand).
     triggered = boss_trigger | flint | (sc & deb).any() | hand_debuffed
-    info = Info(ht, hand.contains, hand.n_played, p.hands_left <= 0, in_round[ht] > 1,
+    info = Info(ht, hand.contains, hand.n_played, p.hands_left == 0, in_round[ht] > 1,
                 (played[ht] > others).all(), (sc & isf0).any(), f, f,
                 held_black, jnp.int32(0), p.hand_played.sum(), jnp.asarray(p.is_boss, bool),
                 f, jnp.asarray(p.money, jnp.float32), triggered)

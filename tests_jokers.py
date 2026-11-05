@@ -952,8 +952,8 @@ def _disable(c, tag, p, w, J):
         return
     if boss == "The Water":
         w.f["discards"] += w.f["boss_sub"]
-    if boss == "The Needle":
-        w.f["hands"] += w.f["boss_sub"]
+    if boss == "The Needle":                             # a negative take (0 base hands): down to 0
+        w.f["hands"] = max(w.f["hands"] + w.f["boss_sub"], 0)
     w.f["blind_target"] = R.blind_chips(int(p.ante), 2, boss, float(p.target_scale), disabled=True,
                                         stake=int(p.stake))
     for x in J:
@@ -973,11 +973,13 @@ def _blind_start(c, tag, p, q, J, w):
                discards_used=0)
     hs, hc, dc, js = R.ref_budget(J, w.f["base_hand_size"], w.f["base_hands"], w.f["base_discards"])
     w.f["hands"], w.f["discards"] = hc, dc
-    w.f["boss_sub"] = dc if boss == "The Water" else hc - 1 if boss == "The Needle" else 0
+    # The Needle takes round_resets.hands - 1 (not at least 1: Troubadours can make it 0 or less)
+    r_hands = w.f["base_hands"] + sum(R.H_PLAYS.get(x["name"], 0) for x in J if not x.get("deb"))
+    w.f["boss_sub"] = dc if boss == "The Water" else r_hands - 1 if boss == "The Needle" else 0
     if boss == "The Water":
         w.f["discards"] = 0
     if boss == "The Needle":
-        w.f["hands"] = 1
+        w.f["hands"] = hc - w.f["boss_sub"]
     # setting_blind, slot order (a joker being destroyed does not act, nor a copy of it)
     names = [x["name"] for x in J]
     eff = R.effective(J)
@@ -1235,7 +1237,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
                                                card_played_ante=float(src.mark and old_mark(cards[0].i)))))
                 held_cards.append(R.Card(-1, src.r, src.s, src.enh, src.ed, src.seal, deb=src.deb))
         J = _drop(J, res["gone"])
-        w.f.update(chips_scored=total, hands=int(p.hands) - 1)
+        w.f.update(chips_scored=total, hands=max(int(p.hands) - 1, 0))
         w.f["money"] += int(res["money"])
         held_after = len(held_cards)
         deck_left = int(p.deck_size) - int(p.deck_ptr)

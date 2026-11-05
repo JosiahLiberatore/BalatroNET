@@ -2273,6 +2273,21 @@ BOSSES = [
       boss_select("The Needle"),
       [play_blind()],
       [C("hands", lambda r: r[1].hands, 1), C("target", lambda r: r[1].blind_target, 800)]),
+    S("Bosses", "The Needle", "with 0 base hands the round has 2 hands",
+      """The Needle takes (base hands - 1) hands from the round. Four Troubadours make the base 0
+      hands. A round still starts with at least 1 hand, and The Needle takes 0 - 1 = -1 hands:
+      the round has 2 hands.""",
+      boss_select("The Needle", jokers=("Troubadour",) * 4),
+      [play_blind()],
+      [C("hands", lambda r: r[1].hands, 2)]),
+    S("Bosses", "The Needle + Luchador", "0 hands after the disable: one more hand",
+      """Four Troubadours, The Needle: 2 hands, 1 played. Selling Luchador disables The Needle, which
+      gives back its take of -1 hands: 0 hands. The game ends a round only after a hand, so the round
+      goes on, and the next hand is the last one (KD KC is far from the target: the run is lost).""",
+      boss("The Needle", jokers=("Troubadour",) * 4 + ("Luchador",), hands=1, boss_sub=-1),
+      [sell(4), play("KD KC")],
+      [C("hands after the sale", lambda r: r[1].hands, 0), C("stage after the sale", lambda r: r[1].stage, "BLIND"),
+       C("stage after the hand", lambda r: r[2].stage, "LOST")]),
     S("Bosses", "The Head", "Heart cards are debuffed",
       """The Head: every Heart card is debuffed. KH KD: 10 + 10 (KD) = 20 x 2 = 40.""",
       boss("The Head", hand="KH KD 2C 3S 4C 6D 7C 8S"),

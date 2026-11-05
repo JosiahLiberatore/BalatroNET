@@ -537,6 +537,17 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       Pillar + Canio, The Pillar + DNA, The Club + Vampire, The Plant + Vampire + Midas Mask).
       GUI: a shop Tarot / Planet shows "buy and use" (or "no room") when the slots are full; the
       message says "Bought and used".
+- [x] The Needle with 0 base hands (2026-11-05), rules from the 1.0.1o Lua:
+      - set_blind takes round_resets.hands - 1 hands (env.round_hands: the base + the acting
+        Troubadours, not at least 1) from new_round's max(1, ...): 0 base hands give 2 hands, -1
+        give 3. Was: always 1.
+      - disable gives the take back, so a negative take lowers the hands (the env stops at 0).
+        update_hand_played checks the hands only after a hand: the round goes on, one more hand
+        can be played, and a DISCARD at 0 hands still draws. Was: the round ended at 0 hands after
+        any step. Dusk / Acrobat act only at hands_left == 0 (was <= 0; no change in a normal
+        round).
+      TESTS: the reference model follows; 2 new scenarios (Bosses: The Needle with 0 base hands,
+      The Needle + Luchador).
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -570,7 +581,7 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - at most 8 held tags (MAX_TAGS)
 - one deck only: the Red Deck (the game's default, 4 discards); no endless mode (every stake is in)
 - an Ankh / Invisible Joker copy of a perished joker is perished and adds nothing (the game's
-  add_to_deck still gives its hand size / discards)
+  add_to_deck still gives its hand size / discards; a game bug) (kept, 2026-11-05)
 - Crimson Heart with no joker to pick (a perished joker and the last pick): the env picks none
   (the game: pseudorandom_element on an empty list, a Lua error)
 - the round's chips stop at 2^31 - 1, a hand's score at 2,147,483,520 (int32; the game: a double,
@@ -579,17 +590,23 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
   - the score floor is float32 (+-1 chip only at an exact target); retrigger caps 12 scored /
     6 held (only Showman duplicates or long copy chains pass them)
   - a USE with too many cards selected takes the first ones (the game turns the button off)
-- open (no decision yet): the Orbital Tag's hand when an ante number comes back, The Needle with
-  0 base hands, Crimson Heart on Astronomer
+- the Orbital Tag's hand when an ante number comes back (Hieroglyph / Petroglyph): the game gives
+  the hand it gave that ante and blind before (G.GAME.orbital_choices has the ante number as its
+  key); the env picks a new one (kept, 2026-11-05)
+- open (no decision yet): Crimson Heart on Astronomer. Astronomer sets every Planet's cost to $0,
+  held ones too, so a held Negative Planet (Perkeo) sells for $1, not $4. While Crimson Heart
+  disables Astronomer, the game sets the prices again ($4); the env keeps $1
 - The Pillar: when a joker comes or goes later in its blind (a sale, Seltzer used up, Judgement
   ...), the game checks every card again (set_blind reset), and a DNA copy made in that blind is
   then debuffed (a suit / rank Tarot on the copy does it too); the env does not debuff the copy
-  in that round
+  in that round (kept, 2026-11-05)
 - a pack hand goes back to the bottom in lane order (the game: the hand's order, sorted by rank
   unless the player moved cards); only a full pass through the deck between two shuffles shows it
+  (kept, 2026-11-05)
 - the END window comes only after a PLAY (a round that a sale ends, a boss disabled by a sale,
-  has none); the next ante's boss and tags are rolled at the end of the round, not at Cash Out
-  (nothing on the cash-out screen changes them)
+  has none; the game waits 0.2 s before end_round reads the jokers) (kept, 2026-11-05); the next
+  ante's boss and tags are rolled at the end of the round, not at Cash Out (nothing on the
+  cash-out screen changes them)
 - at most 4 vouchers in one shop (the ante's voucher and 3 from Voucher Tags; more are dropped)
 - face-down cards and jokers (boss blinds): in the env state (hand_down, joker_down) since
   2026-11-02, but the obs does not hide them yet (agent work). The plan: state keeps true rank/suit
