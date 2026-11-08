@@ -6,6 +6,8 @@
     python train.py --steps 100000   number of updates (default 20000)
     python train.py --move-alpha 0.5 --move-beta 1.0   the MOVE streak penalty
     python train.py --grad-chunks 8  split the grad pass (GPU memory only)
+    python train.py --deck plasma --stake gold   the deck and the stake of every run
+                                     (default Red Deck, White Stake; one run per deck)
 
 EPISODE  = one full run (8 antes, the shop included). Envs AUTO-RESET: each
            update steps every env T more steps and a finished run restarts at
@@ -34,6 +36,7 @@ from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP, 
 from agent import (init_params, act, masked_logits, log_prob_entropy, is_move, OBS_DIM,
                    A_PLAY, A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, A_OPEN, A_USE, A_SELL_CONS,
                    A_PICK, A_SKIP, A_REDEEM, N_ACTIONS)
+from items import BACK_NAMES, STAKE_NAMES, N_BACKS, N_STAKES, B_RED
 
 # --- config -----------------------------------------------------------------------
 N_ENVS        = 1024
@@ -65,13 +68,41 @@ CLEAR_EMA     = 0.95
 SCALE_COOLDOWN = 25         # updates between two scale changes
 
 DECK, HAND = 52, 8
+BACK          = B_RED       # the deck of every run (items.BACK_NAMES; --deck); not in the obs
+STAKE         = 1           # 1 White .. 8 Gold (items.STAKE_NAMES; --stake)
+
+
+def new_run(key, scale):
+    return reset(key, DECK, HAND, scale, stake=STAKE, back=BACK)
+
+
+def parse_deck(name):
+    """'plasma' / 'Plasma Deck' / '13' -> the back index."""
+    names = [n.lower().removesuffix(" deck") for n in BACK_NAMES]
+    s = name.strip().lower().removesuffix(" deck").removesuffix("deck").strip()
+    if s.isdigit() and int(s) < N_BACKS:
+        return int(s)
+    if s not in names:
+        raise ValueError(f"unknown deck {name!r}; one of: {', '.join(names)}")
+    return names.index(s)
+
+
+def parse_stake(name):
+    """'gold' / 'Gold Stake' / '8' -> the stake 1 .. 8."""
+    names = [n.lower().removesuffix(" stake") for n in STAKE_NAMES]
+    s = name.strip().lower().removesuffix(" stake").removesuffix("stake").strip()
+    if s.isdigit() and 1 <= int(s) <= N_STAKES:
+        return int(s)
+    if s not in names:
+        raise ValueError(f"unknown stake {name!r}; one of: {', '.join(names)} or 1 .. {N_STAKES}")
+    return names.index(s) + 1
 
 
 # --- rollout ----------------------------------------------------------------------
 def init_carry(key, scale):
     """env states + per-env running run stats, all leading axis N_ENVS."""
     keys = jax.random.split(key, N_ENVS)
-    states = jax.vmap(lambda k: reset(k, DECK, HAND, scale))(keys)
+    states = jax.vmap(lambda k: new_run(k, scale))(keys)
     zeros = jnp.zeros(N_ENVS)
     return {"state": states, "ret": zeros, "buys": zeros, "steps": zeros,
             "streak": zeros, "pen": zeros}
@@ -106,7 +137,7 @@ def env_step_auto(params, state, run, key, scale):
                 "use": (a >= A_USE) & (a < A_SELL_CONS), "pack": (a == A_OPEN) | (a == A_OPEN + 1),
                 "play": a == A_PLAY, "play_cards": sel.sum() * (a == A_PLAY),
                 "skip_blind": (a == A_SKIP) & (state.game_stage == STAGE_SELECT), "redeem": a >= A_REDEEM}
-    fresh = reset(k_reset, DECK, HAND, scale)
+    fresh = new_run(k_reset, scale)
     nxt = tree_where(done, fresh, nxt)
     keep = ~done
     traj = {"obs": st.obs, "legal": st.legal, "hand_valid": state.hand_valid, "mmask": st.mmask,
@@ -262,12 +293,14 @@ def load_params(path=PARAMS_PATH):
         return pickle.load(f)
 
 
-def save_ckpt(params, m, v, t, key, step, run_dir, scale, clear_ema, curriculum, move_cfg=(MOVE_ALPHA, MOVE_BETA), path=CKPT_PATH):
+def save_ckpt(params, m, v, t, key, step, run_dir, scale, clear_ema, curriculum, move_cfg=(MOVE_ALPHA, MOVE_BETA),
+              game=None, path=CKPT_PATH):
     ckpt = {"params": jax.device_get(params), "m": jax.device_get(m), "v": jax.device_get(v),
             "t": jax.device_get(t),
             "key_data": jax.device_get(jax.random.key_data(key)),   # typed keys don't pickle
             "step": step, "run_dir": run_dir, "scale": scale, "clear_ema": clear_ema,
             "curriculum": curriculum, "move_cfg": tuple(move_cfg),
+            "game": tuple(game) if game is not None else (BACK, STAKE),     # (back, stake)
             "obs_dim": OBS_DIM, "n_actions": N_ACTIONS}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -309,7 +342,16 @@ if __name__ == "__main__":
                     help="MOVE streak penalty at full strength, in $ (0 = moves are free)")
     ap.add_argument("--grad-chunks", type=int, default=GRAD_CHUNKS,
                     help="split the grad pass into this many equal chunks (GPU memory only; same grad)")
+    ap.add_argument("--deck", default="red",
+                    help="the deck of every run: red, blue, ..., plasma, erratic, or 0 .. 14 (items.BACK_NAMES)")
+    ap.add_argument("--stake", default="white",
+                    help="the stake of every run: white .. gold, or 1 .. 8 (items.STAKE_NAMES)")
     args = ap.parse_args()
+    try:
+        BACK, STAKE = parse_deck(args.deck), parse_stake(args.stake)   # read when train_step traces
+    except ValueError as e:
+        sys.exit(str(e))
+    game = (BACK, STAKE)
     GRAD_CHUNKS = args.grad_chunks   # read when train_step traces
     curriculum = args.curriculum
     MOVE_ALPHA, MOVE_BETA = args.move_alpha, args.move_beta   # read when train_step traces
@@ -322,7 +364,7 @@ if __name__ == "__main__":
     v = jax.tree.map(jnp.zeros_like, params)
     t = jnp.float32(0.0)
     start_step, scale, clear_ema = 0, SCALE_START if curriculum else 1.0, 0.0
-    tag = "curr" if curriculum else "real"
+    tag = ("curr" if curriculum else "real") + f"-{BACK_NAMES[BACK].split()[0].lower()}-s{STAKE}"
     run_dir = os.path.join(RUNS_ROOT, f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{tag}")
 
     if args.mode != "fresh" and os.path.exists(CKPT_PATH):
@@ -337,6 +379,10 @@ if __name__ == "__main__":
         if tuple(ckpt.get("move_cfg", (None, None))) != move_cfg:
             sys.exit(f"{CKPT_PATH} was saved with (move_alpha, move_beta)={ckpt.get('move_cfg')}; "
                      f"pass the same values or run `python train.py fresh`.")
+        old = tuple(ckpt.get("game", (B_RED, 1)))      # a ckpt from before --deck / --stake: Red, White
+        if old != game:
+            sys.exit(f"{CKPT_PATH} was saved for {BACK_NAMES[old[0]]}, {STAKE_NAMES[old[1] - 1]}; "
+                     f"pass the same --deck / --stake or run `python train.py fresh`.")
         params, m, v, t = ckpt["params"], ckpt["m"], ckpt["v"], ckpt["t"]
         key, start_step, run_dir = ckpt["key"], ckpt["step"], ckpt["run_dir"]
         scale, clear_ema = ckpt["scale"], ckpt["clear_ema"]
@@ -348,6 +394,7 @@ if __name__ == "__main__":
     print(f"devices {jax.devices()}   envs {N_ENVS} x T {T} = {N_ENVS * T} steps/update")
     print(f"curriculum {'ON' if curriculum else 'OFF (real blind targets)'}   updates {STEPS}   "
           f"move streak penalty alpha {MOVE_ALPHA} beta ${MOVE_BETA}")
+    print(f"game {BACK_NAMES[BACK]}, {STAKE_NAMES[STAKE - 1]}")
     print(f"logging to {run_dir}\nview with:  tensorboard --logdir {RUNS_ROOT}")
 
     key, ck = jax.random.split(key)
@@ -379,15 +426,16 @@ if __name__ == "__main__":
                       f"pen {metrics['run_move_penalty']:5.1f}  use {metrics['use_frac']:4.1%} "
                       f"open {metrics['open_frac']:4.1%}  {rate / 1e3:5.0f}k st/s")
             if completed % CKPT_EVERY == 0:
-                save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum, move_cfg)
+                save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum, move_cfg, game)
                 save_params(params)
     except KeyboardInterrupt:
         print(f"\ninterrupted -- saving checkpoint at step {completed}")
 
     writer.close()
-    save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum, move_cfg)
+    save_ckpt(params, m, v, t, key, completed, run_dir, scale, clear_ema, curriculum, move_cfg, game)
     save_params(params)
     resume = ("python train.py" + (" --curriculum" if curriculum else "")
-              + f" --steps {STEPS} --move-alpha {MOVE_ALPHA} --move-beta {MOVE_BETA}")
+              + f" --steps {STEPS} --move-alpha {MOVE_ALPHA} --move-beta {MOVE_BETA}"
+              + f" --deck {BACK} --stake {STAKE}")
     print(f"stopped at step {completed}/{STEPS}. resume with:  {resume}")
     print("inspect with:  python debug_agent.py")
