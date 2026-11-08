@@ -740,6 +740,9 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
     # AFTER, then the Glass cards break (not a debuffed one)
     gone = _after(J)
     broken = [pos[c] for c in scored if c.enh == GLASS and not c.deb and groll(pos[c])]
+    # Plasma Deck (back.lua final_scoring_step): chips and mult balanced, floor((chips + mult) / 2)
+    if g.get("plasma", False):
+        chips = mult = (chips + mult) // 2
     return dict(hand=name, chips=chips, mult=mult, score=int(chips * mult // 1), money=money - g["money"],
                 gone=gone, played=played, round=rnd_cnt, acted=acted, cards=cards, broken=broken,
                 level_up=level_up, tarots=tarots, spawns=["tarot"] * tarots + spawns, dna=dna,

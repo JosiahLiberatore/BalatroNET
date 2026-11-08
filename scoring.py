@@ -373,6 +373,7 @@ class PlayIn(NamedTuple):
     touch_debuff : jax.Array = None  # (5,) bool: the debuff a played card gets when Midas Mask / Vampire
                                      # touch it (set_ability runs debuff_card again: a plain / Gold card
                                      # without The Pillar mark)
+    plasma      : jax.Array = None   # bool: the Plasma Deck balances chips and mult (final_scoring_step)
 
 
 class PlayOut(NamedTuple):
@@ -714,6 +715,12 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     mult = fold_mult(mult, xs, (jm + mm) * xs)
     # Observatory: each held Planet of this hand, X1.5 (the consumables after the jokers)
     mult = mult * jnp.power(1.5, obs[ht].astype(jnp.float32))
+    # Plasma Deck (final_scoring_step, after the jokers and the consumables): chips = mult =
+    # floor((chips + mult) / 2); the score is then n * n, exact in int32 up to SCORE_CAP
+    plasma = jnp.bool_(False) if p.plasma is None else p.plasma
+    half = jnp.floor((chips + mult) / 2)
+    chips = jnp.where(plasma, half, chips)
+    mult = jnp.where(plasma, half, mult)
 
     # 6. AFTER (Ice Cream, Seltzer), then the Glass cards break (a debuffed one does not)
     value, _, fired = update_ex(rows, active, value, p.joker_state, T_AFTER)
@@ -725,6 +732,8 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     # The game adds in a double; the int32 score stops at SCORE_CAP (env.py caps the round's sum too).
     prod = jnp.nan_to_num(chips * mult, nan=0.0, posinf=SCORE_CAP)
     score = jnp.floor(jnp.minimum(prod * (1 + 2.0 ** -22) + 1e-3, SCORE_CAP)).astype(jnp.int32)
+    n = jnp.clip(half, 0, 46340).astype(jnp.int32)                      # 46340^2 < 2^31
+    score = jnp.where(plasma, jnp.where(half > 46340, jnp.int32(SCORE_CAP), n * n), score)
     perma = hike_rep.sum(axis=1)
     out = PlayOut(ht, sc, base_chips, base_mult, chips, mult, score, money, value, gone,
                   played, in_round, reps, roll, hroll, rnd, enh, broken, perma, level_up,

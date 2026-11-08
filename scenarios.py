@@ -34,7 +34,7 @@ from items import (CONS_ID, CONS_NAMES, CONS_KIND, CK_TAROT, CK_PLANET, PACK_NAM
                    PACK_CHOOSE, PK_ARCANA, PK_CELESTIAL, PK_STANDARD, PK_BUFFOON, MAX_PACK, ENH_NAMES,
                    ED_NAMES, SEAL_NAMES, HAND_NAMES, N_HAND_TYPES, IK_JOKER, IK_PLANET, IK_TAROT, IK_CARD,
                    CK_SPECTRAL, PK_SPECTRAL, BOSS_NAMES, TAG_NAMES, VOUCHER_NAMES, BOSS_ID, TAG_ID, VOUCHER_ID,
-                   PACK_SIZE, hand_chips_mult, STAKE_NAMES, STICKER_NAMES)
+                   PACK_SIZE, hand_chips_mult, STAKE_NAMES, STICKER_NAMES, BACK_NAMES, IK_SPECTRAL)
 import ref_balatro as R
 from jokers import JOKER_NAMES, JOKER_ID, JOKER_RARITY, JOKER_ETERNAL_OK, JOKER_PERISH_OK
 from fixtures import state, card_id, lanes as pad
@@ -3624,8 +3624,171 @@ ROUND_END = [
        C("rounds: the old one, the copy", lambda r: [r[1].jv(0), r[1].jv(1)], [2.0, 0.0])]),
 ]
 
+# ---------------------------------------------------------------------------
+# DECKS (game.lua P_CENTERS b_*, back.lua apply_to_run / trigger_effect; state.back)
+# ---------------------------------------------------------------------------
+def _run_deck(back, seed=0):
+    from env import reset
+    return lambda: reset(jax.random.key(seed), 52, 8, 1.0, 1, BACK_NAMES.index(back))
+
+
+def _live(r, k=0):
+    """(rank, suit) arrays of the live cards of state k."""
+    h = r.raw[k]
+    live = np.asarray(h.card_live, bool)
+    return np.asarray(h.card_rank)[live], np.asarray(h.card_suit)[live]
+
+
+def _suit_counts(r, k=0):
+    return np.bincount(_live(r, k)[1], minlength=4).tolist()
+
+
+def _faces(r, k=0):
+    rank = _live(r, k)[0]
+    return int(((rank >= 9) & (rank <= 11)).sum())
+
+
+def _spectral_share(s, n=4000):
+    """Over n fresh shops of s: the share of the cards that are Spectral, and the Spectral cards
+    that are The Soul or Black Hole."""
+    roll = _shop_rolls(jax.random.split(jax.random.key(11), n), s)
+    ids, kinds = np.asarray(roll.ids), np.asarray(roll.kinds)
+    live = ids >= 0
+    spec = live & (kinds == IK_SPECTRAL)
+    rare = int(np.isin(ids[spec], [CONS_ID["The Soul"], CONS_ID["Black Hole"]]).sum())
+    return round(float(spec.sum() / live.sum()), 2), rare
+
+
+DECKS = [
+    S("Decks", "Red Deck", "+1 discard every round",
+      """Red Deck (the default): 3 + 1 = 4 discards, 4 hands, $4, 5 joker slots, 2 consumable
+      slots, hand size 8, the 52 cards.""",
+      _run_deck("Red Deck"),
+      [],
+      [C("discards", lambda r: r[0].discards, 4), C("hands", lambda r: r[0].hands, 4),
+       C("money", lambda r: r[0].money, 4), C("joker slots", lambda r: r[0].joker_slots, 5),
+       C("consumable slots", lambda r: r[0].consumable_slots, 2), C("hand size", lambda r: r[0].hand_size, 8),
+       C("cards", lambda r: r[0].deck_size, 52)]),
+    S("Decks", "Blue Deck", "+1 hand every round",
+      """Blue Deck: 4 + 1 = 5 hands; 3 discards (only the Red Deck adds one).""",
+      _run_deck("Blue Deck"),
+      [],
+      [C("hands", lambda r: r[0].hands, 5), C("base hands", lambda r: r[0].base_hands, 5),
+       C("discards", lambda r: r[0].discards, 3)]),
+    S("Decks", "Yellow Deck", "start with an extra $10",
+      """Yellow Deck: the run starts with $4 + $10 = $14.""",
+      _run_deck("Yellow Deck"),
+      [],
+      [C("money", lambda r: r[0].money, 14), C("discards", lambda r: r[0].discards, 3)]),
+    S("Decks", "Green Deck", "$2 per hand, $1 per discard, no interest",
+      """Green Deck: at the end of each round, $2 per remaining hand and $1 per remaining discard,
+      and no interest. Beat the Small Blind with $25, 2 hands and 2 discards left: $3 + 2 x $2 +
+      2 x $1 = $9 (the Red Deck: $3 + $2 + $5 interest = $10).""",
+      blind(clear=True, back="Green Deck", money=25),
+      [play("KD KC")],
+      [C("cash out", lambda r: r[1].last_cashout, 9), C("stage", lambda r: r[1].stage, "CASH OUT")]),
+    S("Decks", "Black Deck", "+1 joker slot, -1 hand every round",
+      """Black Deck: 6 joker slots, 4 - 1 = 3 hands.""",
+      _run_deck("Black Deck"),
+      [],
+      [C("joker slots", lambda r: r[0].joker_slots, 6), C("hands", lambda r: r[0].hands, 3)]),
+    S("Decks", "Black Deck", "the slot stays after a Negative joker goes",
+      """Black Deck: 6 joker slots + 1 for a Negative joker = 7. Sell the Negative joker: 6 slots
+      again (not the 5 of the other decks).""",
+      blind(back="Black Deck", jokers=("Joker",), joker_ed=(4,), joker_slots=7),
+      [sell(0)],
+      [C("joker slots after the sale", lambda r: r[1].joker_slots, 6)]),
+    S("Decks", "Magic Deck", "Crystal Ball and 2 copies of The Fool",
+      """Magic Deck: the Crystal Ball voucher is redeemed (+1 consumable slot: 3) and the run
+      starts with 2 copies of The Fool. Crystal Ball never comes up in the shop; Omen Globe can.""",
+      _run_deck("Magic Deck"),
+      [],
+      [C("vouchers", lambda r: r[0].vouchers, ["Crystal Ball"]),
+       C("consumables", lambda r: r[0].cons, ["The Fool", "The Fool"]),
+       C("consumable slots", lambda r: r[0].consumable_slots, 3)]),
+    S("Decks", "Nebula Deck", "Telescope, -1 consumable slot",
+      """Nebula Deck: the Telescope voucher is redeemed (a Celestial Pack has the Planet of the most
+      played hand) and the run has 2 - 1 = 1 consumable slot.""",
+      _run_deck("Nebula Deck"),
+      [],
+      [C("vouchers", lambda r: r[0].vouchers, ["Telescope"]),
+       C("consumable slots", lambda r: r[0].consumable_slots, 1)]),
+    S("Decks", "Ghost Deck", "Spectral cards in the shop, start with a Hex",
+      """Ghost Deck: the run starts with a Hex card, and Spectral cards can come up in the shop (rate
+      2 of 20 + 4 + 4 + 2 = 30: 7 %; never The Soul or Black Hole). The Red Deck: 0 %.""",
+      _run_deck("Ghost Deck"),
+      [],
+      [C("consumables", lambda r: r[0].cons, ["Hex"]),
+       C("Spectral share, The Soul / Black Hole", lambda r: _spectral_share(r.raw[0]), (0.07, 0)),
+       C("Red Deck Spectral share", lambda r: _spectral_share(r.raw[0]._replace(back=jnp.int32(0))), (0.0, 0))]),
+    S("Decks", "Ghost Deck", "buy and use a Spectral card",
+      """Ghost Deck: a shop Spectral card with the consumable slots full is used at once (Buy and
+      Use). Hex for $4: one joker gets Polychrome, the other one is destroyed.""",
+      shop(back="Ghost Deck", jokers=("Joker", "Bull"), consumables=("The Fool", "The Fool"), money=10,
+           shop_slots=(CONS_ID["Hex"],), shop_kind=(IK_SPECTRAL,)),
+      [buy(0)],
+      [C("money", lambda r: r[1].money, 6), C("jokers", lambda r: len(r[1].jokers), 1),
+       C("edition", lambda r: r[1].jed(0), "Polychrome"),
+       C("consumables", lambda r: r[1].cons, ["The Fool", "The Fool"])]),
+    S("Decks", "Abandoned Deck", "no face cards",
+      """Abandoned Deck: the deck has no Jacks, Queens or Kings: 52 - 12 = 40 cards.""",
+      _run_deck("Abandoned Deck"),
+      [],
+      [C("cards", lambda r: r[0].deck_size, 40), C("face cards", lambda r: _faces(r), 0),
+       C("suits (Clubs, Diamonds, Hearts, Spades)", lambda r: _suit_counts(r), [10, 10, 10, 10])]),
+    S("Decks", "Checkered Deck", "26 Spades and 26 Hearts",
+      """Checkered Deck: every Club becomes a Spade and every Diamond a Heart: 26 Spades, 26
+      Hearts, the ranks as in the standard deck.""",
+      _run_deck("Checkered Deck"),
+      [],
+      [C("suits (Clubs, Diamonds, Hearts, Spades)", lambda r: _suit_counts(r), [0, 0, 26, 26]),
+       C("face cards", lambda r: _faces(r), 12)]),
+    S("Decks", "Zodiac Deck", "Tarot Merchant, Planet Merchant and Overstock",
+      """Zodiac Deck: Overstock, Tarot Merchant and Planet Merchant are redeemed: 3 shop card
+      slots.""",
+      _run_deck("Zodiac Deck"),
+      [],
+      [C("vouchers", lambda r: r[0].vouchers, ["Overstock", "Tarot Merchant", "Planet Merchant"]),
+       C("shop slots", lambda r: r[0].shop_size, 3)]),
+    S("Decks", "Painted Deck", "+2 hand size, -1 joker slot",
+      """Painted Deck: hand size 8 + 2 = 10, 5 - 1 = 4 joker slots.""",
+      _run_deck("Painted Deck"),
+      [play_blind()],
+      [C("hand size", lambda r: r[0].hand_size, 10), C("joker slots", lambda r: r[0].joker_slots, 4),
+       C("cards in hand", lambda r: r[1].in_hand, 10)]),
+    S("Decks", "Anaglyph Deck", "a Double Tag after each Boss Blind",
+      """Anaglyph Deck: after a Boss Blind is beaten, the run gets a Double Tag. The Small Blind
+      gives none.""",
+      boss("The Club", clear=True, back="Anaglyph Deck"),
+      [play("KD KC")],
+      [C("stage", lambda r: r[1].stage, "CASH OUT"), C("tags", lambda r: r[1].tags, ["Double Tag"])]),
+    S("Decks", "Anaglyph Deck", "no tag after a Small Blind",
+      """Anaglyph Deck: the Small Blind is beaten, and no tag comes.""",
+      blind(clear=True, back="Anaglyph Deck"),
+      [play("KD KC")],
+      [C("stage", lambda r: r[1].stage, "CASH OUT"), C("tags", lambda r: r[1].tags, [])]),
+    S("Decks", "Plasma Deck", "chips and mult balanced, X2 blind size",
+      """Plasma Deck: the chips and mult of a hand are balanced at the end: KD KC = 30 chips x 2
+      mult -> (30 + 2) / 2 = 16 x 16 = 256. Every blind needs X2 chips: the first Small Blind
+      600.""",
+      blind(back="Plasma Deck"),
+      [play("KD KC")],
+      [C("score", _score(), 256), C("chips", lambda r: float(r.play(0).chips), 16.0),
+       C("mult", lambda r: float(r.play(0).mult), 16.0),
+       C("first Small Blind", lambda r: int(_run_deck("Plasma Deck")().blind_target), 600)]),
+    S("Decks", "Erratic Deck", "random ranks and suits",
+      """Erratic Deck: each of the 52 cards is a random card (rank and suit), so the deck can hold
+      copies of a card and miss others.""",
+      _run_deck("Erratic Deck"),
+      [],
+      [C("cards", lambda r: r[0].deck_size, 52),
+       C("a standard deck", lambda r: sorted((13 * _live(r)[1] + _live(r)[0]).tolist()) == list(range(52)), False),
+       C("different cards < 52", lambda r: len(set((13 * _live(r)[1] + _live(r)[0]).tolist())) < 52, True)]),
+]
+
+
 SCENARIOS = (JOKERS + NEW_JOKERS + TAROTS + PLANETS + SPECTRALS + PACKS + SPECTRAL_PACKS + CARDS + BOSSES + TAGS
-             + VOUCHERS + RULES + SELECT_RULES + STAKES + ROUND_END)
+             + VOUCHERS + RULES + SELECT_RULES + STAKES + ROUND_END + DECKS)
 
 
 # ---------------------------------------------------------------------------

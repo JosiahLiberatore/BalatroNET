@@ -555,6 +555,27 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       the boss is disabled (disable_boss) and at the round end (defeat). Was: the price stayed.
       Kept (the game rule): Astronomer sets the cost of held Planets to $0 too.
       TESTS: the reference model follows; 3 new scenarios (Bosses: Crimson Heart + Astronomer).
+- [x] The 15 decks (2026-11-08), rules from the 1.0.1o Lua (game.lua P_CENTERS b_*, back.lua
+      apply_to_run / trigger_effect, game.lua start_run card_protos, state_events.lua
+      evaluate_play / evaluate_round, UI_definitions.lua create_card_for_shop):
+      - state.back (items.BACK_NAMES, 0 Red .. 14 Erratic); reset(..., back=0). The deck is not an
+        agent choice and not in the obs: each deck is a separate training run.
+      - reset: Red +1 discard (BASE_DISCARDS is now 3, the game's base), Blue +1 hand, Yellow +$10,
+        Black +1 joker slot -1 hand, Painted +2 hand size -1 joker slot, Nebula -1 consumable slot;
+        vouchers redeemed at the start (Magic Crystal Ball, Nebula Telescope, Zodiac Tarot Merchant
+        + Planet Merchant + Overstock; the shop never offers them, their second tier can come);
+        consumables (Magic 2 The Fool, Ghost Hex); cards (Abandoned: 40, no J / Q / K; Checkered:
+        Clubs -> Spades, Diamonds -> Hearts; Erratic: each card a random one of the 52).
+      - later rules: Green (cash out $2 per hand left, $1 per discard left, no interest), Ghost
+        (Spectral cards in the shop at rate 2: IK_SPECTRAL, Buy and Use too), Anaglyph (a Double
+        Tag after each beaten Boss Blind), Plasma (chips = mult = floor((chips + mult) / 2) after
+        the jokers and Observatory, not on a debuffed hand; X2 every blind target: env.run_scale).
+      - the joker slots come from the deck (env.base_joker_slots) when apply_budget counts them.
+      GUI: B (or the deck button under the consumables) = the next deck, a new run; the deck's
+      rule in the info panel.
+      TESTS: the reference model follows (cash out, targets, scoring, tags, shop kinds, joker
+      slots); the soak starts each run with a random deck and checks that Green, Anaglyph, Plasma
+      and Ghost acted; 17 new scenarios (Decks).
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -586,7 +607,7 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - joker slots stop at 16: a Negative past 16 slots gives no slot (agent J_TOK = 16)
 - The Ox: a tie uses the pairs() order of a new run; after a save + continue the game uses another
 - at most 8 held tags (MAX_TAGS)
-- one deck only: the Red Deck (the game's default, 4 discards); no endless mode (every stake is in)
+- no endless mode (every stake and every deck is in)
 - an Ankh / Invisible Joker copy of a perished joker is perished and adds nothing (the game's
   add_to_deck still gives its hand size / discards; a game bug) (kept, 2026-11-05)
 - Crimson Heart with no joker to pick (a perished joker and the last pick): the env picks none
@@ -606,7 +627,8 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
   in that round (kept, 2026-11-05)
 - a pack hand goes back to the bottom in lane order (the game: the hand's order, sorted by rank
   unless the player moved cards); only a full pass through the deck between two shuffles shows it
-  (kept, 2026-11-05)
+  (about 6 Arcana / Spectral Packs between Cash Out and the next blind). Non-issue (2026-11-08):
+  no real run gets there
 - the END window comes only after a PLAY (a round that a sale ends, a boss disabled by a sale,
   has none; the game waits 0.2 s before end_round reads the jokers) (kept, 2026-11-05); the next
   ante's boss and tags are rolled at the end of the round, not at Cash Out (nothing on the

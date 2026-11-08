@@ -4,8 +4,9 @@ Pure functional: the state pytree is the only memory. reset births the full
 state; env_step takes a full state and returns the next full state. Capacity
 is SHAPE (MAX_* constants), current count is DATA (scalars/masks in state).
 
-A run is three blinds per ante (Small, Big, Boss) across 8 antes, with the Red Deck (the game's
-default deck: 4 hands, 4 discards, $4; other decks are not modeled), at one of the 8 stakes
+A run is three blinds per ante (Small, Big, Boss) across 8 antes, with one of the 15 decks
+(state.back, items.BACK_NAMES; the default is the Red Deck: 4 hands, 4 discards, $4; reset
+applies a deck's start, and Green / Ghost / Anaglyph / Plasma act later too), at one of the 8 stakes
 (state.stake: 1 White .. 8 Gold; each has the rules of the ones below it: no Small Blind
 reward, faster target scaling, -1 discard, Eternal / Perishable / Rental shop jokers):
     STAGE_SELECT NEXT (play the blind) / SKIP (Small or Big: take its tag) / REROLL
@@ -63,6 +64,7 @@ import os
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import jit
 from typing import NamedTuple
 from scoring import (play as _play, discard as _discard, detect, PlayIn, Targets, no_info,
@@ -99,7 +101,11 @@ from items import (HAND_NAMES, N_HAND_TYPES, SECRET_HANDS, OX_PAIRS_POS, N_CONS,
                    BK_BELL, WHEEL_ODDS, SERPENT_DRAW, BOSS_REROLL_COST,
                    N_STAKES, ST_NO_SMALL_REWARD, ST_SCALING_2, ST_ETERNAL, ST_DISCARD, ST_SCALING_3, ST_PERISH,
                    ST_RENTAL, STK_ETERNAL, STK_PERISH, STK_RENTAL, STICKER_POLL, PERISH_POLL, PERISH_ROUNDS,
-                   RENTAL_RATE, RENTAL_COST)
+                   RENTAL_RATE, RENTAL_COST, IK_SPECTRAL, N_BACKS, B_RED, B_GREEN, B_MAGIC, B_NEBULA,
+                   B_GHOST, B_ABANDONED, B_CHECKERED, B_ZODIAC, B_ANAGLYPH, B_PLASMA, B_ERRATIC,
+                   BACK_NAMES, BACK_HANDS, BACK_DISCARDS, BACK_DOLLARS, BACK_JOKER_SLOT, BACK_HAND_SIZE,
+                   BACK_CONS_SLOT, BACK_ANTE_SCALING, GHOST_SPECTRAL_RATE, GREEN_PER_HAND,
+                   GREEN_PER_DISCARD)
 from jokers import MAX_JOKERS, J_EMPTY, N_JOKERS, JOKERS, JOKER_COST, JOKER_RARITY, JOKER_ID, J_BLUEPRINT, J_BRAINSTORM
 from jokers import JOKER_ETERNAL_OK, JOKER_PERISH_OK
 from jokers import (N_QUERY_KINDS, Q_MONEY_DIV_5, Q_EMPTY_JOKER_SLOTS, Q_DECK_NINE_COUNT,
@@ -225,7 +231,7 @@ CREDIT_DEBT   = 20   # Credit Card: go down to -$20 per card
 BASE_JOKER_SLOTS = 5
 BASE_CONS_SLOTS = 2
 BASE_HANDS = 4
-BASE_DISCARDS = 4    # the Red Deck (the game's default deck): 3 + 1 discard (back.lua apply_to_run)
+BASE_DISCARDS = 3    # starting_params.discards; the Red Deck adds 1 (BACK_DISCARDS)
 
 # Shop odds for a joker (roll_joker): a rarity 70 / 25 / 5 %, then a joker uniform among the
 # available ones of that rarity. Legendaries never appear in the shop (only The Soul makes one).
@@ -372,6 +378,7 @@ class balatroEnvState(NamedTuple):
 
     # the stake and the joker stickers (STK_* bits: Eternal, Perishable, Rental)
     stake        : jax.Array   # scalar int32   -- 1 White .. 8 Gold (items.STAKE_NAMES)
+    back         : jax.Array   # scalar int32   -- the deck: 0 Red .. 14 Erratic (items.BACK_NAMES)
     joker_sticker : jax.Array  # (32,) int32    -- the stickers of each held joker
     joker_perish : jax.Array   # (32,) int32    -- a Perishable joker's rounds left (5 .. 1; 0: debuffed for good)
     shop_sticker : jax.Array   # (4,) int32     -- the stickers of a shop joker
@@ -422,6 +429,12 @@ def blind_target(ante, blind_index, scale=1.0, boss=0, disabled=False, stake=1):
     return jnp.maximum(jnp.floor(base * blind_mult(blind_index, boss, disabled) * scale), 1).astype(jnp.int32)
 
 
+def run_scale(state):
+    """The scale on every blind target: the curriculum's target_scale x the deck's ante_scaling
+    (Plasma Deck: X2; Blind:set_blind get_blind_amount * mult * ante_scaling)."""
+    return state.target_scale * BACK_ANTE_SCALING[jnp.clip(state.back, 0, N_BACKS - 1)]
+
+
 def blind_dollars(blind_index, boss, stake=1):
     """$ for beating it: 3 / 4 / the boss's (5, a showdown boss 8); from the Red Stake the
     Small Blind pays $0 (no_blind_reward)."""
@@ -457,14 +470,20 @@ def reroll_base(state):
     return (REROLL_BASE - 2 * v[V_REROLL_SURPLUS] - 2 * v[V_REROLL_GLUT]).astype(jnp.int32)
 
 
+def base_joker_slots(state):
+    """starting_params.joker_slots: 5, Black Deck +1, Painted Deck -1."""
+    return BASE_JOKER_SLOTS + BACK_JOKER_SLOT[jnp.clip(state.back, 0, N_BACKS - 1)]
+
+
 def shop_rates(state):
-    """create_card_for_shop: joker 20, Tarot 4 (Merchant 9.6, Tycoon 32), Planet 4 (9.6, 32),
-    playing card 0 (Magic Trick / Illusion 4)."""
+    """create_card_for_shop, by IK_*: joker 20, Tarot 4 (Merchant 9.6, Tycoon 32), Planet 4 (9.6,
+    32), playing card 0 (Magic Trick / Illusion 4), Spectral 0 (Ghost Deck 2)."""
     v = state.vouchers
     tarot = jnp.where(v[V_TAROT_TYCOON], 32.0, jnp.where(v[V_TAROT_MERCHANT], 9.6, TAROT_RATE))
     planet = jnp.where(v[V_PLANET_TYCOON], 32.0, jnp.where(v[V_PLANET_MERCHANT], 9.6, PLANET_RATE))
     card = jnp.where(v[V_MAGIC_TRICK] | v[V_ILLUSION], 4.0, 0.0)
-    return jnp.stack([jnp.float32(JOKER_RATE), tarot, planet, card])
+    spectral = jnp.where(state.back == B_GHOST, GHOST_SPECTRAL_RATE, 0.0)
+    return jnp.stack([jnp.float32(JOKER_RATE), tarot, planet, card, spectral])
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +766,7 @@ def _play_in(state, select):
                debuff=deb, held_debuff=hdeb, hand_debuffed=debuffed, boss_trigger=arm | ox,
                flint=boss_is(state, BK_FLINT), observatory=observatory(state),
                det_enh=det_e, all_ids=state.jokers, card_room=(~state.card_live).sum().astype(jnp.int32),
-               touch_debuff=touch)
+               touch_debuff=touch, plasma=state.back == B_PLASMA)
     return p, sel, cards, valid, dict(ht=ht, debuffed=debuffed, arm=arm, ox=ox, money=money, level=level)
 
 
@@ -884,7 +903,7 @@ def apply_budget(state: balatroEnvState) -> balatroEnvState:
     d = jnp.where(active, rows.D_SIZE, 0).sum()
     neg = ((state.jokers != J_EMPTY) & (state.joker_ed == ED_NEG)).sum()
     manacle = boss_is(state, BK_MANACLE)
-    slots = BASE_JOKER_SLOTS + state.vouchers[V_ANTIMATTER] + neg
+    slots = base_joker_slots(state) + state.vouchers[V_ANTIMATTER] + neg
     return fit_hand(state._replace(
         joker_slots=jnp.minimum(slots, MAX_JOKER_SLOTS).astype(jnp.int32),
         hand_size=jnp.clip(state.base_hand_size + h + state.round_hand_bonus - manacle, 0,
@@ -1367,10 +1386,10 @@ def apply_cons(state, cid, select, key, extra=0):
 
 def buy_and_use(state, t):
     """A BUY of shop slot t is the game's Buy and Use (buy_from_shop, id 'buy_and_use'): the slot
-    holds a Tarot / Planet and the consumable slots are full. With a free slot BUY then USE gives
-    the same result, so only a BUY that cannot take the card uses it."""
+    holds a Tarot / Planet / Spectral (Ghost Deck) and the consumable slots are full. With a free
+    slot BUY then USE gives the same result, so only a BUY that cannot take the card uses it."""
     kind = state.shop_kind[jnp.clip(t, 0, MAX_SHOP_SLOTS - 1)]
-    return ((kind == IK_TAROT) | (kind == IK_PLANET)) & (cons_room(state) <= 0)
+    return ((kind == IK_TAROT) | (kind == IK_PLANET) | (kind == IK_SPECTRAL)) & (cons_room(state) <= 0)
 
 
 def _use_pick(state: balatroEnvState, action: balatroAction):
@@ -1592,7 +1611,7 @@ def disable_boss(state, draw_one=True):
     s = state._replace(
         discards=state.discards + jnp.where(b == BK_WATER, state.boss_sub, 0),
         hands=jnp.maximum(state.hands + jnp.where(b == BK_NEEDLE, state.boss_sub, 0), 0),
-        blind_target=blind_target(state.ante, BLIND_BOSS, state.target_scale, b, True, state.stake),
+        blind_target=blind_target(state.ante, BLIND_BOSS, run_scale(state), b, True, state.stake),
         forced_card=jnp.int32(-1), hand_down=jnp.zeros(MAX_HAND_SIZE, bool),
         joker_down=jnp.zeros(MAX_JOKERS, bool),
     )
@@ -1774,11 +1793,15 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
 
     # interest is paid on the money held BEFORE this cashout
     rate = 1 + (acting(state) == J_MOON).sum()
-    interest = jnp.where(state.money >= INTEREST_PER,
+    # Green Deck: $2 per hand left, $1 per discard left, no interest (modifiers.no_interest)
+    green = state.back == B_GREEN
+    interest = jnp.where((state.money >= INTEREST_PER) & ~green,
                          rate * jnp.minimum(state.money // INTEREST_PER, interest_steps(state)), 0)
     invest = (state.tags == TG_INVESTMENT) & is_boss                    # Investment Tag: $25 at a boss
-    cashout = (jnp.where(saved, 0, blind_dollars(state.blind_index, state.boss, state.stake)) + state.hands + interest
-               + money_eor + INVESTMENT_DOLLARS * invest.sum())
+    hand_pay = state.hands * jnp.where(green, GREEN_PER_HAND, 1)
+    discard_pay = jnp.where(green, jnp.maximum(state.discards, 0) * GREEN_PER_DISCARD, 0)
+    cashout = (jnp.where(saved, 0, blind_dollars(state.blind_index, state.boss, state.stake)) + hand_pay
+               + discard_pay + interest + money_eor + INVESTMENT_DOLLARS * invest.sum())
     won = is_boss & (state.ante >= WIN_ANTE)
 
     # the boss is beaten: The Ox's hand (the most played; a tie: the last in pairs() order,
@@ -1811,6 +1834,9 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
         key=key,
     )
     state = reprice(apply_budget(state), pre_clear)      # defeat: Crimson Heart's joker back (Astronomer)
+    # Anaglyph Deck: a Double Tag after a Boss Blind (trigger_effect 'eval'; a held Double Tag
+    # does not copy it)
+    state = tree_where(is_boss & (state.back == B_ANAGLYPH), add_tag(state, TG_DOUBLE, -1), state)
     new_ante = new_ante_rolls(kb, state)
     # the win ends the run: no new ante, no shop; else the shop opens at Cash Out (k_shop is
     # not used: the cash out has its own keys)
@@ -2009,7 +2035,8 @@ class ShopRoll(NamedTuple):
 def roll_shop(key, state, fill=None) -> ShopRoll:
     """create_card_for_shop for each unlocked slot in fill (default: all): the first held
     Uncommon / Rare Tag makes the slot a free joker of that rarity; else a joker / Tarot /
-    Planet / playing card by the rates (shop_rates). The first held edition tag (Foil ...
+    Planet / playing card / Spectral (Ghost Deck) by the rates (shop_rates). The first held
+    edition tag (Foil ...
     Negative) puts its edition on a joker without one and makes it free. No card twice
     (without Showman), none that exists already; an empty pool gives Joker / Strength /
     Pluto. Illusion: a playing card is Enhanced 40 %, has an edition 20 %. A joker gets the
@@ -2036,7 +2063,8 @@ def roll_shop(key, state, fill=None) -> ShopRoll:
         rarity = jnp.where(forced, jnp.where(tags[t_ur] == TG_RARE, RARE, UNCOMMON), 0)
         kind = jnp.where(forced, IK_JOKER, jax.random.categorical(k1, logr)).astype(jnp.int32)
         jid, ed = roll_joker(k2, s0, k3, taken_j, rarity)
-        cid = roll_cons(k4, s0, jnp.where(kind == IK_TAROT, CK_TAROT, CK_PLANET), taken_c)
+        cid = roll_cons(k4, s0, jnp.select([kind == IK_TAROT, kind == IK_SPECTRAL], [CK_TAROT, CK_SPECTRAL],
+                                           CK_PLANET), taken_c)
         card = jax.random.randint(k5, (), 0, 52)
         e = jnp.where(illusion & (jax.random.uniform(k6) > 0.6), jax.random.randint(k7, (), 1, N_ENH), ENH_NONE)
         u = jax.random.uniform(k9)
@@ -2062,7 +2090,8 @@ def roll_shop(key, state, fill=None) -> ShopRoll:
         stk = jnp.where(is_j, roll_sticker(k10, state.stake, jid), 0)
         stks = stks.at[i].set(jnp.where(live, stk, jnp.where(locked, 0, stks[i])))
         taken_j = taken_j | ((jnp.arange(N_JOKERS) == jid) & live & is_j & ~showman)
-        taken_c = taken_c | ((jnp.arange(N_CONS) == cid) & live & ((kind == IK_TAROT) | (kind == IK_PLANET)) & ~showman)
+        is_c = (kind == IK_TAROT) | (kind == IK_PLANET) | (kind == IK_SPECTRAL)
+        taken_c = taken_c | ((jnp.arange(N_CONS) == cid) & live & is_c & ~showman)
         return key, ids, kinds, eds, rank, suit, enh, free, stks, tags, taken_j, taken_c
 
     carry = (key, ids, kinds, eds, rank, suit, enh, free, stks, tags, taken_j, taken_c)
@@ -2669,7 +2698,7 @@ def _start_blind(state):
     s = state._replace(
         game_stage=jnp.int32(STAGE_BLIND), round=state.round + 1, boss_disabled=jnp.bool_(False),
         boss_hand=jnp.int32(-1), forced_card=jnp.int32(-1), chips_scored=jnp.int32(0),
-        blind_target=blind_target(state.ante, state.blind_index, state.target_scale, b, stake=state.stake),
+        blind_target=blind_target(state.ante, state.blind_index, run_scale(state), b, stake=state.stake),
         hands=state.handcount, discards=state.discardcount, discards_used=jnp.int32(0),
         hand_round=jnp.zeros(N_HAND_TYPES, jnp.int32), hand_down=jnp.zeros(MAX_HAND_SIZE, bool),
         joker_debuff=jnp.zeros(MAX_JOKERS, bool), joker_down=jnp.zeros(MAX_JOKERS, bool),
@@ -2824,6 +2853,25 @@ def standard_cards(deck_size=52):
                 card_live=i < deck_size)
 
 
+_NO_FACES = np.array([c for c in range(52) if c % 13 not in (9, 10, 11)], np.int32)   # 40 cards, J Q K out
+
+
+def back_cards(key, back, deck_size=52):
+    """game.lua start_run's card_protos for deck back (instance i < the deck's size):
+    Abandoned: the 40 cards without J / Q / K; Checkered: Clubs -> Spades, Diamonds -> Hearts;
+    Erratic: each card a random one of the 52 (pseudorandom_element(G.P_CARDS, 'erratic'))."""
+    cards = standard_cards(deck_size)
+    i = jnp.arange(MAX_DECK_SIZE)
+    aband = back == B_ABANDONED
+    cid = jnp.where(aband, jnp.asarray(_NO_FACES)[i % 40], i % 52)
+    cid = jnp.where(back == B_ERRATIC, jax.random.randint(key, (MAX_DECK_SIZE,), 0, 52), cid)
+    suit = cid // 13
+    suit = jnp.where(back == B_CHECKERED, jnp.where(suit == 0, 3, jnp.where(suit == 1, 2, suit)), suit)
+    n = jnp.where(aband, jnp.minimum(deck_size, 40), deck_size)
+    return dict(cards, card_rank=(cid % 13).astype(jnp.int32), card_suit=suit.astype(jnp.int32),
+                card_live=i < n)
+
+
 def run_fields():
     """The fields of a fresh run that every builder shares (reset, fixtures): no boss state,
     no tags, no vouchers, White Stake, no stickers. -> dict"""
@@ -2843,53 +2891,63 @@ def run_fields():
         shop_rank=jnp.zeros(MAX_SHOP_SLOTS, jnp.int32), shop_suit=jnp.zeros(MAX_SHOP_SLOTS, jnp.int32),
         shop_enh=jnp.zeros(MAX_SHOP_SLOTS, jnp.int32), cons_ed=jnp.zeros(MAX_CONSUMABLES, jnp.int32),
         ecto_minus=jnp.int32(1), reroll_inc=jnp.int32(0), reroll_d6=jnp.bool_(False),
-        stake=jnp.int32(1), joker_sticker=jnp.zeros(MAX_JOKERS, jnp.int32),
+        stake=jnp.int32(1), back=jnp.int32(B_RED), joker_sticker=jnp.zeros(MAX_JOKERS, jnp.int32),
         joker_perish=jnp.zeros(MAX_JOKERS, jnp.int32), shop_sticker=jnp.zeros(MAX_SHOP_SLOTS, jnp.int32),
         pack_sticker=jnp.zeros(MAX_PACK, jnp.int32),
     )
 
 
 @jit
-def reset(key, deckSize, handSize, target_scale=1.0, stake=1):
+def reset(key, deckSize, handSize, target_scale=1.0, stake=1, back=B_RED):
     """A new run at the blind select of the ante-1 Small Blind: the boss, the two tags and
     the first voucher are rolled; no hand yet. stake: 1 White .. 8 Gold (the Blue Stake
-    and up: 3 discards)."""
+    and up: -1 discard). back: the deck (items.BACK_NAMES; back.lua apply_to_run): its hands,
+    discards, $, joker / consumable slots, hand size, cards (back_cards), vouchers (redeemed:
+    Magic Crystal Ball, Nebula Telescope, Zodiac Tarot Merchant + Planet Merchant + Overstock)
+    and consumables (Magic 2 The Fool, Ghost Hex)."""
     key, subkey, tkey, akey, vkey = jax.random.split(key, 5)
     stake = jnp.clip(jnp.asarray(stake, jnp.int32), 1, N_STAKES)
-    n_disc = (BASE_DISCARDS - (stake >= ST_DISCARD)).astype(jnp.int32)
-    cards = standard_cards(deckSize)
+    back = jnp.clip(jnp.asarray(back, jnp.int32), 0, N_BACKS - 1)
+    n_disc = (BASE_DISCARDS + BACK_DISCARDS[back] - (stake >= ST_DISCARD)).astype(jnp.int32)
+    n_hands = (BASE_HANDS + BACK_HANDS[back]).astype(jnp.int32)
+    h_size = (handSize + BACK_HAND_SIZE[back]).astype(jnp.int32)
+    cards = back_cards(jax.random.fold_in(subkey, 1), back, deckSize)
     deck, _, _, n = _fresh_deal(subkey, cards["card_live"], 0)
+    vouchers = jnp.zeros(N_VOUCHERS, bool)
+    vouchers = vouchers.at[V_CRYSTAL_BALL].set(back == B_MAGIC).at[V_TELESCOPE].set(back == B_NEBULA)
+    zod = back == B_ZODIAC
+    vouchers = vouchers.at[V_TAROT_MERCHANT].set(zod).at[V_PLANET_MERCHANT].set(zod).at[V_OVERSTOCK].set(zod)
 
     s = balatroEnvState(
         jokers=jnp.full(MAX_JOKERS, J_EMPTY, dtype=jnp.int32),
         joker_value=jnp.full(MAX_JOKERS, 0, dtype=float),
         joker_state=jnp.full(MAX_JOKERS, 0, dtype=jnp.int32),
         joker_sell_value=jnp.full(MAX_JOKERS, 0, dtype=jnp.int32),
-        joker_slots=jnp.int32(BASE_JOKER_SLOTS),
+        joker_slots=(BASE_JOKER_SLOTS + BACK_JOKER_SLOT[back]).astype(jnp.int32),
         joker_ed=jnp.zeros(MAX_JOKERS, jnp.int32),
         consumables=jnp.full(MAX_CONSUMABLES, CONS_EMPTY, dtype=jnp.int32),
         cons_sell=jnp.zeros(MAX_CONSUMABLES, jnp.int32),
-        consumable_slots=jnp.int32(BASE_CONS_SLOTS),
+        consumable_slots=(BASE_CONS_SLOTS + BACK_CONS_SLOT[back] + (back == B_MAGIC)).astype(jnp.int32),
         **cards,
         hand=jnp.full(MAX_HAND_SIZE, -1, jnp.int32),
-        hand_size=jnp.int32(handSize),
+        hand_size=h_size,
         hand_valid=jnp.zeros(MAX_HAND_SIZE, bool),
         deck=deck,
         deck_size=n,
         deck_ptr=jnp.int32(0),
-        hands=jnp.int32(BASE_HANDS),
+        hands=n_hands,
         discards=n_disc,
-        handcount=jnp.int32(BASE_HANDS),
+        handcount=n_hands,
         discardcount=n_disc,
-        base_hand_size=jnp.int32(handSize),
-        base_hands=jnp.int32(BASE_HANDS),
+        base_hand_size=h_size,
+        base_hands=n_hands,
         base_discards=n_disc,
         discards_used=jnp.int32(0),
         round=jnp.int32(0),
         ante=jnp.int32(1),
         blind_index=jnp.int32(BLIND_SMALL),
         chips_scored=jnp.int32(0),
-        blind_target=blind_target(jnp.int32(1), BLIND_SMALL, target_scale, stake=stake),
+        blind_target=blind_target(jnp.int32(1), BLIND_SMALL, target_scale * BACK_ANTE_SCALING[back], stake=stake),
         target_scale=jnp.float32(target_scale),
         key=key,
         hand_played=jnp.zeros(N_HAND_TYPES, jnp.int32),
@@ -2904,14 +2962,14 @@ def reset(key, deckSize, handSize, target_scale=1.0, stake=1):
         shop_slots=jnp.full(MAX_SHOP_SLOTS, -1, dtype=jnp.int32),
         shop_kind=jnp.zeros(MAX_SHOP_SLOTS, jnp.int32),
         shop_ed=jnp.zeros(MAX_SHOP_SLOTS, jnp.int32),
-        shop_size=jnp.int32(SHOP_UNLOCKED),
+        shop_size=(SHOP_UNLOCKED + zod).astype(jnp.int32),
         pack_slots=jnp.full(PACK_SLOTS, -1, jnp.int32),
         reroll_cost=jnp.int32(REROLL_BASE),
         free_rerolls=jnp.int32(0),
         gros_extinct=jnp.bool_(False),
         buffoon_given=jnp.bool_(False),
         game_stage=jnp.int32(STAGE_SELECT),
-        money=jnp.int32(STARTING_MONEY),
+        money=(STARTING_MONEY + BACK_DOLLARS[back]).astype(jnp.int32),
         last_cashout=jnp.int32(0),
         pack_id=jnp.int32(-1),
         pack_left=jnp.int32(0),
@@ -2922,7 +2980,10 @@ def reset(key, deckSize, handSize, target_scale=1.0, stake=1):
         pack_enh=jnp.zeros(MAX_PACK, jnp.int32),
         pack_seal=jnp.zeros(MAX_PACK, jnp.int32),
         **run_fields(),
-    )._replace(stake=stake)
+    )._replace(stake=stake, back=back, vouchers=vouchers)
+    # Magic Deck: 2 The Fool; Ghost Deck: Hex (create_card('Tarot', ..., forced key): no edition)
+    s = give_cons(s, jnp.where(back == B_GHOST, CONS_ID["Hex"], C_FOOL), (back == B_MAGIC) | (back == B_GHOST))
+    s = give_cons(s, C_FOOL, back == B_MAGIC)
     tg = new_targets(tkey, s)
     s = s._replace(idol_card=tg.idol_card, mail_rank=tg.mail_rank,
                    ancient_suit=tg.ancient_suit, castle_suit=tg.castle_suit)
@@ -2995,7 +3056,8 @@ def show(state: balatroEnvState, label=""):
     print(f"round  {STAGE_NAMES[stage] if 0 <= stage < len(STAGE_NAMES) else stage}   "
           f"ante {int(state.ante)} {BLIND_NAMES[bi] if 0 <= bi < 3 else bi}   boss {boss}   round {int(state.round)}"
           f"   hands {int(state.hands)}   discards {int(state.discards)}"
-          f"   money ${int(state.money)}   {STAKE_NAMES[min(max(int(state.stake), 1), 8) - 1]}")
+          f"   money ${int(state.money)}   {STAKE_NAMES[min(max(int(state.stake), 1), 8) - 1]}"
+          f"   {BACK_NAMES[min(max(int(state.back), 0), N_BACKS - 1)]}")
     chips, target = int(state.chips_scored), int(state.blind_target)
     frac = 0.0 if target <= 0 else min(chips / target, 1.0)
     filled = int(round(frac * 20))
@@ -3105,8 +3167,9 @@ def invariant_errors(state: balatroEnvState):
         # a charged Negative Invisible Joker sold at full slots copies first, then its slot goes:
         # one joker over (card.lua 2381 checks #jokers <= limit before the sale removes it)
         ("held jokers within joker_slots + 1", len(held) <= int(state.joker_slots) + 1),
-        ("joker_slots = 5 + Antimatter + Negatives (max 8)",
-         int(state.joker_slots) == min(BASE_JOKER_SLOTS + antimatter + neg, MAX_JOKER_SLOTS)),
+        ("joker_slots = 5 (+1 Black, -1 Painted) + Antimatter + Negatives (capped)",
+         int(state.joker_slots) == min(int(base_joker_slots(state)) + antimatter + neg, MAX_JOKER_SLOTS)),
+        ("back 0 .. 14", 0 <= int(state.back) < N_BACKS),
         ("vacant joker slots hold value 0, sell 0, no edition, no flags, no stickers",
          all(float(state.joker_value[i]) == 0.0 and int(state.joker_sell_value[i]) == 0
              and int(state.joker_ed[i]) == 0 and not debuff[i] and not bool(state.joker_down[i])

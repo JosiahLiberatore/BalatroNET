@@ -47,7 +47,8 @@ from items import (CONS_NAMES, CONS_ID, CONS_KIND, CONS_USE, CONS_PARAM, CONS_LO
                    U_ECTOPLASM, U_IMMOLATE, U_ANKH, U_HEX, U_CRYPTID, U_SOUL, U_BLACK_HOLE,
                    PACK_NAMES, PACK_KIND, PACK_SIZE, PACK_CHOOSE, PACK_COST, PK_ARCANA, PK_CELESTIAL,
                    PK_STANDARD, PK_BUFFOON, PK_SPECTRAL, PLANET_OF_HAND, ED_COST, IK_JOKER, IK_PLANET,
-                   IK_TAROT, IK_CARD, N_HAND_TYPES, BOSS_NAMES, TAG_NAMES, VOUCHER_NAMES,
+                   IK_TAROT, IK_CARD, IK_SPECTRAL, B_GREEN, B_GHOST, B_ANAGLYPH, B_PLASMA, N_BACKS,
+                   BACK_JOKER_SLOT, BACK_ANTE_SCALING, N_HAND_TYPES, BOSS_NAMES, TAG_NAMES, VOUCHER_NAMES,
                    STK_ETERNAL, STK_PERISH, STK_RENTAL)
 from jokers import TABLE, JOKER_NAMES, JOKER_ID, JOKERS, JOKER_COST, JOKER_RARITY, MAX_JOKERS, N_JOKERS
 from scoring import HAND_NAMES
@@ -120,7 +121,8 @@ def ref_g(p):
                 levels={HAND_NAMES[k]: int(p.hand_level[k]) for k in range(N_HAND_TYPES)},
                 steel=int((live & (enh == R.STEEL)).sum()), stone=int((live & (enh == R.STONE)).sum()),
                 enhanced=int((live & (enh != 0)).sum()), tarots_used=int(p.tarots_used),
-                unique_planets=int(np.asarray(p.planets_used).sum()), skips=int(p.skips))
+                unique_planets=int(np.asarray(p.planets_used).sum()), skips=int(p.skips),
+                plasma=int(p.back) == B_PLASMA)
 
 
 def ref_play_state(p, sel, out, mods=None):
@@ -257,7 +259,8 @@ class Want:
              "free_rerolls", "reroll_cost", "last_hand", "last_cons", "tarots_used", "skips", "ante",
              "blind_index", "boss_hand", "unused_discards", "round_hand_bonus", "ecto_minus",
              "consumable_slots", "base_hand_size", "base_hands", "base_discards", "shop_size", "boss", "round",
-             "ox_hand", "boss_sub", "pack_return", "blind_target", "pack_id", "pack_left", "reroll_inc", "stake")
+             "ox_hand", "boss_sub", "pack_return", "blind_target", "pack_id", "pack_left", "reroll_inc", "stake",
+             "back")
         self.f = {f: int(getattr(p, f)) for f in F}
         self.f.update(gros_extinct=bool(p.gros_extinct), boss_disabled=bool(p.boss_disabled),
                       boss_rerolled=bool(p.boss_rerolled), reroll_d6=bool(p.reroll_d6))
@@ -543,7 +546,7 @@ def _apply_cons(c, tag, p, q, J, w, cid, sel):
         # itself: used_jokers keeps it until it dissolves), none twice; Showman allows them all
         if "Showman" not in R.acting_names(J):
             shop_c = {int(p.shop_slots[i]) for i in range(MAX_SHOP_SLOTS)
-                      if int(p.shop_slots[i]) >= 0 and int(p.shop_kind[i]) in (IK_TAROT, IK_PLANET)}
+                      if int(p.shop_slots[i]) >= 0 and int(p.shop_kind[i]) in (IK_TAROT, IK_PLANET, IK_SPECTRAL)}
             pk = _PKIND[int(p.pack_id)] if int(p.pack_id) >= 0 else -1
             pack_c = {int(x) for x in p.pack_items if int(x) >= 0} if pk in (PK_ARCANA, PK_CELESTIAL, PK_SPECTRAL) else set()
             new = [int(x) for x in q.consumables if x >= 0][len(w.cons):]
@@ -696,14 +699,18 @@ def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
     v = w.vouchers
     rate = 1 + sum(x["name"] == "To the Moon" for x in J if not x.get("deb"))
     cap = 20 if "Money Tree" in v else 10 if "Seed Money" in v else 5
-    interest = rate * min(money // 5, cap) if money >= 5 else 0
+    green = w.f["back"] == B_GREEN                         # Green Deck: no interest, $2 / hand, $1 / discard
+    interest = rate * min(money // 5, cap) if money >= 5 and not green else 0
     is_boss = int(p.blind_index) == BLIND_BOSS
     invest = sum(t == "Investment Tag" for t, _ in w.tags) if is_boss else 0
     if invest:
         w.tags = [(t, h) for t, h in w.tags if t != "Investment Tag"]
     boss = BOSS_NAMES[int(p.boss)] if int(p.boss) >= 0 else None
     pay = 0 if saved else R.blind_pay(int(p.blind_index), boss if is_boss else None, int(p.stake))
-    cashout = pay + w.f["hands"] + interest + int(R.ref_dollar_bonus(J, g)) + 25 * invest
+    cashout = (pay + w.f["hands"] * (2 if green else 1) + (max(w.f["discards"], 0) if green else 0) + interest
+               + int(R.ref_dollar_bonus(J, g)) + 25 * invest)
+    if is_boss and w.f["back"] == B_ANAGLYPH:               # Anaglyph Deck: a Double Tag after a boss
+        _add_tag(w, "Double Tag", 0)
     won = is_boss and int(p.ante) >= R.WIN_ANTE
     w.f.update(money=money + (cashout if won else 0), last_cashout=cashout, game_stage=STAGE_WON if won else STAGE_CASHOUT,
                unused_discards=w.f["unused_discards"] + max(w.f["discards"], 0), round_hand_bonus=0,
@@ -776,8 +783,13 @@ def _check_shop(c, tag, q, w, fresh=True):
         it, kd = int(q.shop_slots[i]), int(q.shop_kind[i])
         if i < size:
             ok = ((kd == IK_JOKER and 0 <= it < N_JOKERS) or (kd == IK_CARD and it == 0)
-                  or (kd in (IK_TAROT, IK_PLANET) and 0 <= it < len(CONS_NAMES) and _KIND[it] == (kd - 1)))
+                  or (kd in (IK_TAROT, IK_PLANET) and 0 <= it < len(CONS_NAMES) and _KIND[it] == (kd - 1))
+                  or (kd == IK_SPECTRAL and 0 <= it < len(CONS_NAMES) and _KIND[it] == CK_SPECTRAL
+                      and CONS_NAMES[it] not in ("The Soul", "Black Hole")))
             c.check(f"{tag}: shop slot {i} holds a card of its kind", ok, it, kd)
+            if kd == IK_SPECTRAL:
+                c.check(f"{tag}: shop slot {i}: Spectral cards need the Ghost Deck", w.f["back"] == B_GHOST,
+                        w.f["back"])
             if kd == IK_CARD:
                 c.check(f"{tag}: shop slot {i}: playing cards need Magic Trick",
                         bool(w.vouchers & {"Magic Trick", "Illusion"}), w.vouchers)
@@ -874,7 +886,7 @@ def _enter_select(c, tag, p, q, J, w):
 
 def w_slots(J, w):
     neg = sum(1 for x in J if x["ed"] == 4)
-    return min(5 + ("Antimatter" in w.vouchers) + neg, R.SLOT_CAP)
+    return min(5 + int(BACK_JOKER_SLOT[w.f["back"]]) + ("Antimatter" in w.vouchers) + neg, R.SLOT_CAP)
 
 
 def _reroll_boss_ref(c, tag, w, q, free=False, n=1):
@@ -937,6 +949,11 @@ def _check_pack(c, tag, p, q, w, J, pid):
             npeq(c, f"{tag}: OPEN: the next cards of the deck", hand, [int(x) for x in p.deck[ptr:ptr + n]])
 
 
+def _scale(p):
+    """The blind targets' scale: target_scale x the deck's ante_scaling (Plasma X2)."""
+    return float(np.float32(p.target_scale) * np.float32(BACK_ANTE_SCALING[int(p.back)]))
+
+
 def w_hand_size(J, w, q):
     return R.ref_budget(J, w.f["base_hand_size"], w.f["base_hands"], w.f["base_discards"],
                         w.f["round_hand_bonus"] - _manacle(q))[0]
@@ -956,7 +973,7 @@ def _disable(c, tag, p, w, J):
         w.f["discards"] += w.f["boss_sub"]
     if boss == "The Needle":                             # a negative take (0 base hands): down to 0
         w.f["hands"] = max(w.f["hands"] + w.f["boss_sub"], 0)
-    w.f["blind_target"] = R.blind_chips(int(p.ante), 2, boss, float(p.target_scale), disabled=True,
+    w.f["blind_target"] = R.blind_chips(int(p.ante), 2, boss, _scale(p), disabled=True,
                                         stake=int(p.stake))
     astro_old = "Astronomer" in R.acting_names(J)
     for x in J:
@@ -972,7 +989,7 @@ def _blind_start(c, tag, p, q, J, w):
     is_boss = int(p.blind_index) == BLIND_BOSS
     boss = BOSS_NAMES[int(p.boss)] if is_boss and int(p.boss) >= 0 else None
     w.f.update(game_stage=STAGE_BLIND, round=w.f["round"] + 1, chips_scored=0, boss_disabled=False, boss_hand=-1,
-               blind_target=R.blind_chips(int(p.ante), int(p.blind_index), boss, float(p.target_scale),
+               blind_target=R.blind_chips(int(p.ante), int(p.blind_index), boss, _scale(p),
                                           stake=int(p.stake)),
                discards_used=0)
     hs, hc, dc, js = R.ref_budget(J, w.f["base_hand_size"], w.f["base_hands"], w.f["base_discards"])
@@ -1288,7 +1305,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
             room = w.room() > 0
         # Buy and Use: a Tarot / Planet the full slots cannot take is used at once, if the shop
         # allows its use (can_buy_and_use: can_use_consumeable from outside the slots, no hand)
-        buy_use = kind in (IK_TAROT, IK_PLANET) and not room and item >= 0
+        buy_use = kind in (IK_TAROT, IK_PLANET, IK_SPECTRAL) and not room and item >= 0
         if buy_use:
             room = _can_use(p, J, w, item, np.zeros(MAX_HAND_SIZE, bool), False)
         if 0 <= t < MAX_SHOP_SLOTS and bool(p.shop_free[t]):
@@ -1563,7 +1580,8 @@ def check_step(c, tag, p, a, q, reward, out=None):
     npeq(c, f"{tag}: Perishable rounds left", q.joker_perish, np.array([x["left"] for x in J] + [0] * (MAX_JOKERS - k)))
     manacle = _manacle(q)
     hs, hc, dc, js = R.ref_budget(J, w.f["base_hand_size"], w.f["base_hands"], w.f["base_discards"],
-                                  w.f["round_hand_bonus"] - manacle, "Antimatter" in w.vouchers)
+                                  w.f["round_hand_bonus"] - manacle,
+                                  ("Antimatter" in w.vouchers) + int(BACK_JOKER_SLOT[w.f["back"]]))
     w.f.update(hand_size=hs, handcount=hc, discardcount=dc, joker_slots=js)
     w.f.pop("_ante_voucher", None)
     for f, v in w.f.items():
@@ -2622,16 +2640,22 @@ def _policy(p, rng):
     return int(rng.integers(0, N_VERBS)), sel, 0, 0         # LOST / WON: all no-ops
 
 
-_batch_reset = jax.jit(jax.vmap(lambda k, stake: reset(k, 52, 8, 1.0, stake)))
+_batch_reset = jax.jit(jax.vmap(lambda k, stake, back: reset(k, 52, 8, 1.0, stake, back)))
 _batch_budget = jax.jit(jax.vmap(apply_budget))
 _PAIRS = [(VOUCHER_NAMES.index(a), VOUCHER_NAMES.index(b)) for a, b in R.VOUCHER_PAIRS]
 
 
 def _soak_batch(rng, key, n_envs):
-    """Fresh runs: a random stake, 0-4 random starting jokers (with the stake's stickers; a
-    Perishable one 0-5 rounds left), some money, a mix of curriculum scales."""
+    """Fresh runs: a random stake and deck, 0-4 random starting jokers (with the stake's stickers;
+    a Perishable one 0-5 rounds left), some money, a mix of curriculum scales."""
     stakes = rng.integers(1, 9, n_envs)
-    batch = _batch_reset(jax.random.split(key, n_envs), jnp.asarray(stakes, jnp.int32))
+    backs = rng.integers(0, N_BACKS, n_envs)
+    batch = _batch_reset(jax.random.split(key, n_envs), jnp.asarray(stakes, jnp.int32), jnp.asarray(backs, jnp.int32))
+    live_n = np.asarray(batch.card_live).sum(axis=1)          # 52 (the Abandoned Deck: 40)
+    cslots = np.asarray(batch.consumable_slots)
+    js = np.asarray(batch.joker_slots)
+    held_c = np.asarray(batch.consumables)
+    held_s = np.asarray(batch.cons_sell)
     J = np.full((n_envs, MAX_JOKERS), -1, np.int32)
     STK = np.zeros((n_envs, MAX_JOKERS), np.int32)
     LEFT = np.zeros((n_envs, MAX_JOKERS), np.int32)
@@ -2644,7 +2668,7 @@ def _soak_batch(rng, key, n_envs):
     seal = np.zeros((n_envs, MAX_DECK_SIZE), np.int32)
     ced = np.zeros((n_envs, MAX_DECK_SIZE), np.int32)
     for i in range(n_envs):
-        for slot, j in enumerate(rng.integers(0, N_JOKERS, rng.integers(0, 5))):
+        for slot, j in enumerate(rng.integers(0, N_JOKERS, rng.integers(0, min(5, int(js[i]) + 1)))):
             E[i, slot] = int(rng.integers(1, 4)) if rng.random() < 0.1 else 0
             cost = int(JOKER_COST[j]) + int(ED_COST[E[i, slot]])
             u, st, nm = rng.random(), int(stakes[i]), NAME[j]
@@ -2657,10 +2681,13 @@ def _soak_batch(rng, key, n_envs):
             J[i, slot], S[i, slot] = j, max(1, cost // 2)
             V[i, slot] = _seed(j)
             T[i, slot] = int(rng.integers(3, N_HAND_TYPES)) if NAME[j] == "To Do List" else 0
-        for slot in range(int(rng.integers(0, 3))):
-            C[i, slot] = int(rng.integers(0, len(CONS_NAMES)))
+        if rng.random() < 0.5:                                   # the deck's own consumables (Magic, Ghost)
+            C[i, :] = held_c[i]
+        else:
+            for slot in range(int(rng.integers(0, min(3, int(cslots[i]) + 1)))):
+                C[i, slot] = int(rng.integers(0, len(CONS_NAMES)))
         if rng.random() < 0.5:
-            for x in rng.choice(52, int(rng.integers(1, 20)), replace=False):
+            for x in rng.choice(int(live_n[i]), int(rng.integers(1, 20)), replace=False):
                 enh[i, x] = rng.integers(0, 9)
                 seal[i, x] = rng.integers(0, 5) if rng.random() < 0.3 else 0
                 ced[i, x] = rng.integers(0, 4) if rng.random() < 0.2 else 0
@@ -2669,7 +2696,7 @@ def _soak_batch(rng, key, n_envs):
                 j = JOKER_ID[nm]
                 J[i, slot], S[i, slot], V[i, slot], E[i, slot] = j, max(1, int(JOKER_COST[j]) // 2), _seed(j), 0
                 STK[i, slot], LEFT[i, slot], T[i, slot] = 0, 0, 0
-            for x in rng.choice(52, 12, replace=False):
+            for x in rng.choice(int(live_n[i]), 12, replace=False):
                 enh[i, x] = R.GOLD
     scale = rng.choice([0.01, 0.03, 0.1, 0.3], n_envs).astype(np.float32)
     # some vouchers already redeemed (the second of a pair only after the first)
@@ -2681,13 +2708,18 @@ def _soak_batch(rng, key, n_envs):
                 VCH[i, b] = rng.random() < 0.4
     sells = np.where(C >= 0, rng.integers(1, 4, C.shape), 0)
     sells = np.where((C >= 0) & np.isin(C, np.flatnonzero(np.asarray(CONS_KIND) == CK_SPECTRAL)), sells + 1, sells)
+    same = (C == held_c).all(axis=1)
+    sells = np.where(same[:, None], held_s, sells)
+    # the deck's vouchers stay (Magic, Nebula, Zodiac), with some more
+    VCH = VCH | np.asarray(batch.vouchers)
     batch = batch._replace(
         jokers=jnp.asarray(J), joker_value=jnp.asarray(V), joker_sell_value=jnp.asarray(S),
         joker_state=jnp.asarray(T), joker_ed=jnp.asarray(E), consumables=jnp.asarray(C),
         cons_sell=jnp.asarray(sells, jnp.int32),                 # some Gift Card rounds
         card_enh=jnp.asarray(enh), card_seal=jnp.asarray(seal), card_ed=jnp.asarray(ced),
         money=jnp.asarray(rng.integers(0, 30, n_envs), jnp.int32), target_scale=jnp.asarray(scale),
-        blind_target=jnp.asarray(np.maximum(np.floor(100 * scale), 1), jnp.int32),
+        blind_target=jnp.asarray(np.maximum(np.floor(100 * scale * np.where(backs == B_PLASMA, 2, 1)), 1),
+                                 jnp.int32),
         vouchers=jnp.asarray(VCH), joker_sticker=jnp.asarray(STK), joker_perish=jnp.asarray(LEFT))
     batch = _batch_budget(batch)
     # the first blind starts with the budget the jokers give
@@ -2748,6 +2780,13 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
                         held_at_play[NAME[j]] += 1
                 if int(q.game_stage) in (STAGE_CASHOUT, STAGE_END, STAGE_WON):
                     stats["clears"] += 1
+                    bk = int(p.back)
+                    if bk == B_GREEN:
+                        stats["green cash outs"] += 1
+                    if bk == B_ANAGLYPH and int(p.blind_index) == BLIND_BOSS:
+                        stats["anaglyph bosses"] += 1
+                if int(p.back) == B_PLASMA:
+                    stats["plasma plays"] += 1
                 if int(q.game_stage) == STAGE_END:
                     stats["end windows"] += 1
             if int(p.game_stage) == STAGE_CASHOUT and verb not in (None, V_NEXT):
@@ -2768,7 +2807,10 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
             if verb in (V_BUY, V_PICK) and (np.asarray(q.joker_sticker) != 0).sum() > (np.asarray(p.joker_sticker) != 0).sum():
                 stats["sticker joker in"] += 1
             tb = int(a_host.target[i])
-            if verb == V_BUY and 0 <= tb < MAX_SHOP_SLOTS and int(p.shop_kind[tb]) in (IK_TAROT, IK_PLANET) \
+            if int(q.game_stage) == STAGE_SHOP and ((np.asarray(q.shop_kind) == IK_SPECTRAL)
+                                                    & (np.asarray(q.shop_slots) >= 0))[:int(q.shop_size)].any():
+                stats["ghost shop spectrals"] += 1
+            if verb == V_BUY and 0 <= tb < MAX_SHOP_SLOTS and int(p.shop_kind[tb]) in (IK_TAROT, IK_PLANET, IK_SPECTRAL) \
                     and int(p.shop_slots[tb]) >= 0 > int(q.shop_slots[tb]) \
                     and np.array_equal(np.asarray(p.consumables), np.asarray(q.consumables)):
                 stats["buy and use"] += 1
@@ -2791,6 +2833,9 @@ def run_soak_test(n_envs=64, n_steps=400, seed=0):
             {k: stats[k] for k in ("end windows", "cash-out actions")})
     c.check("the soak met Buy and Use (a BUY with the consumable slots full)", stats["buy and use"] > 0,
             stats["buy and use"])
+    deck_stats = ("green cash outs", "anaglyph bosses", "plasma plays", "ghost shop spectrals")
+    c.check("the soak met the decks' later rules (Green, Anaglyph, Plasma, Ghost)",
+            min(stats[k] for k in deck_stats) > 0, {k: stats[k] for k in deck_stats})
     return c.done()
 
 

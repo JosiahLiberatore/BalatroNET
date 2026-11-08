@@ -25,7 +25,7 @@ import jax.numpy as jnp
 
 from env import balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_CONSUMABLES, MAX_SHOP_SLOTS
 from env import standard_cards, STAGE_PACK, CONS_SELL, run_fields, BASE_JOKER_SLOTS
-from items import (N_HAND_TYPES, CONS_ID, PACK_SLOTS, MAX_PACK, ED_NEG, MAX_JOKER_SLOTS, BOSS_ID,
+from items import (BACK_NAMES, N_HAND_TYPES, CONS_ID, PACK_SLOTS, MAX_PACK, ED_NEG, MAX_JOKER_SLOTS, BOSS_ID,
                    TAG_ID, VOUCHER_ID, MAX_TAGS, MAX_SHOP_VOUCHERS, V_ANTIMATTER, HAND_NAMES,
                    STK_ETERNAL, STK_PERISH, STK_RENTAL, PERISH_ROUNDS, RENTAL_COST)
 # the card-name convention has ONE definition, in env (show() prints with it)
@@ -227,7 +227,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           round_hand_bonus=0, pack_return=None, shop_free=(), pack_free=(), shop_rank=(), shop_suit=(),
           shop_enh=(), bosses_used=(), boss_rerolled=False, boss_sub=0, orbital_hands=(11, 11),
           reroll_inc=0, reroll_d6=False, stake=1, joker_sticker=(), joker_perish=None, shop_sticker=(),
-          pack_sticker=()):
+          pack_sticker=(), back=0):
     """Author a balatroEnvState from the fields the scenario is actually about.
 
     hand        card-name string, or a list of ids. '.' is an empty lane.
@@ -257,6 +257,8 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
     shop_vouchers voucher names in the shop; ante_voucher: this ante's voucher (a name or -1)
     reroll_inc / reroll_d6  paid rerolls in this shop / a D6 Tag made them start at $0
     stake       1 White .. 8 Gold (the Eternal / Perishable / Rental stickers need stake 4 / 7 / 8)
+    back        the deck: an items.BACK_NAMES index or name (only its later rules: Green's cash out,
+                Ghost's shop, Anaglyph's tag, Plasma's score and targets; the start fields are as given)
     joker_sticker / shop_sticker / pack_sticker  per slot: 'E', 'P', 'R' (a mix: 'ER'), '' = none
     joker_perish a Perishable joker's rounds left; defaults to 5 (a new one)
     """
@@ -347,6 +349,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         boss_rerolled=jnp.bool_(boss_rerolled), boss_sub=jnp.int32(boss_sub),
         reroll_inc=jnp.int32(reroll_inc), reroll_d6=jnp.bool_(reroll_d6),
         stake=jnp.int32(stake), joker_sticker=jstk, joker_perish=jper,
+        back=jnp.int32(BACK_NAMES.index(back) if isinstance(back, str) else back),
         shop_sticker=lanes([sticker_bits(x) for x in shop_sticker], MAX_SHOP_SLOTS, 0, jnp.int32),
         pack_sticker=lanes([sticker_bits(x) for x in pack_sticker], MAX_PACK, 0, jnp.int32),
     )

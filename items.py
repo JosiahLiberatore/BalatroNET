@@ -237,7 +237,7 @@ STANDARD_ENHANCED = 0.4                               # 'stdset' > 0.6 -> an Enh
 STANDARD_SEAL = 0.2                                   # 1 - 0.02 * 10
 
 # --- shop item kinds (create_card_for_shop: joker 20, tarot 4, planet 4, playing card 0) ----------
-IK_JOKER, IK_TAROT, IK_PLANET, IK_CARD = 0, 1, 2, 3
+IK_JOKER, IK_TAROT, IK_PLANET, IK_CARD, IK_SPECTRAL = 0, 1, 2, 3, 4   # IK_SPECTRAL: the Ghost Deck
 SHOP_KIND_LOGW = jnp.log(jnp.array([20.0, 4.0, 4.0], jnp.float32))
 JOKER_RATE, TAROT_RATE, PLANET_RATE = 20.0, 4.0, 4.0
 CARD_BASE_COST = 1                                    # a playing card in the shop (c_base: no cost)
@@ -437,6 +437,41 @@ STAKE_DESC = ["Base difficulty",
               "Shop can have Perishable Jokers (debuffed after 5 Rounds)",
               "Shop can have Rental Jokers (costs $3 per round)"]
 N_STAKES = len(STAKE_NAMES)
+
+# ---------------------------------------------------------------------------
+# DECKS (game.lua P_CENTERS b_*, back.lua apply_to_run / trigger_effect): state.back
+# ---------------------------------------------------------------------------
+BACK_NAMES = ["Red Deck", "Blue Deck", "Yellow Deck", "Green Deck", "Black Deck", "Magic Deck",
+              "Nebula Deck", "Ghost Deck", "Abandoned Deck", "Checkered Deck", "Zodiac Deck",
+              "Painted Deck", "Anaglyph Deck", "Plasma Deck", "Erratic Deck"]
+BACK_DESC = ["+1 discard every round",
+             "+1 hand every round",
+             "Start with an extra $10",
+             "At end of each Round: $2 per remaining Hand, $1 per remaining Discard. Earn no Interest",
+             "+1 Joker slot, -1 hand every round",
+             "Start run with the Crystal Ball voucher and 2 copies of The Fool",
+             "Start run with the Telescope voucher, -1 consumable slot",
+             "Spectral cards may appear in the shop, start with a Hex card",
+             "Start run with no Face Cards in your deck",
+             "Start run with 26 Spades and 26 Hearts in deck",
+             "Start run with Tarot Merchant, Planet Merchant, and Overstock",
+             "+2 hand size, -1 Joker slot",
+             "After defeating each Boss Blind, gain a Double Tag",
+             "Balance Chips and Mult when calculating score for played hand, X2 base Blind size",
+             "All Ranks and Suits in deck are randomized"]
+N_BACKS = len(BACK_NAMES)
+(B_RED, B_BLUE, B_YELLOW, B_GREEN, B_BLACK, B_MAGIC, B_NEBULA, B_GHOST, B_ABANDONED, B_CHECKERED,
+ B_ZODIAC, B_PAINTED, B_ANAGLYPH, B_PLASMA, B_ERRATIC) = range(N_BACKS)
+# the config of each deck, by state.back (back.lua apply_to_run)
+BACK_HANDS = jnp.array([0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], jnp.int32)
+BACK_DISCARDS = jnp.array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], jnp.int32)
+BACK_DOLLARS = jnp.array([0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], jnp.int32)
+BACK_JOKER_SLOT = jnp.array([0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0], jnp.int32)
+BACK_HAND_SIZE = jnp.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0], jnp.int32)
+BACK_CONS_SLOT = jnp.array([0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0], jnp.int32)
+BACK_ANTE_SCALING = jnp.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1], jnp.float32)   # Plasma: X2
+GHOST_SPECTRAL_RATE = 2.0          # G.GAME.spectral_rate (0 for the other decks)
+GREEN_PER_HAND, GREEN_PER_DISCARD = 2, 1     # modifiers.money_per_hand / money_per_discard
 ST_NO_SMALL_REWARD = 2   # Red: no_blind_reward.Small
 ST_SCALING_2 = 3         # Green: modifiers.scaling = 2 (get_blind_amount)
 ST_ETERNAL = 4           # Black: enable_eternals_in_shop

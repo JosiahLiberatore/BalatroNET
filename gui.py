@@ -55,7 +55,7 @@ import jax
 import jax.numpy as jnp
 import pygame
 
-from env import (balatroAction, env_step, reset, explain_play, preview, build_ctx, acquire,
+from env import (balatroAction, env_step, reset, explain_play, preview, build_ctx, acquire, run_scale,
                  give_cons, invariant_errors, MAX_HAND_SIZE, MAX_DECK_SIZE, STAGE_BLIND, STAGE_SHOP,
                  STAGE_LOST, STAGE_WON, STAGE_PACK, STAGE_SELECT, STAGE_END, STAGE_CASHOUT, BLIND_NAMES,
                  BLIND_BOSS, V_PLAY, V_DISCARD,
@@ -68,6 +68,7 @@ from items import (CONS_NAMES, CONS_DESC, CONS_KIND, CONS_LO, CONS_HI, CK_TAROT,
                    ENH_NAMES, ED_NAMES, SEAL_NAMES, IK_JOKER, IK_TAROT, IK_CARD, N_HAND_TYPES, hand_chips_mult,
                    BOSS_NAMES, BOSS_DESC, TAG_NAMES, TAG_DESC, VOUCHER_NAMES, VOUCHER_DESC, VOUCHER_ID,
                    BOSS_REROLL_COST, STAKE_NAMES, STAKE_DESC, N_STAKES, STK_ETERNAL, STK_PERISH, STK_RENTAL,
+                   BACK_NAMES, BACK_DESC, N_BACKS,
                    ST_NO_SMALL_REWARD)
 from jokers import (JOKER_NAMES, JOKER_DESC, JOKER_COST, JOKERS, JOKER_RARITY, J_EMPTY,
                     MAX_JOKERS, rows_for, resolve, COMMON, UNCOMMON, RARE, LEGENDARY,
@@ -559,6 +560,7 @@ class App:
         self.clock = pygame.time.Clock()
         self.seed = seed
         self.stake = 1                 # 1 White .. 8 Gold (K: the next stake, a new run)
+        self.back = 0                  # the deck, items.BACK_NAMES (B: the next deck, a new run)
         self.log = []
         self.show_deck = False
         self.seed_edit = None          # the typed digits while the seed box is open
@@ -598,14 +600,15 @@ class App:
 
     def new_run(self, seed):
         self.seed = seed
-        self.state = reset(jax.random.key(seed), 52, 8, self.scale, self.stake)
+        self.state = reset(jax.random.key(seed), 52, 8, self.scale, self.stake, self.back)
         self.selected = set()          # lanes
         self.joker_sel = None          # joker slot
         self.cons_sel = None           # consumable slot
         self.last_play = None          # (PlayResult on host, cards, pre-state hands)
         self.cashout = None            # breakdown text
         self.refresh()
-        self.say(f"New run, seed {seed}, {STAKE_NAMES[self.stake - 1]}, target scale {self.scale:g}. Choose a "
+        self.say(f"New run, seed {seed}, {BACK_NAMES[self.back]}, {STAKE_NAMES[self.stake - 1]}, target scale "
+                 f"{self.scale:g}. Choose a "
                  f"blind: the {BLIND_NAMES[0]} needs {self.targets[0]:,} chips.")
 
     def refresh(self):
@@ -615,7 +618,7 @@ class App:
         self.reroll = int(reroll_price(self.state))
         h, st = self.h, self.state
         # the blind select's targets and rewards; the shop's prices; the boss's debuffs
-        self.targets = [int(blind_target(st.ante, i, st.target_scale, st.boss, stake=st.stake)) for i in range(3)]
+        self.targets = [int(blind_target(st.ante, i, run_scale(st), st.boss, stake=st.stake)) for i in range(3)]
         self.rewards = [int(blind_dollars(i, st.boss, st.stake)) for i in range(3)]
         self.prices = [int(shop_item_cost(st, i)) for i in range(len(h.shop_slots))]
         # a shop Tarot / Planet with the consumable slots full: BUY is Buy and Use (True), or
@@ -1244,6 +1247,7 @@ class App:
         b["tests"] = Button((716, 716, 104, 30), "Tests (T)", AI_C if self.test_mode else PANEL_HI)
         b["stake"] = Button((824, 716, 100, 30), STAKE_NAMES[self.stake - 1].split()[0] + " (K)", PANEL_HI,
                             not self.test_mode)
+        b["back"] = Button((1076, 186, 190, 28), BACK_NAMES[self.back] + " (B)", PANEL_HI, not self.test_mode)
         b["model"] = Button((1020, 710, 120, 36), "Model (P)", AI_C if self.show_model else PANEL_HI,
                             not self.test_mode)
         if self.test_mode:
@@ -1369,6 +1373,8 @@ class App:
             self.give_money(10)
         elif name == "stake":
             self.next_stake()
+        elif name == "back":
+            self.next_back()
         elif name == "deck":
             self.show_deck = True
         elif name == "model":
@@ -1394,6 +1400,12 @@ class App:
             self.refresh()
         elif name == "ai_odds":
             self.ai_odds = not self.ai_odds
+
+    def next_back(self):
+        """The next deck (Erratic goes back to Red): a new run with the same seed."""
+        self.back = (self.back + 1) % N_BACKS
+        self.new_run(self.seed)
+        self.say(f"{BACK_NAMES[self.back]}: {BACK_DESC[self.back]}.")
 
     def next_stake(self):
         """The next stake (Gold goes back to White): a new run with the same seed."""
@@ -1465,6 +1477,8 @@ class App:
             return
         if k == pygame.K_k and not self.test_mode:
             return self.next_stake()
+        if k == pygame.K_b and not self.test_mode:
+            return self.next_back()
         if k == pygame.K_n:
             self.new_run(self.seed + 1)
         elif stage == STAGE_SELECT:
@@ -1603,6 +1617,9 @@ class App:
         # the boss of this ante, the held tags, the redeemed vouchers
         info = []
         st = int(h.stake)
+        bk = int(h.back)
+        if bk != 0 and 0 <= bk < N_BACKS:
+            info.append((f"{BACK_NAMES[bk]}: {BACK_DESC[bk]}", TEXT))
         if st > 1:
             info.append((f"{STAKE_NAMES[st - 1]}: {STAKE_DESC[st - 1]}, and the stakes below", STAKE_C[st - 1]))
         if int(h.boss) >= 0:
