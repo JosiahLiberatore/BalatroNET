@@ -548,6 +548,13 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
         round).
       TESTS: the reference model follows; 2 new scenarios (Bosses: The Needle with 0 base hands,
       The Needle + Luchador).
+- [x] Crimson Heart + Astronomer (2026-11-08), rule from the 1.0.1o Lua: set_debuff runs
+      remove_from_deck / add_to_deck, and Astronomer's runs set_cost on every card (card.lua
+      616-621, 673-678; held Planets too: a Negative Planet sells for $1 with Astronomer, $4
+      without). The env now reprices when Crimson Heart disables or lets go a joker (_heart), when
+      the boss is disabled (disable_boss) and at the round end (defeat). Was: the price stayed.
+      Kept (the game rule): Astronomer sets the cost of held Planets to $0 too.
+      TESTS: the reference model follows; 3 new scenarios (Bosses: Crimson Heart + Astronomer).
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -593,9 +600,6 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - the Orbital Tag's hand when an ante number comes back (Hieroglyph / Petroglyph): the game gives
   the hand it gave that ante and blind before (G.GAME.orbital_choices has the ante number as its
   key); the env picks a new one (kept, 2026-11-05)
-- open (no decision yet): Crimson Heart on Astronomer. Astronomer sets every Planet's cost to $0,
-  held ones too, so a held Negative Planet (Perkeo) sells for $1, not $4. While Crimson Heart
-  disables Astronomer, the game sets the prices again ($4); the env keeps $1
 - The Pillar: when a joker comes or goes later in its blind (a sale, Seltzer used up, Judgement
   ...), the game checks every card again (set_blind reset), and a DNA copy made in that blind is
   then debuffed (a suit / rank Tarot on the copy does it too); the env does not debuff the copy

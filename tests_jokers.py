@@ -722,8 +722,10 @@ def _clear_round(c, tag, p, J, w, held_cards, saved=False, played=None):
         w.f["blind_index"] = 0
     else:
         w.f["blind_index"] += 1
+    astro_old = "Astronomer" in R.acting_names(J)
     for x in J:
         x["deb"] = _perished(x)                           # Crimson Heart lets go; a perished one stays
+    _reprice_cons(w, astro_old, "Astronomer" in R.acting_names(J))
     return J, cashout
 
 
@@ -956,10 +958,12 @@ def _disable(c, tag, p, w, J):
         w.f["hands"] = max(w.f["hands"] + w.f["boss_sub"], 0)
     w.f["blind_target"] = R.blind_chips(int(p.ante), 2, boss, float(p.target_scale), disabled=True,
                                         stake=int(p.stake))
+    astro_old = "Astronomer" in R.acting_names(J)
     for x in J:
         if x.get("deb") and not _perished(x):
             w.f["discards"] += R.D_SIZE.get(x["name"], 0)
             x["deb"] = False
+    _reprice_cons(w, astro_old, "Astronomer" in R.acting_names(J))
     w.f["boss_disabled"] = True
 
 
@@ -1101,8 +1105,10 @@ def _heart_pick(c, tag, p, q, J, w):
     w.f["discards"] = max(w.f["discards"] + back, 0)
     h = lambda x: R.H_SIZE.get(x["name"], 0) + (int(x["v"]) if x["name"] == "Turtle Bean" else 0)
     grow = max(sum(h(J[k]) for k in old), 0) + max(-sum(h(J[k]) for k in new), 0)
+    astro_old = "Astronomer" in R.acting_names(J)
     for k, x in enumerate(J):
         x["deb"] = k in new or _perished(x)
+    _reprice_cons(w, astro_old, "Astronomer" in R.acting_names(J))   # set_debuff: Astronomer's set_cost
     return grow
 
 

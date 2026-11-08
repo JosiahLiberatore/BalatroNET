@@ -2355,6 +2355,29 @@ BOSSES = [
       [play("KD KC")],
       [C("cards in hand", lambda r: r[1].in_hand, 9), C("hand size", lambda r: r[1].hand_size, 8),
        C("Juggler disabled again", lambda r: r[1].jdeb(0), True)]),
+    S("Bosses", "Crimson Heart + Astronomer", "a disabled Astronomer sets the prices again",
+      """Astronomer sets every Planet's cost to $0, held ones too: a held Negative Mercury ($8)
+      sells for $1. The Joker is disabled; after a hand Crimson Heart disables Astronomer (the only
+      other joker), and the game sets the prices again: the Negative Mercury sells for $4.""",
+      boss("Crimson Heart", jokers=("Astronomer", "Joker"), joker_debuff=(0, 1),
+           consumables=("Mercury",), cons_ed=(4,), cons_sell=(1,)),
+      [play("KD KC")],
+      [C("Astronomer disabled", lambda r: r[1].jdeb(0), True), C("Mercury sells for", lambda r: r[1].csell(0), 4)]),
+    S("Bosses", "Crimson Heart + Astronomer", "the boss's end gives Astronomer back",
+      """Crimson Heart disabled Astronomer: the held Negative Mercury sells for $4. The hand beats the
+      blind (ante 8: the run is won); at the end of the round Astronomer acts again and the Mercury
+      sells for $1.""",
+      boss("Crimson Heart", clear=True, jokers=("Astronomer", "Joker"), joker_debuff=(1, 0),
+           consumables=("Mercury",), cons_ed=(4,), cons_sell=(4,)),
+      [play("KD KC")],
+      [C("stage", lambda r: r[1].stage, "WON"), C("Mercury sells for", lambda r: r[1].csell(0), 1)]),
+    S("Bosses", "Crimson Heart + Astronomer", "a disabled boss gives Astronomer back",
+      """Crimson Heart disabled Astronomer: the held Negative Mercury sells for $4. Selling Luchador
+      disables the boss: Astronomer acts again and the Mercury sells for $1.""",
+      boss("Crimson Heart", jokers=("Astronomer", "Luchador"), joker_debuff=(1, 0),
+           consumables=("Mercury",), cons_ed=(4,), cons_sell=(4,)),
+      [sell(1)],
+      [C("boss disabled", lambda r: r[1].boss_disabled, True), C("Mercury sells for", lambda r: r[1].csell(0), 1)]),
     S("Bosses", "Cerulean Bell", "one card is always selected",
       """Cerulean Bell: one card in hand is forced into every hand played. 2H is forced: play KD
       KC and 2H is played too (a kicker; the Pair scores 60). A new forced card is picked after the

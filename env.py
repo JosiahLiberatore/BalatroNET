@@ -1511,7 +1511,9 @@ def _heart(state, key, prepped):
     joker is disabled, never the one just disabled (unless it is the only joker). A
     disabled Drunkard / Merry Andy takes its discards along (remove_from_deck). The joker
     let go adds its hand size back and the new one takes its own (change_size, one event
-    each): a growth draws at once (a Juggler let go: 1 card; Stuntman disabled: 2)."""
+    each): a growth draws at once (a Juggler let go: 1 card; Stuntman disabled: 2). set_debuff runs
+    add_to_deck / remove_from_deck: an Astronomer let go or disabled sets the prices again
+    (reprice: a held Negative Planet sells for $1 / $4)."""
     on = boss_is(state, BK_HEART) & prepped
     k_pick, k_draw = jax.random.split(key)
     held = state.jokers != J_EMPTY
@@ -1523,7 +1525,7 @@ def _heart(state, key, prepped):
     back = jnp.where(state.joker_debuff, d, 0).sum() - jnp.where(new, d, 0).sum()
     h = _joker_h_size(state)
     grow = jnp.maximum(jnp.where(state.joker_debuff, h, 0).sum(), 0) + jnp.maximum(-jnp.where(new, h, 0).sum(), 0)
-    s = apply_budget(state._replace(joker_debuff=new, discards=jnp.maximum(state.discards + back, 0)))
+    s = reprice(apply_budget(state._replace(joker_debuff=new, discards=jnp.maximum(state.discards + back, 0))), state)
     s = _grow_draw(s, s.hand_size, k_draw, n=grow)
     return tree_where(on & held.any(), s, state)
 
@@ -1597,7 +1599,7 @@ def disable_boss(state, draw_one=True):
     d = JOKERS.D_SIZE[jnp.clip(state.jokers, 0, N_JOKERS - 1)]
     s = s._replace(discards=s.discards + jnp.where(state.joker_debuff, d, 0).sum(),
                    joker_debuff=jnp.zeros(MAX_JOKERS, bool), boss_disabled=jnp.bool_(True))
-    s = apply_budget(s)
+    s = reprice(apply_budget(s), state)                   # Crimson Heart's joker back (Astronomer)
     if draw_one:
         s = tree_where(b == BK_MANACLE, draw(s, jax.random.fold_in(state.key, K_DRAW), n=1), s)
     return tree_where(on, s, state)
@@ -1787,6 +1789,7 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
     nxt = jnp.where(is_boss, BLIND_SMALL, state.blind_index + 1)
     tg = new_targets(k_tg, state)
     kv, kb, kt = jax.random.split(k_ante, 3)
+    pre_clear = state
     state = state._replace(
         tags=compact(jnp.where(invest, -1, state.tags), ~invest & (state.tags >= 0)),
         tag_hand=compact(state.tag_hand, ~invest & (state.tags >= 0)),
@@ -1807,7 +1810,7 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
         deck_ptr=jnp.int32(0),
         key=key,
     )
-    state = apply_budget(state)
+    state = reprice(apply_budget(state), pre_clear)      # defeat: Crimson Heart's joker back (Astronomer)
     new_ante = new_ante_rolls(kb, state)
     # the win ends the run: no new ante, no shop; else the shop opens at Cash Out (k_shop is
     # not used: the cash out has its own keys)
