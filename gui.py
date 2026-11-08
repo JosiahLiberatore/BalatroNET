@@ -80,7 +80,8 @@ from scoring import HAND_NAMES
 from agent import (observe, encode, legal_mask, move_masks, masked_logits, sample_src, sample_dst, sample_picks,
                    pick_query, pick_bounds, uses_picker, init_params, action_name, is_move, OBS_DIM,
                    O_GLOB, N_ACTIONS, ACTION_VERB, ACTION_TARGET, A_PLAY, A_DISCARD, A_BUY, A_SELL,
-                   A_MOVE_JOKER, A_MOVE_CARD, A_REROLL, A_OPEN, A_USE, A_SELL_CONS, A_PICK, A_SKIP)
+                   A_MOVE_JOKER, A_MOVE_CARD, A_REROLL, A_OPEN, A_USE, A_SELL_CONS, A_PICK, A_SKIP,
+                   A_REDEEM)
 from train import load_params, PARAMS_PATH, REWARD_SCALE
 
 GW = 1280                  # the game area; the model panel sits to its right
@@ -1105,6 +1106,9 @@ class App:
             return f"SELL {JOKER_NAMES[jid]} (+${int(h.joker_sell_value[i])})" if jid >= 0 else action_name(a)
         if a == A_REROLL:
             return f"REROLL the boss (${BOSS_REROLL_COST})" if int(h.game_stage) == STAGE_SELECT else f"REROLL (${self.reroll})"
+        if a >= A_REDEEM:
+            v = int(h.shop_vouchers[a - A_REDEEM])
+            return f"REDEEM {VOUCHER_NAMES[v]}" if v >= 0 else action_name(a)
         return action_name(a)
 
     def model_step(self):

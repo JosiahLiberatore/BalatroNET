@@ -40,7 +40,11 @@ BOSS BLINDS act only while their round is on (STAGE_BLIND, STAGE_END) and not di
 function of the boss and the card (card_debuffed), so it needs no state; The
 Pillar reads card_played_ante (a card played in The Pillar's own blind gets no
 mark: the game set the debuff flags at the blind's start). Face-down cards
-(hand_down, joker_down) change nothing in the env: only what a player sees.
+(hand_down, joker_down) change nothing in the env: only what a player sees. Two more
+fields record what a player can know (the agent obs reads them): card_down, the cards the
+deck view still counts as in the deck (a face-down card until it is played or turned face
+up, a discarded one too: ability.wheel_flipped), and joker_seen, a face-down joker that
+showed a message in this round (Amber Acorn).
 
 BUY of a Tarot / Planet when the consumable slots are full is the game's Buy and
 Use: the card is paid and used at once (if it can be used in the shop). With a
@@ -349,8 +353,11 @@ class balatroEnvState(NamedTuple):
     forced_card  : jax.Array   # scalar int32   -- Cerulean Bell: the card always selected (instance, -1)
     card_played_ante : jax.Array # (128,) bool  -- played this ante (The Pillar)
     hand_down    : jax.Array   # (32,) bool     -- lanes drawn face down (Wheel, House, Mark, Fish)
+    card_down    : jax.Array   # (128,) bool    -- the deck view counts it as in the deck: drawn face down
+                               #                   this round and not played or turned up (wheel_flipped)
     joker_debuff : jax.Array   # (32,) bool     -- Crimson Heart: the disabled joker
     joker_down   : jax.Array   # (32,) bool     -- Amber Acorn: face-down jokers
+    joker_seen   : jax.Array   # (32,) bool     -- a face-down joker that showed a message this round
 
     # skips and tags
     blind_tags   : jax.Array   # (2,) int32     -- the tag of the Small / Big Blind this ante
@@ -848,8 +855,22 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     nxt, _, _ = jax.lax.switch(branch, _HANDLERS, state, action)
     go_end = legal & (verb == V_NEXT) & (state.game_stage == STAGE_END)
     nxt, reward, over = _settle(nxt, legal & (verb == V_PLAY), go_end)
+    nxt = _track_down(nxt)
     was_over = (state.game_stage == STAGE_LOST) | (state.game_stage == STAGE_WON)
     return nxt, reward, over & ~was_over
+
+
+def _track_down(state):
+    """card_down: + the face-down cards in the hand, - the face-up ones (drawn face up, or
+    turned up when the boss is disabled), - the destroyed ones; nothing after a round (the
+    round end clears ability.wheel_flipped; a lost run keeps its last hand as it was). A
+    discarded face-down card stays."""
+    on = lambda m: jnp.zeros(MAX_DECK_SIZE, bool).at[jnp.where(m, state.hand, MAX_DECK_SIZE)].set(True, mode="drop")
+    down = on(state.hand_valid & state.hand_down)
+    up = on(state.hand_valid & ~state.hand_down)
+    stage = state.game_stage
+    in_round = (stage == STAGE_BLIND) | (stage == STAGE_END) | (stage == STAGE_LOST) | (stage == STAGE_WON)
+    return state._replace(card_down=((state.card_down | down) & ~up & state.card_live) & in_round)
 
 
 def _no_change(state):
@@ -875,6 +896,7 @@ def remove_jokers(state: balatroEnvState, gone) -> balatroEnvState:
         joker_ed=compact(jnp.where(gone, ED_NONE, state.joker_ed), keep),
         joker_debuff=compact(state.joker_debuff & ~gone, keep),
         joker_down=compact(state.joker_down & ~gone, keep),
+        joker_seen=compact(state.joker_seen & ~gone, keep),
         joker_sticker=compact(jnp.where(gone, 0, state.joker_sticker), keep),
         joker_perish=compact(jnp.where(gone, 0, state.joker_perish), keep),
         discards=jnp.maximum(state.discards - lost_d, 0),
@@ -1475,7 +1497,9 @@ def _discard_cards(state, cards, valid, hook, key):
     trading = (n_trading > 0) & first_discard & (valid.sum() == 1)
     idx = jnp.where(valid, cards, MAX_DECK_SIZE)
     gone = jnp.zeros(MAX_DECK_SIZE, bool).at[idx].set(valid & trading, mode="drop")
+    changed = (dsc.joker_value != state.joker_value) | (dsc.joker_state != state.joker_state)
     s = state._replace(joker_value=dsc.joker_value, joker_state=dsc.joker_state,
+                       joker_seen=state.joker_seen | (state.joker_down & changed),
                        money=state.money + jnp.floor(dsc.money + 3 * n_trading * trading).astype(jnp.int32),
                        hand_level=state.hand_level.at[dhand].add(burnt))
     s = spawn_cons(s, CK_TAROT, purple, key)
@@ -1613,7 +1637,7 @@ def disable_boss(state, draw_one=True):
         hands=jnp.maximum(state.hands + jnp.where(b == BK_NEEDLE, state.boss_sub, 0), 0),
         blind_target=blind_target(state.ante, BLIND_BOSS, run_scale(state), b, True, state.stake),
         forced_card=jnp.int32(-1), hand_down=jnp.zeros(MAX_HAND_SIZE, bool),
-        joker_down=jnp.zeros(MAX_JOKERS, bool),
+        joker_down=jnp.zeros(MAX_JOKERS, bool), joker_seen=jnp.zeros(MAX_JOKERS, bool),
     )
     d = JOKERS.D_SIZE[jnp.clip(state.jokers, 0, N_JOKERS - 1)]
     s = s._replace(discards=s.discards + jnp.where(state.joker_debuff, d, 0).sum(),
@@ -1658,6 +1682,8 @@ def _blind_action(state: balatroEnvState, action: balatroAction):
     played = pre._replace(
         hands=jnp.maximum(pre.hands - 1, 0),            # a PLAY at 0 hands (The Needle's disable)
         hand_valid=pre.hand_valid & ~res.sel, hand_down=pre.hand_down & ~res.sel,
+        card_down=pre.card_down & ~on(res.valid),        # played: turned face up (Card:flip)
+        joker_seen=pre.joker_seen | (pre.joker_down & out.acted),
         chips_scored=jnp.minimum(pre.chips_scored, INT32_MAX - res.score) + res.score,   # no int32 wrap
         joker_value=out.joker_value, joker_state=out.joker_state,
         money=info["money"] + jnp.floor(out.money).astype(jnp.int32),
@@ -1828,7 +1854,9 @@ def _clear_blind(state: balatroEnvState, saved=False) -> balatroEnvState:
         ancient_suit=tg.ancient_suit, castle_suit=tg.castle_suit,
         hand_valid=jnp.zeros(MAX_HAND_SIZE, bool), hand=jnp.full(MAX_HAND_SIZE, -1, jnp.int32),
         hand_down=jnp.zeros(MAX_HAND_SIZE, bool), forced_card=jnp.int32(-1),
+        card_down=jnp.zeros(MAX_DECK_SIZE, bool),
         joker_debuff=jnp.zeros(MAX_JOKERS, bool), joker_down=jnp.zeros(MAX_JOKERS, bool),
+        joker_seen=jnp.zeros(MAX_JOKERS, bool),
         round_hand_bonus=jnp.int32(0), boss_disabled=jnp.bool_(False),
         deck_ptr=jnp.int32(0),
         key=key,
@@ -1973,6 +2001,7 @@ def acquire(state: balatroEnvState, jid, ed=ED_NONE, sticker=0) -> tuple[balatro
         joker_ed=state.joker_ed.at[dest].set(ed),
         joker_debuff=state.joker_debuff.at[dest].set(False),
         joker_down=state.joker_down.at[dest].set(False),
+        joker_seen=state.joker_seen.at[dest].set(False),
         joker_sticker=state.joker_sticker.at[dest].set(sticker),
         joker_perish=state.joker_perish.at[dest].set(jnp.where(has_sticker(sticker, STK_PERISH), PERISH_ROUNDS, 0)),
         free_rerolls=state.free_rerolls + (jid == J_CHAOS),
@@ -2701,6 +2730,7 @@ def _start_blind(state):
         blind_target=blind_target(state.ante, state.blind_index, run_scale(state), b, stake=state.stake),
         hands=state.handcount, discards=state.discardcount, discards_used=jnp.int32(0),
         hand_round=jnp.zeros(N_HAND_TYPES, jnp.int32), hand_down=jnp.zeros(MAX_HAND_SIZE, bool),
+        card_down=jnp.zeros(MAX_DECK_SIZE, bool), joker_seen=jnp.zeros(MAX_JOKERS, bool),
         joker_debuff=jnp.zeros(MAX_JOKERS, bool), joker_down=jnp.zeros(MAX_JOKERS, bool),
         shop_slots=jnp.full(MAX_SHOP_SLOTS, -1, jnp.int32), pack_slots=jnp.full(PACK_SLOTS, -1, jnp.int32),
         shop_sticker=jnp.zeros(MAX_SHOP_SLOTS, jnp.int32), key=key)
@@ -2727,6 +2757,7 @@ def _start_blind(state):
     shuffled = s._replace(jokers=s.jokers[perm], joker_value=s.joker_value[perm], joker_state=s.joker_state[perm],
                           joker_sell_value=s.joker_sell_value[perm], joker_ed=s.joker_ed[perm],
                           joker_debuff=s.joker_debuff[perm], joker_down=s.joker_down[perm],
+                          joker_seen=s.joker_seen[perm],
                           joker_sticker=s.joker_sticker[perm], joker_perish=s.joker_perish[perm])
     s = tree_where(boss_is(s, BK_ACORN), shuffled, s)
     # Chicot (not a copy): the boss is off before the first draw
@@ -2799,6 +2830,7 @@ def _move_joker(state: balatroEnvState, action: balatroAction):
         joker_ed=state.joker_ed[perm],
         joker_debuff=state.joker_debuff[perm],
         joker_down=state.joker_down[perm],
+        joker_seen=state.joker_seen[perm],
         joker_sticker=state.joker_sticker[perm],
         joker_perish=state.joker_perish[perm],
     )
@@ -2880,7 +2912,9 @@ def run_fields():
         boss_disabled=jnp.bool_(False), boss_hand=jnp.int32(-1), ox_hand=jnp.int32(N_HAND_TYPES - 1),
         boss_sub=jnp.int32(0), forced_card=jnp.int32(-1),
         card_played_ante=jnp.zeros(MAX_DECK_SIZE, bool), hand_down=jnp.zeros(MAX_HAND_SIZE, bool),
+        card_down=jnp.zeros(MAX_DECK_SIZE, bool),
         joker_debuff=jnp.zeros(MAX_JOKERS, bool), joker_down=jnp.zeros(MAX_JOKERS, bool),
+        joker_seen=jnp.zeros(MAX_JOKERS, bool),
         blind_tags=jnp.full(2, -1, jnp.int32), orbital_hands=jnp.full(2, N_HAND_TYPES - 1, jnp.int32),
         tags=jnp.full(MAX_TAGS, -1, jnp.int32), tag_hand=jnp.zeros(MAX_TAGS, jnp.int32),
         skips=jnp.int32(0), unused_discards=jnp.int32(0), pack_return=jnp.int32(STAGE_SHOP),
@@ -3160,6 +3194,12 @@ def invariant_errors(state: balatroEnvState):
         ("no duplicate valid card in hand",
          len([hand[i] for i in range(MAX_HAND_SIZE) if valid[i]]) == len({hand[i] for i in range(MAX_HAND_SIZE) if valid[i]})),
         ("a face-down lane holds a card", all(valid[i] for i in range(MAX_HAND_SIZE) if bool(state.hand_down[i]))),
+        ("a face-down lane's card is hidden in the deck view (card_down)",
+         all(bool(state.card_down[hand[i]]) for i in range(MAX_HAND_SIZE) if valid[i] and bool(state.hand_down[i]))),
+        ("a face-up lane's card is not card_down",
+         not any(bool(state.card_down[hand[i]]) for i in range(MAX_HAND_SIZE) if valid[i] and not bool(state.hand_down[i]))),
+        ("joker_seen only on a face-down joker",
+         not any(bool(state.joker_seen[i]) and not bool(state.joker_down[i]) for i in range(MAX_JOKERS))),
         ("hands / discards not negative", int(state.hands) >= 0 and int(state.discards) >= 0),
         ("money not far below the Credit Card limit (The Tooth can take more)",
          int(state.money) >= -CREDIT_DEBT * sum(j == J_CREDIT for j in jokers) - 200),

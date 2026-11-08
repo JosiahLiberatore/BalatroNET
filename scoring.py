@@ -409,6 +409,8 @@ class PlayOut(NamedTuple):
     dna_n       : jax.Array   # scalar int: DNA copies made (they were held cards in this hand)
     dna_mark    : jax.Array   # (J,) bool: copy k has The Pillar mark (no Midas / Vampire touched card 0 first)
     reset       : jax.Array   # (5,) bool: Midas Mask / Vampire touched the card (its The Pillar mark goes)
+    acted       : jax.Array   # (J,) bool: the slot showed a message in this hand (a chip / mult / $ / X
+                              #   effect, a retrigger, a counter change, its edition): Amber Acorn's reveal
 
 
 def effective(ids, joker_value, joker_state):
@@ -735,11 +737,21 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
     n = jnp.clip(half, 0, 46340).astype(jnp.int32)                      # 46340^2 < 2^31
     score = jnp.where(plasma, jnp.where(half > 46340, jnp.int32(SCORE_CAP), n * n), score)
     perma = hike_rep.sum(axis=1)
+    # the slots that showed a message (card_eval_status_text / juice_up): an effect on a scored or
+    # held card, a retrigger, the main effect, To Do / Space / DNA / Midas in BEFORE, a counter
+    # change (Green Joker, Ice Cream ...), the joker's edition
+    rep_on = (m_card & (retrig & (rep_n > 0))[:, None] & live_sc[None, :]).any(axis=1)
+    mime_on = (m_held & mime[:, None] & had[None, :]).any(axis=1)
+    main_on = main & ((mc != 0) | (mm != 0) | (mx != 1) | (md != 0) | (spawn_kind >= 0))
+    before_on = before | (space & space_roll) | dna_on | (eok & (erows.EFFECT == E_MIDAS) & reset.any())
+    acted = active & (on.any(axis=(0, 1)) | hon.any(axis=(0, 1)) | rep_on | mime_on | main_on | before_on
+                      | (value != p.joker_value) | (joker_ed == ED_FOIL) | (joker_ed == ED_HOLO)
+                      | (joker_ed == ED_POLY))
     out = PlayOut(ht, sc, base_chips, base_mult, chips, mult, score, money, value, gone,
                   played, in_round, reps, roll, hroll, rnd, enh, broken, perma, level_up,
                   spawn.astype(jnp.int32), jnp.stack([lucky_m, lucky_d], axis=-1), lucky_hits,
                   glass_roll, space_roll, dna_enh, p.joker_state, spawn_kind, triggered,
-                  dna_n, dna_mark, reset)
+                  dna_n, dna_mark, reset, acted)
 
     # a debuffed hand (The Psychic / The Eye / The Mouth): 0 chips x 0 mult; no BEFORE, no card,
     # no joker effect but Matador's $ (copies too); the AFTER step still acts
@@ -755,7 +767,8 @@ def play(p: PlayIn, mods: RuleMods, key, sell=None) -> PlayOut:
         reps=jnp.zeros_like(reps), enh=enh0, broken=z5, perma=jnp.zeros_like(perma),
         level_up=jnp.int32(0), tarots=jnp.int32(0), lucky_hits=jnp.zeros_like(lucky_hits),
         dna_n=jnp.int32(0), reset=z5,
-        spawn_kind=jnp.full(J, -1, jnp.int32))
+        spawn_kind=jnp.full(J, -1, jnp.int32),
+        acted=active & ((d_value != p.joker_value) | matador))
     return jax.tree.map(lambda a, b: jnp.where(hand_debuffed, a, b), dead, out)
 
 

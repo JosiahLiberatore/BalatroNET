@@ -222,7 +222,8 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
           hand_level=(), last_hand=-1, last_cons=-1, tarots_used=0, planets_used=(),
           shop_kind=(), shop_ed=(), pack_slots=(EMPTY, EMPTY), buffoon_given=True, cons_sell=None,
           boss=-1, boss_disabled=False, vouchers=(), tags=(), tag_hand=(), blind_tags=(EMPTY, EMPTY),
-          skips=0, played_ante=(), forced_card=None, hand_down=(), joker_debuff=(), ante_voucher=-1,
+          skips=0, played_ante=(), forced_card=None, hand_down=(), joker_debuff=(), joker_down=(), joker_seen=(),
+          ante_voucher=-1,
           shop_vouchers=(), cons_ed=(), ecto_minus=1, boss_hand=-1, ox_hand=None, unused_discards=0,
           round_hand_bonus=0, pack_return=None, shop_free=(), pack_free=(), shop_rank=(), shop_suit=(),
           shop_enh=(), bosses_used=(), boss_rerolled=False, boss_sub=0, orbital_hands=(11, 11),
@@ -254,6 +255,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
     vouchers    redeemed voucher names; tags: held tag names (tag_hand: an Orbital Tag's hand)
     played_ante card names played this ante (The Pillar); forced_card: Cerulean Bell's card
     hand_down / joker_debuff  lanes / slots (0/1 lists): face down / disabled by Crimson Heart
+    joker_down / joker_seen   slots (0/1 lists): face down (Amber Acorn) / face down and seen
     shop_vouchers voucher names in the shop; ante_voucher: this ante's voucher (a name or -1)
     reroll_inc / reroll_d6  paid rerolls in this shop / a D6 Tag made them start at $0
     stake       1 White .. 8 Gold (the Eternal / Perishable / Rental stickers need stake 4 / 7 / 8)
@@ -334,6 +336,9 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         if played_ante else rf["card_played_ante"],
         forced_card=jnp.int32(-1 if forced_card is None else card_id(forced_card)),
         hand_down=mask_lanes(hand_down), joker_debuff=mask_lanes(joker_debuff, MAX_JOKERS),
+        card_down=jnp.zeros(MAX_DECK_SIZE, bool).at[jnp.where(mask_lanes(hand_down) & mask_lanes(valid),
+                                                              lanes(ids), MAX_DECK_SIZE)].set(True, mode="drop"),
+        joker_down=mask_lanes(joker_down, MAX_JOKERS), joker_seen=mask_lanes(joker_seen, MAX_JOKERS),
         ante_voucher=jnp.int32(named(VOUCHER_ID, ante_voucher)),
         shop_vouchers=lanes([named(VOUCHER_ID, v) for v in shop_vouchers], MAX_SHOP_VOUCHERS),
         cons_ed=lanes(list(cons_ed), MAX_CONSUMABLES, 0), ecto_minus=jnp.int32(ecto_minus),

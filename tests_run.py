@@ -736,6 +736,8 @@ def run_picker_test(n_envs=256, seed=11):
     c.check("no cards: logp 0, entropy 0", abs(float(lp)) < 1e-6 and abs(float(ent)) < 1e-6, float(lp), float(ent))
 
     states = jax.vmap(lambda k: reset(k, 52, 8, 0.05))(jax.random.split(k3, n_envs))
+    nxt = balatroAction(jnp.int32(V_NEXT), NO_CARDS, jnp.int32(0), jnp.int32(0))
+    states = jax.vmap(lambda s: env_step(s, nxt)[0])(states)            # the blind select -> the blind
     cons = jnp.asarray(np.random.default_rng(seed).integers(0, 22, (n_envs, 2)), jnp.int32)
     states = states._replace(consumables=states.consumables.at[:, :2].set(cons),
                              cons_sell=states.cons_sell.at[:, :2].set(1))
@@ -860,11 +862,83 @@ def run_embed_test(seed=21):
     return c.done()
 
 
+def run_hidden_obs_test():
+    """The obs shows only what a player can know. A face-down card has no card features, only
+    the cards it can be: between its face-up neighbours in the rank sort and the suit sort, and
+    in the deck view; two hands a player cannot tell apart give the same obs. Hidden jokers
+    (Amber Acorn) have no slot order; a seen one shows its id. A shop playing card has no item id
+    (it was read as The Fool); a Spectral pack shows its cards, and a picked Aura takes 1 card."""
+    from agent import (observe, lane_feats, hand_feats, joker_ids, pick_bounds, legal_mask, action_name,
+                       I_SHOP, I_PACK, I_HID, ID_N, O_SHOP, SHOP_F, A_PICK, A_NEXT, A_SKIP, A_REROLL,
+                       N_ACTIONS, LANE_C)
+    from env import STAGE_SHOP, STAGE_PACK, STAGE_SELECT, MAX_SHOP_SLOTS
+    from items import IK_CARD, CONS_ID, PACK_KIND, PK_SPECTRAL
+    from fixtures import card_id
+    c = Checks("hidden obs")
+    # Sort Rank: KS [QH] 9H 7C 7D 4S 3H 2C -> KH KC KD, any Q J T, 9S; Sort Suit: KS 4S [QH] 9H 3H
+    # 7C 2C 7D -> 3S 2S, AH .. TH. Both: KH QH JH TH (all in the deck view: QH is the hidden one)
+    a = state(hand="KS QH 9H 7C 7D 4S 3H 2C", hand_down=(0, 1))
+    oa = np.asarray(observe(a))
+    ln = np.asarray(lane_feats(oa))
+    c.eq("face-down lane: no card features", float(np.abs(np.asarray(hand_feats(oa))[1]).sum()), 0.0)
+    c.eq("lane flags (present, down, debuffed, forced)", ln[1, :4], [1, 1, 0, 0])
+    c.eq("the cards it can be", sorted(np.nonzero(ln[1, 4:])[0].tolist()),
+         sorted(card_id(x) for x in ("KH", "QH", "JH", "TH")))
+    c.eq("not a Stone Card", ln[1, 4 + 52], 0)
+    c.eq("a face-up lane has no possible cards", float(ln[0, 4:].sum()), 0.0)
+    b = state(hand="KS KH 9H 7C 7D 4S 3H 2C", hand_down=(0, 1))
+    c.check("hidden QH or hidden KH: the same obs", np.array_equal(oa, np.asarray(observe(b))))
+    up = state(hand="KS QH 9H 7C 7D 4S 3H 2C")
+    c.check("the same hand face up: another obs", not np.array_equal(oa, np.asarray(observe(up))))
+    stone = state(hand="KS 9H 7C 2D", hand_down=(0, 0, 0, 1), cards_mod={"2D": dict(enh=6)})
+    ls = np.asarray(lane_feats(observe(stone)))
+    c.eq("a face-down card below every face-up card can be a Stone Card", ls[3, 4 + 52], 1)
+    # (2D itself is the Stone Card, so no plain 2D is in the deck view)
+    c.eq("... or a card below 7C in both sorts", sorted(np.nonzero(ls[3, 4:4 + 52])[0].tolist()),
+         sorted([card_id(r + "D") for r in "34567"] + [card_id(r + "C") for r in "23456"]))
+
+    names = ("Joker", "Bull", "Banner")
+    j1 = state(hand="KD KC 2H 3S 4C 6D 7H 8S", jokers=names, joker_down=(1, 1, 1))
+    j2 = state(hand="KD KC 2H 3S 4C 6D 7H 8S", jokers=names[::-1], joker_down=(1, 1, 1))
+    o1 = np.asarray(observe(j1))
+    c.check("hidden jokers: no slot order in the obs", np.array_equal(o1, np.asarray(observe(j2))))
+    c.eq("hidden jokers: no slot ids", np.asarray(joker_ids(o1))[:3], [-1, -1, -1])
+    c.eq("the hidden set", sorted(int(x) - 1 for x in o1[I_HID:ID_N] if x > 0), sorted(JOKER_ID[n] for n in names))
+    seen = np.asarray(observe(state(hand="KD KC 2H 3S 4C 6D 7H 8S", jokers=names, joker_down=(1, 1, 1),
+                                    joker_seen=(0, 1, 0))))
+    c.eq("a seen joker shows its id", np.asarray(joker_ids(seen))[:3], [-1, JOKER_ID["Bull"], -1])
+
+    sh = state(hand="", hand_size=8, deck_ptr=0, game_stage=STAGE_SHOP, money=10, shop_slots=(0,),
+               shop_kind=(IK_CARD,), shop_rank=(11,), shop_suit=(2,), shop_enh=(1,), shop_size=2)
+    osh = np.asarray(observe(sh))
+    sf = osh[O_SHOP:O_SHOP + MAX_SHOP_SLOTS * SHOP_F].reshape(MAX_SHOP_SLOTS, SHOP_F)
+    c.eq("a shop playing card: no item id", int(osh[I_SHOP]), 0)
+    c.eq("a shop playing card: present", sf[0, 0], 1)
+    c.eq("a shop playing card: rank K, suit Hearts, Bonus", [int(np.argmax(sf[0, 16:29])), int(np.argmax(sf[0, 29:33])),
+                                                            int(np.argmax(sf[0, 33:]))], [11, 2, 1])
+    spid = int(np.flatnonzero(np.asarray(PACK_KIND) == PK_SPECTRAL)[0])
+    aura = CONS_ID["Aura"]
+    pk = state(hand="KD KC 2H 3S 4C 6D 7H 8S")._replace(
+        game_stage=jnp.int32(STAGE_PACK), pack_id=jnp.int32(spid), pack_left=jnp.int32(1),
+        pack_items=jnp.array([aura, CONS_ID["Hex"], -1, -1, -1], jnp.int32))
+    c.eq("a Spectral pack shows its cards", int(np.asarray(observe(pk))[I_PACK]) - 1, N_JOKERS + aura)
+    c.eq("PICK Aura from a Spectral pack takes 1 card", [int(x) for x in pick_bounds(pk, jnp.int32(A_PICK))], [1, 1])
+
+    at_select = lambda **kw: state(hand="", hand_size=8, deck_ptr=0, game_stage=STAGE_SELECT, **kw)
+    legal = np.asarray(legal_mask(at_select(blind_index=0)))
+    names = [action_name(i) for i in range(N_ACTIONS) if legal[i]]
+    c.check("the blind select: NEXT and SKIP", names == ["NEXT", "SKIP"], names)
+    legal = np.asarray(legal_mask(at_select(blind_index=2, vouchers=("Director's Cut",), money=10)))
+    c.eq("the boss select with Director's Cut: REROLL and NEXT, no SKIP",
+         [bool(legal[A_REROLL]), bool(legal[A_NEXT]), bool(legal[A_SKIP])], [True, True, False])
+    return c.done()
+
+
 ALL = [run_repair_test, run_deal_empty_test, run_blind_end_test, run_targets_test,
        run_shop_test, run_explain_test, run_vmap_determinism_test, run_full_run_test,
        run_move_reach_test, run_fuzz_test]
 # the agent tests are not in the default run (env work); python tests_run.py agent runs them
-AGENT = [run_legal_mask_test, run_picker_test, run_embed_test]
+AGENT = [run_hidden_obs_test, run_legal_mask_test, run_picker_test, run_embed_test]
 
 
 def run_all():

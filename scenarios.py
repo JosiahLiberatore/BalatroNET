@@ -413,6 +413,15 @@ class View:
     def jdown(self, i):
         return bool(self.h.joker_down[i])
 
+    def jseen(self, i):
+        """A face-down joker that showed a message this round (env joker_seen)."""
+        return bool(self.h.joker_seen[i])
+
+    @property
+    def deck_down(self):
+        """The cards the deck view counts as in the deck while face down (env card_down)."""
+        return [self.card(i).name for i in range(len(self.h.card_down)) if bool(self.h.card_down[i])]
+
     def ced(self, i):
         return ED_NAMES[int(self.h.cons_ed[i])] or "none"
 
@@ -3787,8 +3796,63 @@ DECKS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# WHAT A PLAYER SEES (env card_down, joker_seen; the agent obs reads them)
+# ---------------------------------------------------------------------------
+HW = "KD KC 2C 3S 4D 6D 7H 8S"      # 2C is face down below (lane 2)
+
+HIDDEN = [
+    S("Bosses", "The Wheel", "a discarded face-down card stays hidden in the deck view",
+      """The Wheel: 2C is face down. Discard 2C 3S: the game keeps ability.wheel_flipped on a
+      discarded card until the round ends, so the deck view still counts 2C as in the deck (with
+      a "?"). 3S was face up: it is not.""",
+      boss("The Wheel", hand=HW, hand_down=(0, 0, 1)),
+      [discard("2C 3S")],
+      [C("hidden before", lambda r: r[0].deck_down, ["2C"]),
+       C("2C hidden after the discard", lambda r: "2C" in r[1].deck_down, True),
+       C("3S hidden after the discard", lambda r: "3S" in r[1].deck_down, False)]),
+    S("Bosses", "The Wheel", "a played face-down card is turned face up",
+      """The Wheel: 2C is face down. Play KD KC 2C: the played cards are turned face up (Card:flip
+      clears wheel_flipped), so 2C is no longer hidden.""",
+      boss("The Wheel", hand=HW, hand_down=(0, 0, 1)),
+      [play("KD KC 2C")],
+      [C("2C hidden after the hand", lambda r: "2C" in r[1].deck_down, False)]),
+    S("Bosses", "The Wheel", "the end of the round shows every card",
+      """The Wheel: discard the face-down 2C, then beat the blind. The round end clears
+      wheel_flipped on every card: nothing is hidden on the cash-out screen.""",
+      boss("The Wheel", hand=HW, hand_down=(0, 0, 1), clear=True),
+      [discard("2C"), play("KD KC")],
+      [C("2C hidden after the discard", lambda r: "2C" in r[1].deck_down, True),
+       C("stage", lambda r: r[2].stage, "CASH OUT"), C("hidden at the cash out", lambda r: r[2].deck_down, [])]),
+    S("Bosses", "Amber Acorn", "a joker that acts in a hand is seen",
+      """Amber Acorn: the 3 jokers are face down. Play KC KS (no Diamond) with $0: Joker shows
+      +4 Mult, so the player can tell its slot; Greedy Joker (no Diamond) and Bull ($0: +0 chips)
+      show nothing and stay unknown.""",
+      boss("Amber Acorn", hand="KC KS 2H 3S 4C 6H 7H 8S", jokers=("Joker", "Greedy Joker", "Bull"),
+           joker_down=(1, 1, 1), money=0),
+      [play("KC KS")],
+      [C("seen", lambda r: [r[1].jseen(i) for i in range(3)], [True, False, False]),
+       C("face down", lambda r: [r[1].jdown(i) for i in range(3)], [True] * 3)]),
+    S("Bosses", "Amber Acorn", "a joker whose counter changes on a discard is seen",
+      """Amber Acorn: Green Joker (+2 Mult) and Bull are face down. A discard takes 1 Mult from
+      Green Joker (a message on it), so it is seen; Bull stays unknown.""",
+      boss("Amber Acorn", jokers=("Green Joker", "Bull"), joker_value=(2.0, 2.0), joker_down=(1, 1)),
+      [discard("2H")],
+      [C("Green Joker", lambda r: r[1].jv(0), 1.0),
+       C("seen", lambda r: [r[1].jseen(i) for i in range(2)], [True, False])]),
+    S("Bosses", "Amber Acorn", "the end of the round turns the jokers face up",
+      """Amber Acorn: beat the blind (ante 8: the run is won). At the end of the round the jokers
+      are face up again, and none is marked as seen.""",
+      boss("Amber Acorn", jokers=("Joker", "Bull"), joker_down=(1, 1), clear=True),
+      [play("KD KC")],
+      [C("stage", lambda r: r[1].stage, "WON"),
+       C("face down", lambda r: [r[1].jdown(i) for i in range(2)], [False, False]),
+       C("seen", lambda r: [r[1].jseen(i) for i in range(2)], [False, False])]),
+]
+
+
 SCENARIOS = (JOKERS + NEW_JOKERS + TAROTS + PLANETS + SPECTRALS + PACKS + SPECTRAL_PACKS + CARDS + BOSSES + TAGS
-             + VOUCHERS + RULES + SELECT_RULES + STAKES + ROUND_END + DECKS)
+             + VOUCHERS + RULES + SELECT_RULES + STAKES + ROUND_END + DECKS + HIDDEN)
 
 
 # ---------------------------------------------------------------------------

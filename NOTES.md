@@ -576,6 +576,43 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       TESTS: the reference model follows (cash out, targets, scoring, tags, shop kinds, joker
       slots); the soak starts each run with a random deck and checks that Green, Anaglyph, Plasma
       and Ghost acted; 17 new scenarios (Decks).
+- [x] Agent obs v2 + the missing actions (2026-11-08). The obs shows only what a player can see
+      or know; the agent has no memory, so what a player remembers is in the obs too. Training
+      method, reward and env rules unchanged; the deck stays out of the obs (one run per deck).
+      - OBS ERRORS FIXED: a shop playing card read as The Fool (item 0; now no item id, its rank /
+        suit / enhancement in the shop slot); a Spectral pack showed no cards (and PICK of an
+        Aura / Talisman / Deja Vu ... took no card: pick_bounds now reads every consumable pack);
+        face-down cards and jokers showed their real features.
+      - FACE-DOWN CARDS (The House, The Wheel, The Mark, The Fish): the lane shows only present +
+        face down, and the cards it can be (LANE block, 52 + Stone): the game keeps the hand sorted
+        by the real cards (CardArea:sort, get_nominal) and Sort Rank / Sort Suit are free, so the
+        face-up cards next to it in each sort bound it; and the deck view (view_deck) counts a
+        face-down card as still in the deck, so it is one of those cards. The deck block shows the
+        deck view (undealt + face down), not the undealt cards only. Checked: a hidden QH and a
+        hidden KH that a player cannot tell apart give the same obs.
+      - FACE-DOWN JOKERS (Amber Acorn): a slot shows only present + hidden; the hidden jokers' ids
+        go in a sorted list (no slot order) that the GLOBAL token sums (what the player saw before
+        the blind). A slot shows its joker after it shows a message in a hand or a discard.
+      - ENV (no rule change; what a player can know): card_down (128,) = ability.wheel_flipped (set
+        when drawn face down, cleared when played / turned up / at the round end; a discarded
+        face-down card stays: env._track_down after each step); joker_seen (32,) (moves with the
+        jokers like joker_down; set from scoring.PlayOut.acted on a PLAY, from a counter change on
+        a discard; cleared with joker_down). 3 new state invariants.
+      - NEW OBS: the stage SELECT; the boss (disabled, rerolled, can reroll, The Mouth / The Ox
+        hands); the 3 blinds' targets and rewards; the skip tags (+ Orbital hands), the held tags,
+        skips; the redeemed vouchers; the shop vouchers (tokens: Ev embedding, cost, affordable);
+        the last consumable used (The Fool); per lane debuffed and Cerulean Bell's card; per joker
+        slot Crimson Heart's disable; per consumable Negative and sell value; consumable room.
+      - ACTIONS: N_ACTIONS 54 -> 70: REDEEM x4 (token-scored); K_CONS 2 -> 8 (USE / SELL_CONS x8);
+        the blind select is in the legal mask: NEXT plays, SKIP (Small / Big) takes the tag,
+        REROLL rerolls the boss (Director's Cut / Retcon, $10), SELL / USE / SELL_CONS / MOVE_JOKER.
+      - SIZES: OBS_DIM 2301 -> 4137 (the LANE block is 20 x 57); tokens 50 -> 60; params 534k ->
+        659k. Old params do not load: retrain fresh.
+      - train.py logs run_skips and run_redeems.
+      TESTS: tests_run agent: run_hidden_obs_test (new: the sort bounds, Stone, the same-obs check,
+      hidden joker order, a seen joker, the shop playing card, the Spectral pack, the blind select);
+      the legal mask test now plays from the blind select (skips, boss rerolls, redeems). 6 new
+      scenarios (Bosses: The Wheel x3, Amber Acorn x3).
 - [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
 - [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
 
@@ -634,12 +671,15 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
   ante's boss and tags are rolled at the end of the round, not at Cash Out (nothing on the
   cash-out screen changes them)
 - at most 4 vouchers in one shop (the ante's voucher and 3 from Voucher Tags; more are dropped)
-- face-down cards and jokers (boss blinds): in the env state (hand_down, joker_down) since
-  2026-11-02, but the obs does not hide them yet (agent work). The plan: state keeps true rank/suit
-  (env must score them), obs gets a face_down flag and zeroes that card's rank/suit lanes -> POMDP.
-  The sort-inference trick is faithful FOR FREE: SORT reorders using ground truth, obs shows lane
-  order, so a hidden card's position between visible cards leaks the same rank interval the
-  animation leaks to a human. Only the pixels are lost, not the information.
+- the agent sees 8 consumable slots (K_CONS; the env holds up to 16: more Negatives are not
+  usable by the agent)
+- face-down obs (2026-11-08): a tie of two identical cards in a sort goes by the instance order
+  (the game: unique_val); the obs gives the same bounds a player gets from both sort buttons,
+  but not the order of two face-down cards next to each other
+- Amber Acorn's reveal (2026-11-08): a slot shows its joker after any message; the game shows
+  only the message, so two jokers with the same message can look alike there. A discard reveals
+  only a counter change (not a joker's $ on a discard: Mail-In Rebate, Faceless Joker); a message
+  at the blind select or the round end reveals nothing (the round end turns them up anyway)
 
 ## v0.2 joker/scoring engine — PROVISIONAL spec
 Source: jokers_checklist.xlsx (150-joker taxonomy) + jax-learn lessons 30/31/37/38/39/43/44/45.

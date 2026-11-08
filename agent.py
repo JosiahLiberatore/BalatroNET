@@ -5,54 +5,72 @@ flat masked action vector ... one head, one policy, phase-masked"):
 
     index   0                PLAY        (+ the card picker)
             1                DISCARD     (+ the card picker)
-            2 .. 5           BUY shop slot 0..3 (a joker, a Tarot or a Planet)
+            2 .. 5           BUY shop slot 0..3 (a joker, a Tarot / Planet / Spectral card, a playing card)
             6 .. 37          SELL joker slot 0..31
             38               MOVE_JOKER  (+ the joker src / dst pointer heads)
             39               MOVE_CARD   (+ the card src / dst pointer heads)
-            40               REROLL
-            41               NEXT
+            40               REROLL      (the shop; at the blind select: the boss)
+            41               NEXT        (leave the shop / the cash out / END; at the blind select: play it)
             42 .. 43         OPEN pack slot 0..1
-            44 .. 45         USE consumable slot 0..1   (+ the card picker for a card Tarot)
-            46 .. 47         SELL_CONS consumable slot 0..1
-            48 .. 52         PICK pack card 0..4        (+ the card picker for an Arcana Tarot)
-            53               SKIP the pack
+            44 .. 51         USE consumable slot 0..7   (+ the card picker for a card Tarot / Spectral)
+            52 .. 59         SELL_CONS consumable slot 0..7
+            60 .. 64         PICK pack card 0..4        (+ the card picker for an Arcana / Spectral card)
+            65               SKIP        (the pack; at the blind select: the Small / Big Blind, for its tag)
+            66 .. 69         REDEEM shop voucher slot 0..3
 
 plus the card picker, read by PLAY / DISCARD / USE / PICK: given the action, it
 picks lanes one at a time (up to MAX_PICK), each pick conditioned on the cards
 picked so far, or STOP. The action sets the count range [lo, hi]: PLAY and
-DISCARD 1..5, a Tarot its own (The Lovers 1..1, Death 2..2, The Star 1..3), and
-0..0 for anything that takes no cards (the picker then STOPs with p = 1). The
-query is per verb, plus the token of the consumable / pack card being used.
-Then two pointer pairs (src over 32 slots, then dst over 32 slots given src),
-read only by the MOVE verbs. legal_mask() and move_masks() mask every choice
-the env would turn into a no-op.
+DISCARD 1..5, a Tarot / Spectral its own (The Lovers 1..1, Death 2..2, The Star
+1..3, Aura 1..1), and 0..0 for anything that takes no cards (the picker then
+STOPs with p = 1). The query is per verb, plus the token of the consumable /
+pack card being used. Then two pointer pairs (src over 32 slots, then dst over
+32 slots given src), read only by the MOVE verbs. legal_mask() and move_masks()
+mask every choice the env would turn into a no-op.
 
-OBS LAYOUT — a union of DISJOINT blocks, in this order (offsets O_*):
-    IDS         item id + 1 per held joker (32), shop slot (4), consumable slot (2), pack card (5),
-                then pack id + 1 per pack slot (2); 0 = empty. An item id is a joker id, or
-                N_JOKERS + a consumable id.
-    JOKER SLOT  per held slot: live value, sell value, To Do hand, Loyalty phase, edition, the
-                stickers (Eternal, Perishable + its rounds left / 5, Rental)
-    CARDS       per hand lane: rank, suit, enhancement, edition, seal, perma chips
-    SHOP SLOT   per shop slot: cost, affordable, kind, edition, a joker's stickers (0 outside the shop)
+OBS LAYOUT — a union of DISJOINT blocks, in this order (offsets O_*). The obs shows only what a
+player can see or know (the agent has no memory, so what a player remembers is in it too):
+    IDS         item id + 1 per held joker (32), shop slot (4), consumable slot (8), pack card (5),
+                then pack id + 1 per pack slot (2), voucher id + 1 per shop voucher slot (4), and the
+                hidden jokers' ids (16, sorted: no slot order); 0 = empty. An item id is a joker id,
+                or N_JOKERS + a consumable id. A face-down joker (Amber Acorn) has no id in its
+                slot until it shows a message (env joker_seen); the hidden set is what the player
+                saw before the blind. A shop / pack playing card has no item id (its features).
+    JOKER SLOT  per held slot: present, hidden, disabled (Crimson Heart); then (0 for a hidden one)
+                live value, sell value, To Do hand, Loyalty phase, edition, the stickers
+                (Eternal, Perishable + its rounds left / 5, Rental)
+    CARDS       per hand lane: rank, suit, enhancement, edition, seal, perma chips (0 face down)
+    LANE        per hand lane (C_TOK): present, face down, debuffed, Cerulean Bell's card; a
+                face-down card's possible cards (52 + Stone): between its face-up neighbours in
+                the rank sort and in the suit sort (the game sorts the hand by the real cards),
+                and still in the deck view (env card_down)
+    SHOP SLOT   per shop slot: present, cost, affordable, kind (5), edition, a joker's stickers,
+                a playing card's rank, suit, enhancement (0 outside the shop)
     PACK SLOT   per pack slot: cost, affordable                           (0 outside the shop)
     PACK CARD   per pack card: present, a playing card's rank .. seal, a joker's edition and stickers
-    CONS SLOT   per consumable slot: present
-    GLOBAL      money, ante, blind, stage (END and CASH OUT too; the cash out's $ on its screen),
-                scale, the stake, round targets, hand counts and levels,
-                Planets / Tarots used, budget; hands/discards left, chips vs target; the
-                undealt deck (rank x suit, enhancements) and the full deck's enhancements;
-                reroll cost; the open pack's kind and cards left
+    CONS SLOT   per consumable slot: present, Negative, sell value
+    VOUCHER     per shop voucher slot: present, cost, affordable          (0 outside the shop)
+    GLOBAL      money, ante, blind, stage (SELECT, END and CASH OUT too; the cash out's $ on its
+                screen), scale, the stake, round targets, hand counts and levels, Planets / Tarots
+                used, budget; the boss (disabled, rerolled, can reroll, The Mouth / The Ox hands),
+                the 3 blinds' targets and rewards; the skip tags (+ Orbital hands), the held tags,
+                skips; the redeemed vouchers; the last consumable used (The Fool); consumable room;
+                hands/discards left, chips vs target; the deck view's cards (rank x suit,
+                enhancements: the undealt cards and the face-down ones) and the full deck's
+                enhancements; reroll cost; the open pack's kind and cards left
+    The deck (state.back) is not in the obs: each deck is its own training run.
 
-ENCODER — every held joker, shop card, pack slot, pack card, consumable and hand
-lane is one token, plus one GLOBAL token. An item token = E[item] + fixed item
-features @ Wf (one table for jokers, Tarots and Planets, the same in every
-slot); a card token = its card features. Every token adds a learned POSITION
-vector for its slot and a TYPE vector. N_LAYERS pre-LN self-attention layers
-mix the tokens; an empty slot or a hole is never a key. The trunk reads the
-GLOBAL features and the GLOBAL token's output. BUY / SELL / OPEN / USE /
-SELL_CONS / PICK add a score per token, the MOVE pointers score the joker /
-card tokens, and the picker scores the card tokens.
+ENCODER — every held joker, shop card, pack slot, pack card, consumable, shop
+voucher and hand lane is one token, plus one GLOBAL token. An item token = E[item]
++ fixed item features @ Wf (one table for jokers, Tarots, Planets and Spectral
+cards, the same in every slot); a voucher token = Ev[voucher]; a card token = its
+card and lane features. Every token adds a learned POSITION vector for its slot
+and a TYPE vector; the GLOBAL token adds the summed item embeddings of the hidden
+jokers. N_LAYERS pre-LN self-attention layers mix the tokens; an empty slot or a
+hole is never a key. The trunk reads the GLOBAL features and the GLOBAL token's
+output. BUY / SELL / OPEN / USE / SELL_CONS / PICK / REDEEM add a score per token,
+the MOVE pointers score the joker / card tokens, and the picker scores the card
+tokens.
 """
 
 from typing import NamedTuple
@@ -62,20 +80,24 @@ import jax.numpy as jnp
 import numpy as np
 
 from env import (balatroAction, balatroEnvState, MAX_HAND_SIZE, MAX_DECK_SIZE, MAX_SHOP_SLOTS,
-                 STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_END, STAGE_CASHOUT, V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL,
-                 V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, V_USE, V_SELL_CONS, V_OPEN, V_PICK, V_SKIP,
-                 WIN_ANTE, live_v, bankrupt_at, reroll_price, pack_cost, cons_room,
-                 can_use_base, pick_ok, deck_counts, affordable, shop_item_cost, card_lanes, eternal)
+                 STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_END, STAGE_CASHOUT, STAGE_SELECT, V_PLAY, V_DISCARD,
+                 V_BUY, V_SELL, V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD, V_USE, V_SELL_CONS, V_OPEN, V_PICK,
+                 V_SKIP, V_REDEEM, BLIND_BOSS, WIN_ANTE, live_v, bankrupt_at, reroll_price, pack_cost, cons_room,
+                 cons_capacity, can_use_base, pick_ok, deck_counts, affordable, shop_item_cost, card_lanes, eternal,
+                 voucher_cost, card_debuffed, blind_target, blind_dollars, run_scale)
 from items import (N_HAND_TYPES, N_CONS, CONS_KIND, CONS_USE, CONS_PARAM, CONS_LO, CONS_HI, N_ENH,
-                   N_ED, N_SEAL, N_PACKS, PACK_KIND, PACK_SLOTS, MAX_PACK, PK_ARCANA, PK_BUFFOON, IK_JOKER, IK_CARD,
-                   MAX_JOKER_SLOTS, ED_NEG, U_ENHANCE, U_SUIT, U_PLANET, MAX_PICK_USE, N_STAKES,
-                   STK_ETERNAL, STK_PERISH, STK_RENTAL, PERISH_ROUNDS)
+                   N_ED, N_SEAL, N_PACKS, PACK_KIND, PACK_SLOTS, MAX_PACK, PK_ARCANA, PK_CELESTIAL, PK_BUFFOON,
+                   PK_SPECTRAL, IK_JOKER, IK_CARD, MAX_JOKER_SLOTS, ED_NEG, ENH_STONE, U_ENHANCE, U_SUIT, U_PLANET,
+                   MAX_PICK_USE, N_STAKES, STK_ETERNAL, STK_PERISH, STK_RENTAL, PERISH_ROUNDS,
+                   MAX_SHOP_VOUCHERS, N_VOUCHERS, N_TAGS, TAG_ID, N_BOSSES, V_RETCON, V_DIRECTORS_CUT,
+                   BOSS_REROLL_COST)
 from jokers import (MAX_JOKERS, N_JOKERS, J_EMPTY, JOKER_COST, JOKERS, JOKER_RARITY, ST_TODO,
                     ST_LOYALTY, CONDITION_NAMES, C_SUIT, C_RANK_IN, C_HAND_HAS,
                     C_COUNT_CMP, C_FACES_GE, C_LOYALTY, C_POSITION, C_COUNT_EQ)
 
 # --- action layout ------------------------------------------------------------
-K_CONS = 2                                  # consumable slots the agent sees (the env has 2)
+K_CONS = 8                                  # consumable slots the agent sees (the env holds up to 16:
+                                            # 2 + Crystal Ball + Negatives; past 8 is a divergence)
 A_PLAY, A_DISCARD = 0, 1
 A_BUY = 2                                   # + shop slot
 A_SELL = A_BUY + MAX_SHOP_SLOTS             # + joker slot
@@ -88,7 +110,8 @@ A_USE = A_OPEN + PACK_SLOTS                 # + consumable slot
 A_SELL_CONS = A_USE + K_CONS                # + consumable slot
 A_PICK = A_SELL_CONS + K_CONS               # + pack card
 A_SKIP = A_PICK + MAX_PACK
-N_ACTIONS = A_SKIP + 1                      # 54
+A_REDEEM = A_SKIP + 1                       # + shop voucher slot
+N_ACTIONS = A_REDEEM + MAX_SHOP_VOUCHERS    # 70
 N_PTR = MAX_JOKERS                          # pointer width; MAX_JOKERS == MAX_HAND_SIZE == 32
 assert MAX_HAND_SIZE == N_PTR
 MAX_PICK = 5                                # the most cards one action picks (PLAY / DISCARD)
@@ -101,14 +124,15 @@ _in = lambda lo, hi: (_idx >= lo) & (_idx < hi)
 ACTION_VERB = jnp.select(
     [_idx == A_PLAY, _idx == A_DISCARD, _in(A_BUY, A_SELL), _in(A_SELL, A_MOVE_JOKER),
      _idx == A_MOVE_JOKER, _idx == A_MOVE_CARD, _idx == A_REROLL, _idx == A_NEXT,
-     _in(A_OPEN, A_USE), _in(A_USE, A_SELL_CONS), _in(A_SELL_CONS, A_PICK), _in(A_PICK, A_SKIP)],
+     _in(A_OPEN, A_USE), _in(A_USE, A_SELL_CONS), _in(A_SELL_CONS, A_PICK), _in(A_PICK, A_SKIP),
+     _idx == A_SKIP],
     [V_PLAY, V_DISCARD, V_BUY, V_SELL, V_MOVE_JOKER, V_MOVE_CARD, V_REROLL, V_NEXT,
-     V_OPEN, V_USE, V_SELL_CONS, V_PICK], V_SKIP).astype(jnp.int32)
+     V_OPEN, V_USE, V_SELL_CONS, V_PICK, V_SKIP], V_REDEEM).astype(jnp.int32)
 ACTION_TARGET = jnp.select(
     [_in(A_BUY, A_SELL), _in(A_SELL, A_MOVE_JOKER), _in(A_OPEN, A_USE), _in(A_USE, A_SELL_CONS),
-     _in(A_SELL_CONS, A_PICK), _in(A_PICK, A_SKIP)],
-    [_idx - A_BUY, _idx - A_SELL, _idx - A_OPEN, _idx - A_USE, _idx - A_SELL_CONS, _idx - A_PICK],
-    0).astype(jnp.int32)
+     _in(A_SELL_CONS, A_PICK), _in(A_PICK, A_SKIP), _in(A_REDEEM, N_ACTIONS)],
+    [_idx - A_BUY, _idx - A_SELL, _idx - A_OPEN, _idx - A_USE, _idx - A_SELL_CONS, _idx - A_PICK,
+     _idx - A_REDEEM], 0).astype(jnp.int32)
 
 
 def is_move(a):
@@ -139,19 +163,21 @@ def action_name(a, src=None, dst=None):
     if a < A_SELL_CONS: return f"USE {a - A_USE}"
     if a < A_PICK:     return f"SELL_C {a - A_SELL_CONS}"
     if a < A_SKIP:     return f"PICK {a - A_PICK}"
-    return "SKIP"
+    if a == A_SKIP:    return "SKIP"
+    return f"REDEEM {a - A_REDEEM}"
 
 
 def pick_bounds(state: balatroEnvState, a):
-    """(lo, hi): how many cards action a picks. PLAY / DISCARD 1..5; a card Tarot
-    (USE, or PICK in an Arcana pack) its own range; anything else 0..0."""
+    """(lo, hi): how many cards action a picks. PLAY / DISCARD 1..5; a card Tarot / Spectral
+    (USE, or PICK in an Arcana / Spectral pack) its own range; anything else 0..0."""
     cid = state.consumables[jnp.clip(a - A_USE, 0, K_CONS - 1)]
     item = state.pack_items[jnp.clip(a - A_PICK, 0, MAX_PACK - 1)]
-    arcana = PACK_KIND[jnp.clip(state.pack_id, 0, N_PACKS - 1)] == PK_ARCANA
+    pk = PACK_KIND[jnp.clip(state.pack_id, 0, N_PACKS - 1)]
+    cons_pack = (pk == PK_ARCANA) | (pk == PK_CELESTIAL) | (pk == PK_SPECTRAL)
     c_use = jnp.clip(cid, 0, N_CONS - 1)
     c_pick = jnp.clip(item, 0, N_CONS - 1)
     use = (a >= A_USE) & (a < A_SELL_CONS)
-    pick = (a >= A_PICK) & (a < A_SKIP) & arcana
+    pick = (a >= A_PICK) & (a < A_SKIP) & cons_pack
     card = (a == A_PLAY) | (a == A_DISCARD)
     lo = jnp.select([card, use, pick], [1, CONS_LO[c_use], CONS_LO[c_pick]], 0)
     hi = jnp.select([card, use, pick], [MAX_PICK, CONS_HI[c_use], CONS_HI[c_pick]], 0)
@@ -171,6 +197,8 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
     pack = state.game_stage == STAGE_PACK
     end = state.game_stage == STAGE_END              # after the winning hand: MOVE_JOKER, NEXT
     cash = state.game_stage == STAGE_CASHOUT         # the cash-out screen: USE, SELL, SELL_CONS, MOVE_JOKER, NEXT
+    select = state.game_stage == STAGE_SELECT        # the blind select: NEXT, SKIP, REROLL (the boss), SELL, USE ...
+    hold = blind | shop | pack | cash | select       # the stages that sell / use / sell a consumable
     held = (state.jokers != J_EMPTY)
 
     slots = jnp.arange(MAX_SHOP_SLOTS)
@@ -183,24 +211,30 @@ def legal_mask(state: balatroEnvState) -> jax.Array:
                       [held.sum() < state.joker_slots + neg, ~state.card_live.all()],
                       (cons_room(state) > 0) | use_now)
     buy = shop & (slots < state.shop_size) & (item >= 0) & affordable(state, cost) & room
-    sell = (blind | shop | pack | cash) & held & ~eternal(state)      # an Eternal joker cannot be sold
-    move = (blind | shop | pack | end | cash) & (held.sum() >= 2)
+    sell = hold & held & ~eternal(state)             # an Eternal joker cannot be sold
+    move = (hold | end) & (held.sum() >= 2)
     move_card = (blind | pack) & (card_lanes(state) >= 2) & state.hand_valid.any()
     pid = state.pack_slots
     opn = shop & (pid >= 0) & affordable(state, jax.vmap(lambda p, f: pack_cost(state, p, f))(pid, state.pack_free))
     cons = state.consumables[:K_CONS]
     present = cons >= 0
-    use = (blind | shop | pack | cash) & present & jax.vmap(lambda c: can_use_base(state, c, True))(cons)
-    sell_c = (blind | shop | pack | cash) & present
+    use = hold & present & jax.vmap(lambda c: can_use_base(state, c, True))(cons)
+    sell_c = hold & present
     pick = pack & jax.vmap(lambda t: pick_ok(state, t))(jnp.arange(MAX_PACK))
+    v = state.vouchers                               # env._reroll_boss: Retcon, or Director's Cut once an ante
+    boss_reroll = select & (v[V_RETCON] | (v[V_DIRECTORS_CUT] & ~state.boss_rerolled)) \
+        & (state.money - BOSS_REROLL_COST >= bankrupt_at(state))
+    shop_reroll = shop & ((state.free_rerolls > 0) | affordable(state, reroll_price(state)))
+    skip = pack | (select & (state.blind_index < BLIND_BOSS))
+    redeem = shop & (state.shop_vouchers >= 0) & (state.money - voucher_cost(state) >= bankrupt_at(state))
 
     legal = jnp.concatenate([
         jnp.stack([blind, blind & (state.discards > 0)]),
         buy,
         sell,
         jnp.stack([move, move_card]),
-        jnp.stack([shop & ((state.free_rerolls > 0) | affordable(state, reroll_price(state))), shop | end | cash]),
-        opn, use, sell_c, pick, jnp.stack([pack]),
+        jnp.stack([shop_reroll | boss_reroll, shop | end | cash | select]),
+        opn, use, sell_c, pick, jnp.stack([skip]), redeem,
     ])
     return legal.at[A_NEXT].set(legal[A_NEXT] | ~legal.any())
 
@@ -223,28 +257,45 @@ def dst_mask(base, src):
 
 
 # --- observation ----------------------------------------------------------------
-N_ITEMS = N_JOKERS + N_CONS                 # one id space: jokers, then Tarots and Planets
-ID_N = MAX_JOKERS + MAX_SHOP_SLOTS + K_CONS + MAX_PACK + PACK_SLOTS
+N_ITEMS = N_JOKERS + N_CONS                 # one id space: jokers, then Tarots, Planets and Spectral cards
+H_TOK = 16                                  # the hidden jokers' ids (Amber Acorn; == J_TOK)
+ID_N = MAX_JOKERS + MAX_SHOP_SLOTS + K_CONS + MAX_PACK + PACK_SLOTS + MAX_SHOP_VOUCHERS + H_TOK
 STK_F = 3                                   # a joker's stickers: Eternal, Perishable, Rental
-JS_F = 2 + N_HAND_TYPES + 1 + N_ED + STK_F + 1   # per held slot: value, sell, To Do hand, Loyalty, edition,
-                                                 # the stickers, a Perishable joker's rounds left
+JS_F = 3 + 2 + N_HAND_TYPES + 1 + N_ED + STK_F + 1   # per held slot: present, hidden, disabled; value, sell,
+                                                     # To Do hand, Loyalty, edition, the stickers, rounds left
 CARD_F = 13 + 4 + N_ENH + 4 + N_SEAL + 1    # rank, suit, enhancement, edition, seal, perma
-SHOP_F = 2 + 3 + N_ED + STK_F               # cost, affordable, kind, edition, a joker's stickers
+LANE_C = 52 + 1                             # a face-down card's possible cards: rank + 13 * suit, then Stone
+LANE_F = 4 + LANE_C                         # present, face down, debuffed, Cerulean Bell's card, the possible cards
+N_KINDS = 5                                 # shop kinds IK_JOKER .. IK_SPECTRAL
+SHOP_F = 3 + N_KINDS + N_ED + STK_F + 13 + 4 + N_ENH   # present, cost, affordable, kind, edition, stickers, a card
 PS_F = 2                                    # pack slot: cost, affordable
 PI_F = 1 + CARD_F + N_ED + STK_F            # pack card: present, a playing card, a joker's edition and stickers
-CS_F = 1                                    # consumable slot: present
+CS_F = 3                                    # consumable slot: present, Negative, sell value
+VS_F = 3                                    # shop voucher slot: present, cost, affordable
+C_TOK = 20                                  # hand lane tokens (8 + the largest hand size bonus + added cards)
 O_JS = ID_N
 O_CARD = O_JS + MAX_JOKERS * JS_F
-O_SHOP = O_CARD + MAX_HAND_SIZE * CARD_F
+O_LANE = O_CARD + MAX_HAND_SIZE * CARD_F
+O_SHOP = O_LANE + C_TOK * LANE_F
 O_PS = O_SHOP + MAX_SHOP_SLOTS * SHOP_F
 O_PI = O_PS + PACK_SLOTS * PS_F
 O_CS = O_PI + MAX_PACK * PI_F
-O_GLOB = O_CS + K_CONS * CS_F
+O_VS = O_CS + K_CONS * CS_F
+O_GLOB = O_VS + MAX_SHOP_VOUCHERS * VS_F
 # id offsets inside IDS
 I_HELD, I_SHOP = 0, MAX_JOKERS
 I_CONS = I_SHOP + MAX_SHOP_SLOTS
 I_PACK = I_CONS + K_CONS
 I_PSLOT = I_PACK + MAX_PACK
+I_VOUCH = I_PSLOT + PACK_SLOTS
+I_HID = I_VOUCH + MAX_SHOP_VOUCHERS
+
+# the game's hand sorts (CardArea:sort, Card:get_nominal): suit_nominal Diamonds < Clubs < Hearts < Spades
+SUIT_ORDER = jnp.array([1, 0, 2, 3], jnp.int32)        # env suits: 0 Clubs, 1 Diamonds, 2 Hearts, 3 Spades
+_C = jnp.arange(52)                                     # a card = rank + 13 * suit
+_KR = (_C % 13) * 4 + SUIT_ORDER[_C // 13]              # Sort Rank key (higher = further left)
+_KS = SUIT_ORDER[_C // 13] * 13 + _C % 13               # Sort Suit key
+J_ORBITAL = TAG_ID["Orbital Tag"]
 
 
 def _card_feats(rank, suit, enh, ed, seal, bonus, ok):
@@ -260,19 +311,76 @@ def _stickers(st):
     return jnp.stack([(st & STK_ETERNAL) > 0, (st & STK_PERISH) > 0, (st & STK_RENTAL) > 0], axis=1).astype(jnp.float32)
 
 
+def hidden_jokers(state: balatroEnvState) -> jax.Array:
+    """(MAX_JOKERS,) bool: a face-down joker (Amber Acorn) that has not shown a message yet."""
+    return (state.jokers != J_EMPTY) & state.joker_down & ~state.joker_seen
+
+
+def deck_view(state: balatroEnvState) -> jax.Array:
+    """(MAX_DECK_SIZE,) bool: the cards the game's deck view counts as in the deck: the undealt
+    ones and the face-down ones (env card_down: ability.wheel_flipped)."""
+    pos = jnp.arange(MAX_DECK_SIZE)
+    undealt = jnp.zeros(MAX_DECK_SIZE, bool).at[state.deck].set((pos >= state.deck_ptr) & (pos < state.deck_size))
+    return (undealt | state.card_down) & state.card_live
+
+
 def _joker_slot_block(state: balatroEnvState) -> jax.Array:
-    """(MAX_JOKERS, JS_F) the per-slot joker state; zero for an empty slot. A perished joker is
-    Perishable with 0 rounds left."""
+    """(MAX_JOKERS, JS_F) the per-slot joker state; zero for an empty slot, only present + hidden
+    for a hidden one. A perished joker is Perishable with 0 rounds left."""
     held = state.jokers != J_EMPTY
+    hid = hidden_jokers(state)
+    show = held & ~hid
     kind = JOKERS.STATE[jnp.clip(state.jokers, 0, N_JOKERS - 1)]
     todo = jax.nn.one_hot(state.joker_state, N_HAND_TYPES) * (held & (kind == ST_TODO))[:, None]
     loyal = jnp.where(held & (kind == ST_LOYALTY),
                       jnp.mod(state.hand_played.sum() - state.joker_state, 6) / 5.0, 0.0)
-    return jnp.concatenate([(live_v(state) / 10.0)[:, None],
-                            (state.joker_sell_value / 10.0)[:, None],
-                            todo, loyal[:, None], jax.nn.one_hot(state.joker_ed, N_ED),
-                            _stickers(state.joker_sticker), (state.joker_perish / PERISH_ROUNDS)[:, None]],
-                           axis=1) * held[:, None]
+    known = jnp.concatenate([(live_v(state) / 10.0)[:, None],
+                             (state.joker_sell_value / 10.0)[:, None],
+                             todo, loyal[:, None], jax.nn.one_hot(state.joker_ed, N_ED),
+                             _stickers(state.joker_sticker), (state.joker_perish / PERISH_ROUNDS)[:, None]],
+                            axis=1) * show[:, None]
+    flags = jnp.stack([held, hid, held & state.joker_debuff], axis=1).astype(jnp.float32)
+    return jnp.concatenate([flags, known], axis=1)
+
+
+def _lane_block(state: balatroEnvState) -> jax.Array:
+    """(C_TOK, LANE_F) per hand lane: present, face down, debuffed (face up only), Cerulean Bell's
+    card, and for a face-down card the cards it can be. The game keeps the hand sorted by the
+    real cards, and Sort Rank / Sort Suit are free: so the face-up cards next to it in each sort
+    bound it (ties of one card go by an instance order, the game's unique_val). A Stone Card
+    sorts below every other card. The deck view counts a face-down card as in the deck, so it
+    is one of the deck view's cards."""
+    f32 = jnp.float32
+    i = jnp.clip(state.hand, 0, MAX_DECK_SIZE - 1)
+    valid = state.hand_valid
+    down = valid & state.hand_down
+    up = valid & ~state.hand_down
+    stone = state.card_enh[i] == ENH_STONE
+    so = SUIT_ORDER[jnp.clip(state.card_suit[i], 0, 3)]
+    rank = jnp.clip(state.card_rank[i], 0, 12)
+    K = MAX_DECK_SIZE
+
+    def bounds(key):
+        """The face-up neighbours' keys below / above each lane's card (-1 = Stone or none
+        below, 51 = none above)."""
+        k2 = key * K + i                                                   # a strict order
+        lo = jnp.where(up[None, :] & (k2[None, :] < k2[:, None]), k2[None, :], -2 * K).max(axis=1)
+        hi = jnp.where(up[None, :] & (k2[None, :] > k2[:, None]), k2[None, :], 52 * K).min(axis=1)
+        return jnp.maximum(jnp.floor_divide(lo, K), -1), jnp.minimum(jnp.floor_divide(hi, K), 51)
+
+    lo_r, hi_r = bounds(jnp.where(stone, -1, rank * 4 + so))
+    lo_s, hi_s = bounds(jnp.where(stone, -1, so * 13 + rank))
+    fits = ((_KR[None, :] >= lo_r[:, None]) & (_KR[None, :] <= hi_r[:, None])
+            & (_KS[None, :] >= lo_s[:, None]) & (_KS[None, :] <= hi_s[:, None]))     # (lanes, 52)
+    view = deck_view(state)
+    s_all = state.card_enh == ENH_STONE
+    in_view = jnp.zeros(52).at[jnp.clip(state.card_rank + 13 * state.card_suit, 0, 51)].add(view & ~s_all) > 0
+    stone_ok = (lo_r < 0) & (lo_s < 0) & (view & s_all).any()
+    can = jnp.concatenate([fits & in_view[None, :], stone_ok[:, None]], axis=1) & down[:, None]
+    deb = up & card_debuffed(state, state.hand)
+    forced = valid & (state.forced_card >= 0) & (state.hand == state.forced_card)
+    flags = jnp.stack([valid, down, deb, forced], axis=1)
+    return jnp.concatenate([flags, can], axis=1).astype(f32)[:C_TOK]
 
 
 def _shared_block(state: balatroEnvState) -> jax.Array:
@@ -282,14 +390,23 @@ def _shared_block(state: balatroEnvState) -> jax.Array:
     pack = (state.game_stage == STAGE_PACK).astype(f32)
     end = (state.game_stage == STAGE_END).astype(f32)
     cash = (state.game_stage == STAGE_CASHOUT).astype(f32)
+    select = (state.game_stage == STAGE_SELECT).astype(f32)
     held = state.jokers != J_EMPTY
     pk = jnp.clip(state.pack_id, 0, N_PACKS - 1)
+    v = state.vouchers
+    can_reroll = v[V_RETCON] | (v[V_DIRECTORS_CUT] & ~state.boss_rerolled)
+    bl = jnp.arange(3)
+    targets = jax.vmap(lambda b: blind_target(state.ante, b, run_scale(state), state.boss, False, state.stake))(bl)
+    rewards = jax.vmap(lambda b: blind_dollars(b, state.boss, state.stake))(bl)
+    orbital = lambda k: jax.nn.one_hot(state.orbital_hands[k], N_HAND_TYPES) * (state.blind_tags[k] == J_ORBITAL)
+    held_orb = (jax.nn.one_hot(state.tag_hand, N_HAND_TYPES) * (state.tags == J_ORBITAL)[:, None]).sum(0)
+    n_cons = (state.consumables >= 0).sum()
     shared = jnp.concatenate([
         jnp.stack([state.money / 25.0, jnp.log1p(jnp.maximum(state.money, 0)) / 4.0]),
         jax.nn.one_hot(jnp.clip(state.ante, 1, WIN_ANTE) - 1, WIN_ANTE),
         jax.nn.one_hot(state.blind_index, 3),
         # the stage; on the cash-out screen the $ that Cash Out pays (it is not in the money yet)
-        jnp.stack([blind, shop, pack, end, cash, state.last_cashout * cash / 25.0, state.target_scale]),
+        jnp.stack([blind, shop, pack, end, cash, select, state.last_cashout * cash / 25.0, state.target_scale]),
         jax.nn.one_hot(state.stake - 1, N_STAKES),
         jnp.stack([held.sum() / state.joker_slots, state.joker_slots / 5.0]),
         # the round targets (The Idol, Mail-In Rebate, Ancient Joker, Castle)
@@ -301,21 +418,33 @@ def _shared_block(state: balatroEnvState) -> jax.Array:
         jnp.stack([state.hand_size / 10.0, state.handcount / 5.0, state.discardcount / 5.0,
                    state.discards_used / 3.0, state.free_rerolls.astype(f32),
                    bankrupt_at(state) / 20.0, state.gros_extinct.astype(f32),
-                   state.tarots_used / 10.0, cons_room(state) / 2.0]),
-        jax.nn.one_hot(PACK_KIND[pk], 4) * pack, jnp.stack([state.pack_left * pack / 2.0]),
+                   state.tarots_used / 10.0, cons_room(state) / 2.0,
+                   cons_capacity(state) / 4.0, n_cons / 4.0]),
+        jax.nn.one_hot(PACK_KIND[pk], 5) * pack, jnp.stack([state.pack_left * pack / 2.0]),
+        # the boss of this ante (shown at the blind select), the 3 blinds
+        jax.nn.one_hot(state.boss, N_BOSSES),
+        jnp.stack([state.boss_disabled, state.boss_rerolled, can_reroll]).astype(f32),
+        jax.nn.one_hot(state.boss_hand, N_HAND_TYPES), jax.nn.one_hot(state.ox_hand, N_HAND_TYPES),
+        jnp.log10(targets.astype(f32)) / 6.0, rewards / 5.0,
+        # the tags: on the Small / Big Blind (an Orbital Tag's hand), held, the skips
+        jax.nn.one_hot(state.blind_tags[0], N_TAGS), jax.nn.one_hot(state.blind_tags[1], N_TAGS),
+        orbital(0), orbital(1),
+        jax.nn.one_hot(state.tags, N_TAGS).sum(0) / 2.0, held_orb,
+        jnp.stack([state.skips / 10.0]),
+        # the redeemed vouchers, the last consumable used (The Fool)
+        v.astype(f32), jax.nn.one_hot(state.last_cons, N_CONS),
     ]).astype(f32)
     return shared
 
 
 def _deck_block(state: balatroEnvState) -> jax.Array:
-    """The undealt cards (rank x suit counts, enhancement counts) and the full deck's enhancements."""
-    pos = jnp.arange(MAX_DECK_SIZE)
-    inst = state.deck
-    undealt = (pos >= state.deck_ptr) & (pos < state.deck_size)
-    card = state.card_rank[inst] + 13 * state.card_suit[inst]
-    stone = state.card_enh[inst] == 6
-    by_card = jnp.zeros(52).at[card].add(undealt & ~stone)
-    by_enh = jnp.zeros(N_ENH).at[state.card_enh[inst]].add(undealt)
+    """The deck view's cards (rank x suit counts, enhancement counts: the undealt and the
+    face-down ones) and the full deck's enhancements."""
+    view = deck_view(state)
+    card = jnp.clip(state.card_rank + 13 * state.card_suit, 0, 51)
+    stone = state.card_enh == ENH_STONE
+    by_card = jnp.zeros(52).at[card].add(view & ~stone)
+    by_enh = jnp.zeros(N_ENH).at[state.card_enh].add(view)
     full = jnp.zeros(N_ENH).at[state.card_enh].add(state.card_live)
     return jnp.concatenate([by_card, by_enh / 10.0, full / 10.0,
                             jnp.stack([deck_counts(state)["size"] / 52.0])])
@@ -329,32 +458,41 @@ def observe(state: balatroEnvState) -> jax.Array:
     in_shop = state.game_stage == STAGE_SHOP
 
     # IDS (item id + 1, 0 = empty; the shop ids only in the shop, the pack ids only with a pack open)
-    held_id = jnp.where(state.jokers != J_EMPTY, state.jokers + 1, 0)
-    shop_item = jnp.where(state.shop_kind == IK_JOKER, state.shop_slots, N_JOKERS + state.shop_slots)
-    shop_id = jnp.where((state.shop_slots >= 0) & in_shop, shop_item + 1, 0)
+    hid = hidden_jokers(state)
+    held_id = jnp.where((state.jokers != J_EMPTY) & ~hid, state.jokers + 1, 0)
+    hid_id = jnp.sort(jnp.where(hid, state.jokers + 1, 0))[::-1][:H_TOK]      # no slot order
+    on = state.shop_slots >= 0
+    shop_item = jnp.select([state.shop_kind == IK_JOKER, state.shop_kind == IK_CARD],
+                           [state.shop_slots, -1], N_JOKERS + state.shop_slots)
+    shop_id = jnp.where(on & (shop_item >= 0) & in_shop, shop_item + 1, 0)
     cons = state.consumables[:K_CONS]
     cons_id = jnp.where(cons >= 0, N_JOKERS + cons + 1, 0)
     pk = PACK_KIND[jnp.clip(state.pack_id, 0, N_PACKS - 1)]
     open_ = state.game_stage == STAGE_PACK
     items = state.pack_items
-    pack_item = jnp.select([pk == 3, (pk == 0) | (pk == 1)], [items, N_JOKERS + items], -1)
+    cons_pack = (pk == PK_ARCANA) | (pk == PK_CELESTIAL) | (pk == PK_SPECTRAL)
+    pack_item = jnp.select([pk == PK_BUFFOON, cons_pack], [items, N_JOKERS + items], -1)
     pack_id = jnp.where(open_ & (items >= 0) & (pack_item >= 0), pack_item + 1, 0)
     pslot_id = jnp.where((state.pack_slots >= 0) & in_shop, state.pack_slots + 1, 0)
-    ids = jnp.concatenate([held_id, shop_id, cons_id, pack_id, pslot_id]).astype(f32)
+    von = (state.shop_vouchers >= 0) & in_shop
+    vouch_id = jnp.where(von, state.shop_vouchers + 1, 0)
+    ids = jnp.concatenate([held_id, shop_id, cons_id, pack_id, pslot_id, vouch_id, hid_id]).astype(f32)
 
-    # CARDS (the hand)
+    # CARDS (the hand; a face-down card shows nothing here, see LANE)
     i = jnp.clip(state.hand, 0, MAX_DECK_SIZE - 1)
     cards = _card_feats(state.card_rank[i], state.card_suit[i], state.card_enh[i], state.card_ed[i],
-                        state.card_seal[i], state.card_bonus[i], state.hand_valid)
+                        state.card_seal[i], state.card_bonus[i], state.hand_valid & ~state.hand_down)
 
     # SHOP SLOT / PACK SLOT (in the shop): the price BUY / OPEN charge (a couponed card or pack $0)
     # and whether it can be paid now (the legal mask's test: $0 always, Credit Card below $0)
-    on = state.shop_slots >= 0
     cost = jax.vmap(lambda k: shop_item_cost(state, k))(jnp.arange(MAX_SHOP_SLOTS)) * on
-    shop_slot = jnp.concatenate([jnp.stack([cost / 10.0, (on & affordable(state, cost)).astype(f32)], axis=1),
-                                 jax.nn.one_hot(state.shop_kind, 3) * on[:, None],
+    pc = on & (state.shop_kind == IK_CARD)
+    shop_card = jnp.concatenate([jax.nn.one_hot(state.shop_rank, 13), jax.nn.one_hot(state.shop_suit, 4),
+                                 jax.nn.one_hot(state.shop_enh, N_ENH)], axis=1) * pc[:, None]
+    shop_slot = jnp.concatenate([jnp.stack([on, cost / 10.0, on & affordable(state, cost)], axis=1).astype(f32),
+                                 jax.nn.one_hot(state.shop_kind, N_KINDS) * on[:, None],
                                  jax.nn.one_hot(state.shop_ed, N_ED) * on[:, None],
-                                 _stickers(state.shop_sticker) * on[:, None]], axis=1) * shop
+                                 _stickers(state.shop_sticker) * on[:, None], shop_card], axis=1) * shop
     pon = state.pack_slots >= 0
     pcost = jax.vmap(lambda p, f: pack_cost(state, p, f))(state.pack_slots, state.pack_free) * pon
     pack_slot = jnp.stack([pcost / 10.0, (pon & affordable(state, pcost)).astype(f32)], axis=1) * shop
@@ -369,7 +507,14 @@ def observe(state: balatroEnvState) -> jax.Array:
     pack_card = jnp.concatenate([present[:, None].astype(f32), pcard, pjed, pstk], axis=1)
 
     # CONS SLOT
-    cons_slot = (cons >= 0).astype(f32)[:, None]
+    cpres = cons >= 0
+    cons_slot = jnp.stack([cpres, cpres & (state.cons_ed[:K_CONS] == ED_NEG),
+                           state.cons_sell[:K_CONS] * cpres / 5.0], axis=1).astype(f32)
+
+    # VOUCHER (in the shop)
+    vcost = voucher_cost(state)
+    vouch = jnp.stack([von, von * vcost / 10.0, von & (state.money - vcost >= bankrupt_at(state))],
+                      axis=1).astype(f32)
 
     # GLOBAL
     blind_g = jnp.stack([state.hands / state.handcount,
@@ -379,9 +524,9 @@ def observe(state: balatroEnvState) -> jax.Array:
     shop_g = jnp.stack([reroll_price(state) / 10.0,
                         affordable(state, reroll_price(state)).astype(f32)]) * shop
 
-    return jnp.concatenate([ids, _joker_slot_block(state).ravel(), cards.ravel(), shop_slot.ravel(),
-                            pack_slot.ravel(), pack_card.ravel(), cons_slot.ravel(),
-                            _shared_block(state), blind_g, _deck_block(state) * (blind + pack),
+    return jnp.concatenate([ids, _joker_slot_block(state).ravel(), cards.ravel(), _lane_block(state).ravel(),
+                            shop_slot.ravel(), pack_slot.ravel(), pack_card.ravel(), cons_slot.ravel(),
+                            vouch.ravel(), _shared_block(state), blind_g, _deck_block(state) * (blind + pack),
                             shop_g]).astype(f32)
 
 
@@ -397,8 +542,13 @@ def joker_ids(obs):
 
 def hand_feats(obs) -> jax.Array:
     """(MAX_HAND_SIZE, CARD_F) the card features per lane, read back from obs
-    (all zero for a hole and in the shop). Columns 0..12 rank, 13..16 suit."""
-    return obs[O_CARD:O_SHOP].reshape(MAX_HAND_SIZE, CARD_F)
+    (all zero for a hole, a face-down card and in the shop). Columns 0..12 rank, 13..16 suit."""
+    return obs[O_CARD:O_LANE].reshape(MAX_HAND_SIZE, CARD_F)
+
+
+def lane_feats(obs) -> jax.Array:
+    """(C_TOK, LANE_F) the lane features: present, face down, debuffed, forced, the possible cards."""
+    return obs[O_LANE:O_SHOP].reshape(C_TOK, LANE_F)
 
 
 # --- the fixed item features ("the card text") ------------------------------------
@@ -477,9 +627,8 @@ FF_D = 128                                  # the feed-forward width in each lay
 # Tokens only for the slots the env can fill (held jokers are packed, lanes <
 # hand_size); the obs and the action layout keep all 32. tests_run checks the caps.
 J_TOK = 16                                  # held joker tokens (items.MAX_JOKER_SLOTS: 5 slots + Antimatter + Negatives)
-C_TOK = 20                                  # hand lane tokens (8 + the largest hand size bonus + added cards)
-N_TOK = 1 + J_TOK + MAX_SHOP_SLOTS + PACK_SLOTS + MAX_PACK + K_CONS + C_TOK
-T_HELD, T_SHOP, T_PSLOT, T_PACK, T_CONS, T_CARD, T_GLOB = range(7)   # rows of the TYPE table
+N_TOK = 1 + J_TOK + MAX_SHOP_SLOTS + PACK_SLOTS + MAX_PACK + K_CONS + MAX_SHOP_VOUCHERS + C_TOK
+T_HELD, T_SHOP, T_PSLOT, T_PACK, T_CONS, T_VOUCH, T_CARD, T_GLOB = range(8)   # rows of the TYPE table
 
 
 def _ln(x, g, b):
@@ -518,30 +667,39 @@ def _item_emb(params, ids):
 
 def tokens(params, obs):
     """-> (tok (N_TOK, TOK_D), key_ok (N_TOK,)) before the attention layers.
-    Order: GLOBAL, held slots, shop slots, pack slots, pack cards, consumables, hand lanes."""
+    Order: GLOBAL, held slots, shop slots, pack slots, pack cards, consumables, shop vouchers,
+    hand lanes."""
     ids = obs[:ID_N].astype(jnp.int32) - 1
     Ty = jnp.asarray(params["Ty"])
     held_i = ids[I_HELD:I_HELD + J_TOK]
     shop_i = ids[I_SHOP:I_CONS]
     cons_i = ids[I_CONS:I_PACK]
     pack_i = ids[I_PACK:I_PSLOT]
-    pslot_i = ids[I_PSLOT:ID_N]
+    pslot_i = ids[I_PSLOT:I_VOUCH]
+    vouch_i = ids[I_VOUCH:I_HID]
+    hid_i = ids[I_HID:ID_N]
     js = obs[O_JS:O_CARD].reshape(MAX_JOKERS, JS_F)[:J_TOK]
     x = hand_feats(obs)[:C_TOK]
+    ln = lane_feats(obs)
     sf = obs[O_SHOP:O_PS].reshape(MAX_SHOP_SLOTS, SHOP_F)
     psf = obs[O_PS:O_PI].reshape(PACK_SLOTS, PS_F)
     pif = obs[O_PI:O_CS].reshape(MAX_PACK, PI_F)
+    csf = obs[O_CS:O_VS].reshape(K_CONS, CS_F)
+    vsf = obs[O_VS:O_GLOB].reshape(MAX_SHOP_VOUCHERS, VS_F)
     held = _item_emb(params, held_i) + js @ params["Wjs"] + params["Pj"] + Ty[T_HELD]
     shop = _item_emb(params, shop_i) + sf @ params["Wsh"] + params["Ps"] + Ty[T_SHOP]
     ep = jnp.asarray(params["Ep"])[jnp.clip(pslot_i, 0, N_PACKS - 1)] * (pslot_i >= 0)[:, None]
     pslot = ep + psf @ params["Wps"] + params["Pps"] + Ty[T_PSLOT]
     pack = _item_emb(params, pack_i) + pif @ params["Wpi"] + params["Ppi"] + Ty[T_PACK]
-    cons = _item_emb(params, cons_i) + params["Pcs"] + Ty[T_CONS]
-    cards = x @ params["Wcd"] + params["Pc"] + Ty[T_CARD]
-    glob = obs[O_GLOB:] @ params["Wg"] + params["bg"] + Ty[T_GLOB]
-    tok = jnp.concatenate([glob[None], held, shop, pslot, pack, cons, cards])
-    key_ok = jnp.concatenate([jnp.ones(1, bool), held_i >= 0, shop_i >= 0, pslot_i >= 0,
-                              pif[:, 0] > 0, cons_i >= 0, x.sum(1) > 0])
+    cons = _item_emb(params, cons_i) + csf @ params["Wcs"] + params["Pcs"] + Ty[T_CONS]
+    ev = jnp.asarray(params["Ev"])[jnp.clip(vouch_i, 0, N_VOUCHERS - 1)] * (vouch_i >= 0)[:, None]
+    vouch = ev + vsf @ params["Wvs"] + params["Pv"] + Ty[T_VOUCH]
+    cards = x @ params["Wcd"] + ln @ params["Wln"] + params["Pc"] + Ty[T_CARD]
+    hidden = _item_emb(params, hid_i).sum(0) @ params["Whd"]          # the hidden jokers, as a set
+    glob = obs[O_GLOB:] @ params["Wg"] + params["bg"] + Ty[T_GLOB] + hidden
+    tok = jnp.concatenate([glob[None], held, shop, pslot, pack, cons, vouch, cards])
+    key_ok = jnp.concatenate([jnp.ones(1, bool), js[:, 0] > 0, sf[:, 0] > 0, pslot_i >= 0,
+                              pif[:, 0] > 0, cons_i >= 0, vsf[:, 0] > 0, ln[:, 0] > 0])
     return tok, key_ok
 
 
@@ -552,6 +710,7 @@ class Encoded(NamedTuple):
     pst   : jax.Array   # (PACK_SLOTS, TOK_D)  pack slot tokens
     pit   : jax.Array   # (MAX_PACK, TOK_D)  pack card tokens
     cst   : jax.Array   # (K_CONS, TOK_D)  consumable tokens
+    vt    : jax.Array   # (MAX_SHOP_VOUCHERS, TOK_D)  shop voucher tokens
     ct    : jax.Array   # (MAX_HAND_SIZE, TOK_D)  hand lane tokens (zero past C_TOK)
 
 
@@ -562,21 +721,22 @@ def encode(params, obs) -> Encoded:
     tok = _ln(tok, params["gN"], params["bN"])
     h = jnp.tanh(obs[O_GLOB:] @ params["W1"] + tok[0] @ params["W1t"] + params["b1"])
     h = jnp.tanh(h @ params["W2"] + params["b2"])
-    cuts = [int(x) for x in np.cumsum([1, J_TOK, MAX_SHOP_SLOTS, PACK_SLOTS, MAX_PACK, K_CONS])]
+    cuts = [int(x) for x in np.cumsum([1, J_TOK, MAX_SHOP_SLOTS, PACK_SLOTS, MAX_PACK, K_CONS,
+                                       MAX_SHOP_VOUCHERS])]
     pad = lambda t, n: jnp.pad(t, ((0, n - t.shape[0]), (0, 0)))
-    jt, st, pst, pit, cst, ct = (tok[a:b] for a, b in zip(cuts, cuts[1:] + [N_TOK]))
-    return Encoded(h, pad(jt, MAX_JOKERS), st, pst, pit, cst, pad(ct, MAX_HAND_SIZE))
+    jt, st, pst, pit, cst, vt, ct = (tok[a:b] for a, b in zip(cuts, cuts[1:] + [N_TOK]))
+    return Encoded(h, pad(jt, MAX_JOKERS), st, pst, pit, cst, vt, pad(ct, MAX_HAND_SIZE))
 
 
 # --- network --------------------------------------------------------------------
 HIDDEN = 256
-N_SCORED = 6                                # token-scored action groups: BUY, SELL, OPEN, USE, SELL_CONS, PICK
+N_SCORED = 7                                # token-scored action groups: BUY, SELL, OPEN, USE, SELL_CONS, PICK, REDEEM
 
 
 def init_params(key, obs_dim=None):
     obs_dim = obs_dim or OBS_DIM
     g_dim = obs_dim - O_GLOB
-    ks = iter(jax.random.split(key, 80))
+    ks = iter(jax.random.split(key, 96))
     def dense(n_in, n_out, scale):
         return jax.random.normal(next(ks), (n_in, n_out)) * scale / jnp.sqrt(n_in), jnp.zeros(n_out)
     def table(*shape, scale=0.5):
@@ -593,16 +753,20 @@ def init_params(key, obs_dim=None):
 
     p = {
         # tokens
-        "E": table(N_ITEMS, D),                          # the shared item embedding (jokers, Tarots, Planets)
+        "E": table(N_ITEMS, D),                          # the shared item embedding (jokers, consumables)
         "Wf": dense(ITEM_F, D, 0.5)[0],                  # fixed item features -> token
         "Ep": table(N_PACKS, D),                         # the pack embedding
         "Wjs": dense(JS_F, D, 1.0)[0], "Wsh": dense(SHOP_F, D, 1.0)[0],
         "Wps": dense(PS_F, D, 1.0)[0], "Wpi": dense(PI_F, D, 1.0)[0],
-        "Wcd": dense(CARD_F, D, 1.0)[0],
+        "Wcd": dense(CARD_F, D, 1.0)[0], "Wln": dense(LANE_F, D, 1.0)[0],
+        "Wcs": dense(CS_F, D, 1.0)[0],
+        "Ev": table(N_VOUCHERS, D), "Wvs": dense(VS_F, D, 1.0)[0],     # the voucher embedding
+        "Whd": dense(D, D, 1.0)[0],                                    # the hidden jokers' set -> GLOBAL
         "Wg": dense(g_dim, D, 1.0)[0], "bg": jnp.zeros(D),
         "Pj": table(J_TOK, D), "Ps": table(MAX_SHOP_SLOTS, D), "Pps": table(PACK_SLOTS, D),
-        "Ppi": table(MAX_PACK, D), "Pcs": table(K_CONS, D), "Pc": table(C_TOK, D),   # position per slot
-        "Ty": table(7, D),
+        "Ppi": table(MAX_PACK, D), "Pcs": table(K_CONS, D), "Pv": table(MAX_SHOP_VOUCHERS, D),
+        "Pc": table(C_TOK, D),                                         # position per slot
+        "Ty": table(8, D),
         "layers": [layer() for _ in range(N_LAYERS)],
         "gN": jnp.ones(D), "bN": jnp.zeros(D),
         # trunk
@@ -647,13 +811,14 @@ def policy(params, obs, src, enc: Encoded = None):
     src for row 3; one src serves both, only the verb's own pair is read).
     enc = encode(params, obs) when the caller already has it."""
     enc = encode(params, obs) if enc is None else enc
-    h, jt, st, pst, pit, cst, ct = enc
+    h, jt, st, pst, pit, cst, vt, ct = enc
     D = TOK_D
     qb = (h @ params["Wbs"]).reshape(N_SCORED, D) / jnp.sqrt(D)
     a = h @ params["Wa"] + params["ba"]
     a = (a.at[A_BUY:A_SELL].add(st @ qb[0]).at[A_SELL:A_MOVE_JOKER].add(jt @ qb[1])
           .at[A_OPEN:A_USE].add(pst @ qb[2]).at[A_USE:A_SELL_CONS].add(cst @ qb[3])
-          .at[A_SELL_CONS:A_PICK].add(cst @ qb[4]).at[A_PICK:A_SKIP].add(pit @ qb[5]))
+          .at[A_SELL_CONS:A_PICK].add(cst @ qb[4]).at[A_PICK:A_SKIP].add(pit @ qb[5])
+          .at[A_REDEEM:N_ACTIONS].add(vt @ qb[6]))
     qp = (h @ params["Wp"] + params["bp"]).reshape(4, D)
     s = jnp.clip(src, 0, N_PTR - 1)
     Pm, Rp = jnp.asarray(params["Pm"]), jnp.asarray(params["Rp"])   # loaded params are numpy

@@ -30,10 +30,10 @@ import sys
 import jax
 import jax.numpy as jnp
 
-from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP
+from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP, STAGE_SELECT
 from agent import (init_params, act, masked_logits, log_prob_entropy, is_move, OBS_DIM,
                    A_PLAY, A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, A_OPEN, A_USE, A_SELL_CONS,
-                   A_PICK, A_SKIP, N_ACTIONS)
+                   A_PICK, A_SKIP, A_REDEEM, N_ACTIONS)
 
 # --- config -----------------------------------------------------------------------
 N_ENVS        = 1024
@@ -104,7 +104,8 @@ def env_step_auto(params, state, run, key, scale):
                 "sell": (a >= A_SELL) & (a < A_MOVE_JOKER), "move": moved,   # joker + card moves
                 "streak": streak, "reroll": a == A_REROLL,
                 "use": (a >= A_USE) & (a < A_SELL_CONS), "pack": (a == A_OPEN) | (a == A_OPEN + 1),
-                "play": a == A_PLAY, "play_cards": sel.sum() * (a == A_PLAY)}
+                "play": a == A_PLAY, "play_cards": sel.sum() * (a == A_PLAY),
+                "skip_blind": (a == A_SKIP) & (state.game_stage == STAGE_SELECT), "redeem": a >= A_REDEEM}
     fresh = reset(k_reset, DECK, HAND, scale)
     nxt = tree_where(done, fresh, nxt)
     keep = ~done
@@ -210,6 +211,7 @@ def train_step(params, m, v, t, carry, key, scale):
     d = fin["done"]
     n_done = d.sum()
     per_run = lambda x: jnp.where(d, x, 0).sum() / jnp.maximum(n_done, 1)
+    per_run_sum = lambda x: x.sum() / jnp.maximum(n_done, 1)      # events in the segment / runs ended in it
     n_cleared, n_failed = fin["cleared"].sum(), fin["failed"].sum()
     var_ret = ret.var()
     metrics = {
@@ -232,6 +234,8 @@ def train_step(params, m, v, t, carry, key, scale):
         "reroll_frac": fin["reroll"].mean(),
         "use_frac": fin["use"].mean(),                    # USE a Tarot / Planet
         "open_frac": fin["pack"].mean(),                  # OPEN a pack
+        "run_skips": per_run_sum(fin["skip_blind"]),       # blinds skipped (for the tag) per run
+        "run_redeems": per_run_sum(fin["redeem"]),         # vouchers redeemed per run
         "play_cards": fin["play_cards"].sum() / jnp.maximum(fin["play"].sum(), 1),   # cards per PLAY
     }
     return params, m, v, t, carry, metrics
