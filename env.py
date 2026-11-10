@@ -67,6 +67,7 @@ explain_play shows exactly the outcome env_step will produce.
 import os
 
 import jax
+import jax.custom_batching
 import jax.numpy as jnp
 import numpy as np
 from jax import jit
@@ -417,6 +418,56 @@ class PlayResult(NamedTuple):
 def tree_where(c, a, b):
     """Select a whole pytree: a where c, else b. The branch-free 'if'."""
     return jax.tree.map(lambda x, y: jnp.where(c, x, y), a, b)
+
+
+COMPACT_DIV = 8     # compacted: a pass runs f on batch / COMPACT_DIV envs (8 = the fastest rollout at 1024 envs)
+
+
+def _leafwise(fn, *trees):
+    """jax.tree.map(fn, *trees), with PRNG key leaves as their raw key data."""
+    def one(*xs):
+        if jnp.issubdtype(xs[0].dtype, jax.dtypes.prng_key):
+            impl = jax.random.key_impl(xs[0])
+            return jax.random.wrap_key_data(fn(*(jax.random.key_data(x) for x in xs)), impl=impl)
+        return fn(*xs)
+    return jax.tree.map(one, *trees)
+
+
+def compacted(f):
+    """g(need, args) == tree_where(need, f(*args), args[0]), where f(*args) has the structure
+    and dtypes of args[0]; f runs only for the envs that need it. One env: lax.cond. Under
+    vmap: the envs with need are gathered (in batch order) into a buffer of
+    ceil(batch / COMPACT_DIV) envs, vmap(f) runs on the buffer and the results are scattered
+    back; a while loop does one pass per buffer, so any count of envs is exact."""
+    def run(*a):
+        out = f(*a)
+        return jax.tree.map(lambda o, x: o if jnp.issubdtype(x.dtype, jax.dtypes.prng_key) else o.astype(x.dtype),
+                            out, a[0])
+
+    @jax.custom_batching.custom_vmap
+    def g(need, args):
+        return jax.lax.cond(need, lambda a: run(*a), lambda a: a[0], args)
+
+    @g.def_vmap
+    def _rule(axis_size, in_batched, need, args):
+        n_b, a_b = in_batched
+        need = need if n_b else jnp.broadcast_to(need, (axis_size,))
+        args = jax.tree.map(lambda x, b: x if b else _leafwise(lambda y: jnp.broadcast_to(y, (axis_size,) + y.shape), x),
+                            args, a_b)
+        k = max(1, -(-axis_size // COMPACT_DIV))
+        n = need.sum()
+        idx = jnp.nonzero(need, size=axis_size + k, fill_value=0)[0]     # the envs with need first
+        f_b = jax.vmap(run)
+
+        def body(carry):
+            c, out = carry
+            lanes = jax.lax.dynamic_slice(idx, (c * k,), (k,))
+            dst = jnp.where(c * k + jnp.arange(k) < n, lanes, axis_size)      # out of range = dropped
+            res = f_b(*_leafwise(lambda x: x[lanes], args))
+            return c + 1, _leafwise(lambda o, r: o.at[dst].set(r, mode="drop"), out, res)
+        _, out = jax.lax.while_loop(lambda carry: carry[0] * k < n, body, (jnp.int32(0), args[0]))
+        return out, jax.tree.map(lambda _: True, out)
+    return g
 
 
 def blind_mult(blind_index, boss, disabled=False):
@@ -852,7 +903,12 @@ def env_step(state: balatroEnvState, action: balatroAction) -> tuple[balatroEnvS
     # one branch each for PLAY / DISCARD and USE / PICK / Buy and Use (they share their heavy parts)
     branch = jnp.where(branch == V_DISCARD, V_PLAY, jnp.where(branch == V_PICK, V_USE, branch))
     branch = jnp.where((branch == V_BUY) & buy_and_use(state, action.target), V_USE, branch)
-    nxt, _, _ = jax.lax.switch(branch, _HANDLERS, state, action)
+    # the two heavy rare parts run here, out of the switch, each only where its handler uses it
+    # (compacted: under vmap only those envs pay for it; a custom_vmap cannot sit in a switch)
+    use = _use_parts(state, action)
+    pre = _Pre(started=_start_blind_c((branch == V_NEXT) & (_next_branch(state) == 1), (state,)),
+               used=_apply_cons_c((branch == V_USE) & use["need"], use["args"]))
+    nxt, _, _ = jax.lax.switch(branch, _SWITCH, state, action, pre)
     go_end = legal & (verb == V_NEXT) & (state.game_stage == STAGE_END)
     nxt, reward, over = _settle(nxt, legal & (verb == V_PLAY), go_end)
     nxt = _track_down(nxt)
@@ -1414,11 +1470,13 @@ def buy_and_use(state, t):
     return ((kind == IK_TAROT) | (kind == IK_PLANET) | (kind == IK_SPECTRAL)) & (cons_room(state) <= 0)
 
 
-def _use_pick(state: balatroEnvState, action: balatroAction):
-    """USE a held consumable, PICK a pack card, or BUY a Tarot / Planet the full consumable slots
-    cannot take (Buy and Use): they share one use_consumeable. A pack's joker / playing card
-    goes to the jokers / the deck instead. A Chicot made in a boss round (The Soul) disables the
-    boss at once (add_to_deck)."""
+_apply_cons_c = compacted(apply_cons)
+
+
+def _use_parts(state: balatroEnvState, action: balatroAction):
+    """The common part of _use_pick: the checks, the state before use_consumeable (base) and the
+    apply_cons arguments. need: apply_cons's result is kept (an ok USE, Buy and Use, or PICK of
+    a consumable). env_step calls it too, for the apply_cons call it makes (see _Pre)."""
     is_use = action.verb == V_USE
     is_buy = action.verb == V_BUY
     t = action.target
@@ -1449,7 +1507,22 @@ def _use_pick(state: balatroEnvState, action: balatroAction):
     base = tree_where(is_use, take_cons(state, slot), tree_where(is_buy, b_state, p_state))._replace(key=key)
     neg = is_use & (state.cons_ed[slot] == ED_NEG)
     cid = jnp.where(is_use, u_cid, jnp.where(is_buy, b_cid, item))
-    used = apply_cons(base, cid, action.select, sub, neg.astype(jnp.int32))
+    ok = jnp.where(is_use, u_ok, jnp.where(is_buy, b_ok, p_ok))
+    need = ok & (is_use | is_buy | ((action.verb == V_PICK) & cons))
+    return dict(is_use=is_use, is_buy=is_buy, key=key, i=i, kind=kind, p_state=p_state, cons=cons, ok=ok,
+                need=need, args=(base, cid, action.select, sub, neg.astype(jnp.int32)))
+
+
+def _use_pick(state: balatroEnvState, action: balatroAction, pre=None):
+    """USE a held consumable, PICK a pack card, or BUY a Tarot / Planet the full consumable slots
+    cannot take (Buy and Use): they share one use_consumeable. A pack's joker / playing card
+    goes to the jokers / the deck instead. A Chicot made in a boss round (The Soul) disables the
+    boss at once (add_to_deck). pre: env_step's _Pre (its apply_cons result); None = call it here."""
+    p = _use_parts(state, action)
+    is_use, is_buy, key, i, kind, p_state, cons, ok = (p[n] for n in
+                                                      ("is_use", "is_buy", "key", "i", "kind", "p_state", "cons", "ok"))
+    item = state.pack_items[i]
+    used = apply_cons(*p["args"]) if pre is None else pre.used
     joker = acquire(p_state._replace(key=key), item, state.pack_ed[i], state.pack_sticker[i])[0]
     card, added = add_card(p_state._replace(key=key), state.pack_rank[i], state.pack_suit[i],
                            state.pack_enh[i], state.pack_ed[i], state.pack_seal[i])
@@ -1459,7 +1532,6 @@ def _use_pick(state: balatroEnvState, action: balatroAction):
     got = tree_where(is_use | is_buy, used, picked)
     chicot = (acting(got) == J_CHICOT).any() & ~(acting(state) == J_CHICOT).any()
     got = tree_where(chicot, disable_boss(got), got)
-    ok = jnp.where(is_use, u_ok, jnp.where(is_buy, b_ok, p_ok))
     return tree_where(ok, got, state), jnp.int32(0), jnp.bool_(False)
 
 
@@ -2523,6 +2595,13 @@ def new_ante_rolls(key, state):
                           blind_tags=jnp.stack([tag(k1), tag(k2)]), orbital_hands=jnp.stack([hand(k3), hand(k4)]))
 
 
+def _tag_span(tags):
+    """The loop bound for the tag loops: 1 + the last held slot (0 with no tag). An empty slot
+    is a no-op in each loop, so the slots after it need no pass (under vmap the loop runs to
+    the largest bound in the batch, not to MAX_TAGS)."""
+    return jnp.max(jnp.where(tags >= 0, jnp.arange(MAX_TAGS) + 1, 0))
+
+
 def add_tag(state, tag, hand):
     """add_tag: each held Double Tag gives a copy of a new tag that is not a Double Tag (and is
     used up); the tag and its copies join the end of the list (a full list drops the rest)."""
@@ -2558,7 +2637,7 @@ def immediate_tags(state, key):
         level = s.hand_level.at[jnp.clip(s.tag_hand[i], 0, N_HAND_TYPES - 1)].add(ORBITAL_LEVELS * orb)
         used = top | (money > 0) | orb | jnp.isin(t, jnp.array([TG_SKIP, TG_GARBAGE, TG_HANDY, TG_ECONOMY]))
         return s._replace(money=s.money + money, hand_level=level, tags=s.tags.at[i].set(jnp.where(used, -1, t)))
-    s = jax.lax.fori_loop(0, MAX_TAGS, body, state)
+    s = jax.lax.fori_loop(0, _tag_span(state.tags), body, state)
     keep = s.tags >= 0
     return s._replace(tags=compact(s.tags, keep), tag_hand=compact(s.tag_hand, keep))
 
@@ -2581,7 +2660,7 @@ def new_blind_choice(state):
                        boss_rerolled=s.boss_rerolled | boss, tags=s.tags.at[i].set(jnp.where(boss | pack, -1, t)))
         s = tree_where(pack, open_pack(s, TAG_PACK[tt], k2, STAGE_SELECT), s)
         return s, stopped | pack
-    s, opened = jax.lax.fori_loop(0, MAX_TAGS, body, (state, jnp.bool_(False)))
+    s, opened = jax.lax.fori_loop(0, _tag_span(state.tags), body, (state, jnp.bool_(False)))
     keep = s.tags >= 0
     s = s._replace(tags=compact(s.tags, keep), tag_hand=compact(s.tag_hand, keep))
     # a pack moves the key on: the next tag's pack (a Double Tag's copy) is a new roll, even when
@@ -2778,6 +2857,9 @@ def _start_blind(state):
     return tree_where(s.hand_size > 0, drawn_to_hand(_first_hand_drawn(s, k_cert), k_c, True), s)
 
 
+_start_blind_c = compacted(_start_blind)
+
+
 def _first_hand_drawn(s, key):
     """first_hand_drawn: Certificate (copies too) adds a card with a seal at the end of the hand."""
     erows, eok, _, _ = effective(acting(s), s.joker_value, s.joker_state)
@@ -2796,12 +2878,18 @@ def _first_hand_drawn(s, key):
     return _event(s, T_ON_CARD_ADDED, added.astype(jnp.float32))
 
 
-def _next(state: balatroEnvState, action: balatroAction):
-    """NEXT: leave the shop (to the blind select), play the blind on deck, or Cash Out. In
-    STAGE_END the end of the round runs in _settle, with the joker order the player left."""
+def _next_branch(state):
+    """_next's branch: 0 leave the shop, 1 play the blind on deck, 2 Cash Out, 3 STAGE_END."""
     st = state.game_stage
-    branch = jnp.select([st == STAGE_SHOP, st == STAGE_CASHOUT, st == STAGE_END], [0, 2, 3], 1)
-    return jax.lax.switch(branch, [_leave_shop, _start_blind, _cash_out, lambda s: s], state), \
+    return jnp.select([st == STAGE_SHOP, st == STAGE_CASHOUT, st == STAGE_END], [0, 2, 3], 1)
+
+
+def _next(state: balatroEnvState, action: balatroAction, pre=None):
+    """NEXT: leave the shop (to the blind select), play the blind on deck, or Cash Out. In
+    STAGE_END the end of the round runs in _settle, with the joker order the player left.
+    pre: env_step's _Pre (its _start_blind result); None = call it here."""
+    start = _start_blind if pre is None else (lambda s: pre.started)
+    return jax.lax.switch(_next_branch(state), [_leave_shop, start, _cash_out, lambda s: s], state), \
         jnp.int32(0), jnp.bool_(False)
 
 
@@ -2864,6 +2952,17 @@ def _noop(state: balatroEnvState, action: balatroAction):
 # index = verb (env_step sends DISCARD to PLAY's and PICK to USE's); the last entry is V_NOOP
 _HANDLERS = [_blind_action, _noop, _buy, _sell, _reroll, _next, _move_joker, _move_card,
              _use_pick, _sell_cons, _open, _noop, _skip, _redeem, _noop]
+
+
+class _Pre(NamedTuple):
+    """What env_step computes before the switch: _start_blind(state) and apply_cons(...)."""
+    started: "balatroEnvState"
+    used: "balatroEnvState"
+
+
+# env_step's switch: _next and _use_pick take its _Pre, the other handlers do not
+_SWITCH = [(lambda s, a, p, h=h: h(s, a, p)) if h in (_next, _use_pick) else (lambda s, a, p, h=h: h(s, a))
+           for h in _HANDLERS]
 
 
 def _fresh_deal(key, card_live, hand_size):

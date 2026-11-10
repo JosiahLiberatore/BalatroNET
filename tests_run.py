@@ -16,7 +16,7 @@ from env import (balatroAction, env_step, deal, reset, explain_play, preview, ac
                  invariant_errors, blind_target, MAX_HAND_SIZE, MAX_SHOP_SLOTS,
                  V_PLAY, V_DISCARD, V_BUY, V_SELL, V_REROLL, V_NEXT, V_MOVE_JOKER, V_MOVE_CARD,
                  STAGE_BLIND, STAGE_SHOP, STAGE_LOST, STAGE_WON, STAGE_SELECT, STAGE_NAMES, N_VERBS,
-                 STAGE_END, STAGE_CASHOUT, BLIND_SMALL, BLIND_BIG, BLIND_BOSS)
+                 STAGE_END, STAGE_CASHOUT, BLIND_SMALL, BLIND_BIG, BLIND_BOSS, V_USE, V_PICK)
 from items import BOSS_MIN_ANTE, BOSS_SHOWDOWN, TAG_MIN_ANTE, IK_JOKER
 from jokers import JOKER_ID, J_EMPTY, MAX_JOKERS, N_JOKERS, COMMON
 from fixtures import state, select, mask_lanes, diff_states, report
@@ -578,6 +578,49 @@ def run_vmap_determinism_test():
     return c.done()
 
 
+def run_compact_test(n_envs=32, n_steps=80, seed=7):
+    """env.compacted: vmap(env_step) gathers the envs that start a blind / use a consumable into
+    a buffer; it must equal env_step env by env (lax.map: no vmap, the lax.cond path). Here the
+    buffer holds 1 env (COMPACT_DIV = n_envs), so a step with k such envs takes k passes.
+    Random verbs (illegal ones too); half the batch has 1-chip targets and $40 (shop traffic)."""
+    import env as _env
+    c = Checks("compacted == env by env")
+    div = _env.COMPACT_DIV
+    _env.COMPACT_DIV = n_envs
+    jax.clear_caches()                        # env_step is @jit: trace it again with the new buffer
+    try:
+        keys = jax.random.split(jax.random.key(seed), n_envs)
+        states = jax.vmap(lambda k: reset(k, 52, 8))(keys)
+        easy = jnp.arange(n_envs) % 2 == 0
+        states = states._replace(blind_target=jnp.where(easy, 1, states.blind_target),
+                                 money=jnp.where(easy, 40, states.money))
+        batched = jax.jit(jax.vmap(env_step))
+        by_env = jax.jit(lambda s, a: jax.lax.map(lambda x: env_step(*x), (s, a)))
+        akey = jax.random.key(seed + 1)
+        n_start = n_use = 0
+        for t in range(n_steps):
+            akey, k1, k2, k3, k4 = jax.random.split(akey, 5)
+            verb = jax.random.randint(k1, (n_envs,), -1, N_VERBS + 1)
+            a = balatroAction(verb=verb, select=jax.random.bernoulli(k2, 0.3, (n_envs, MAX_HAND_SIZE)),
+                              target=jax.random.randint(k3, (n_envs,), -2, 34),
+                              dest=jax.random.randint(k4, (n_envs,), -2, 10))
+            n_start += int(((verb == V_NEXT) & (states.game_stage == STAGE_SELECT)).sum())
+            n_use += int(((verb == V_USE) | (verb == V_PICK) | (verb == V_BUY)).sum())
+            got, r, d = batched(states, a)
+            want, r1, d1 = by_env(states, a)
+            c.same_state(f"step {t}", got, want)
+            c.eq(f"step {t} reward", r, r1)
+            c.eq(f"step {t} done", d, d1)
+            states = want._replace(blind_target=jnp.where(easy, 1, want.blind_target))
+        c.check("NEXT at the blind select happened", n_start > 0, n_start)
+        c.check("USE / PICK / BUY happened", n_use > 0, n_use)
+        print(f"  compacted: {n_start} NEXT at the blind select, {n_use} USE / PICK / BUY")
+    finally:
+        _env.COMPACT_DIV = div
+        jax.clear_caches()
+    return c.done()
+
+
 def run_legal_mask_test(n_envs=64, n_steps=60, seed=5):
     """agent.legal_mask must mirror env_step: a legal choice changes the state,
     a masked one is a no-op. Checked on every state of a random-play batch.
@@ -935,7 +978,7 @@ def run_hidden_obs_test():
 
 
 ALL = [run_repair_test, run_deal_empty_test, run_blind_end_test, run_targets_test,
-       run_shop_test, run_explain_test, run_vmap_determinism_test, run_full_run_test,
+       run_shop_test, run_explain_test, run_vmap_determinism_test, run_compact_test, run_full_run_test,
        run_move_reach_test, run_fuzz_test]
 # the agent tests are not in the default run (env work); python tests_run.py agent runs them
 AGENT = [run_hidden_obs_test, run_legal_mask_test, run_picker_test, run_embed_test]
