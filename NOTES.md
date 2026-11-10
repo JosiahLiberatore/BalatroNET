@@ -613,8 +613,25 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
       hidden joker order, a seen joker, the shop playing card, the Spectral pack, the blind select);
       the legal mask test now plays from the blind select (skips, boss rerolls, redeems). 6 new
       scenarios (Bosses: The Wheel x3, Amber Acorn x3).
-- [ ] later: joker pipeline — full provisional spec at bottom of file ("v0.2 joker/scoring engine")
-- [ ] later: economy/shop/phase + curriculum — full provisional spec at bottom ("v0.2 economy/shop/phase + curriculum")
+- [x] train.py --deck / --stake (2026-11-08, 2dd79c6): every run names its deck and stake; a resume
+      with another deck or stake stops (the ckpt keeps "game"). Run: Red Deck, Gold Stake, on the node.
+- [x] Env speed (2026-11-10, d20b07f). No rule change: env_step gives the same output bit for bit.
+      - PROFILE (GPU, 1024 envs, the training's mix; a piece made a no-op inside the real env_step,
+        jax.clear_caches() first: env_step is @jit): of 42 ms, enter_select 10, NEXT 7.7 (_start_blind
+        5.4), USE / PICK 6.5 (apply_cons 6.0), PLAY / DISCARD 3.6 (score_play 2.0), _redraw 1.6, the 9
+        other handlers 2.8, end_round / end_window / _track_down / draw ~0, a jit call that copies the
+        state 2.2. The env is ~40 % of an update, the network ~60 %.
+      - THE CAUSE: vmap runs every lax.switch branch and every tree_where side for every env; the
+        heavy parts that few envs need cost the most.
+      - FIXES: the tag loops run to 1 + the last held slot (_tag_span), not MAX_TAGS. compacted(f)
+        (a custom_vmap): one env = lax.cond; under vmap the envs with need are gathered into a buffer
+        of batch / COMPACT_DIV (8) envs, f runs there, the results are scattered back, more passes
+        if more envs need it. env_step calls _start_blind and apply_cons through it before the verb
+        switch (a custom_vmap cannot sit in a switch branch under vmap: the switch batches its consts).
+      - RESULT: env_step 42 -> 25 ms; rollout 3280 -> 2150 ms; training 13k -> 16k steps/s.
+      - TESTS: tests_run.run_compact_test (1-env buffer == env by env, lax.map).
+- [x] joker pipeline (the "v0.2 joker/scoring engine" spec at the bottom of the file is history)
+- [x] economy / shop / phase + curriculum (the "v0.2 economy/shop/phase + curriculum" spec at the bottom is history)
 
 ## design decisions (so far)
 - struct-of-arrays everywhere; staple into one tensor only in observe()
@@ -645,6 +662,8 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - The Ox: a tie uses the pairs() order of a new run; after a save + continue the game uses another
 - at most 8 held tags (MAX_TAGS)
 - no endless mode (every stake and every deck is in)
+- no challenge runs, and no game seeds: the env's random numbers are JAX's, so a game seed
+  (N6QD4HV9 ...) does not give the same run (not needed yet, 2026-11-10)
 - an Ankh / Invisible Joker copy of a perished joker is perished and adds nothing (the game's
   add_to_deck still gives its hand size / discards; a game bug) (kept, 2026-11-05)
 - Crimson Heart with no joker to pick (a perished joker and the last pick): the env picks none
