@@ -114,7 +114,7 @@ def ref_g(p):
     return dict(money=int(p.money), hands_left=int(p.hands) - 1, discards=max(int(p.discards), 0),
                 deck_left=max(int(p.deck_size) - int(p.deck_ptr), 0), slots=int(p.joker_slots),
                 nines=int((live & (enh != R.STONE) & (np.asarray(p.card_rank) == R.NINE)).sum()),
-                deck_size=size, played=counts(p.hand_played), round=counts(p.hand_round),
+                deck_size=size, deck_start=int(p.deck_start), played=counts(p.hand_played), round=counts(p.hand_round),
                 targets=dict(idol=int(p.idol_card), mail=int(p.mail_rank),
                              ancient=int(p.ancient_suit), castle=int(p.castle_suit)),
                 is_boss=int(p.blind_index) == BLIND_BOSS, discards_used=int(p.discards_used),

@@ -678,8 +678,8 @@ def ref_play(J, cards, held, g, rolls=None, hrolls=None, rnd=None, mods=None, lu
                 add_c = v
             elif n == "Blue Joker" and g["deck_left"] > 0:
                 add_c = 2 * g["deck_left"]
-            elif n == "Erosion" and 52 - (g["deck_size"] + len(dna)) > 0:          # the DNA copies count
-                add_m = 4 * (52 - (g["deck_size"] + len(dna)))
+            elif n == "Erosion" and g["deck_start"] - (g["deck_size"] + len(dna)) > 0:   # the DNA copies count
+                add_m = 4 * (g["deck_start"] - (g["deck_size"] + len(dna)))
             elif n == "Bull" and money > 0:
                 add_c = 2 * money
             elif n == "Blackboard" and all(is_suit(c, CLUBS, m, "flush") or is_suit(c, SPADES, m, "flush")

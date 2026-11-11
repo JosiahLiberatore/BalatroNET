@@ -9,6 +9,9 @@
     python debug_agent.py               # runs/params_run.pkl if present
     python debug_agent.py fresh         # a random (untrained) policy
     python debug_agent.py 0.25          # at target scale 0.25 (default 1.0 = real game)
+    python debug_agent.py --deck plasma --stake gold
+                                        # the deck and the stake (default: the ones of
+                                        # runs/ckpt_run.pkl, else Red Deck, White Stake)
 """
 
 import os
@@ -31,10 +34,16 @@ from agent import (init_params, act, action_name, masked_logits, legal_mask, mov
                    is_move, A_PLAY, A_DISCARD, A_MOVE_CARD, A_BUY, A_SELL, A_OPEN, A_USE, A_SELL_CONS,
                    N_ACTIONS)
 from env import STAGE_PACK, STAGE_NAMES, card_id
-from items import CONS_NAMES, PACK_NAMES
+from items import CONS_NAMES, PACK_NAMES, BACK_NAMES, STAKE_NAMES, IK_JOKER, IK_CARD, B_RED
 from jokers import JOKER_NAMES
 from scoring import HAND_NAMES
-from train import load_params, PARAMS_PATH, DECK, HAND
+from train import load_params, load_ckpt, parse_deck, parse_stake, PARAMS_PATH, CKPT_PATH, DECK, HAND
+
+BACK, STAKE = B_RED, 1      # the deck and the stake of every run here (set in __main__)
+
+
+def new_run(key, scale):
+    return reset(key, DECK, HAND, scale, stake=STAKE, back=BACK)
 
 SUIT_PIP = {"C": "♣", "D": "♦", "H": "♥", "S": "♠"}
 RESET = "\033[0m"
@@ -63,7 +72,7 @@ def _probs(params, state):
 # ---------- one run, verbose ----------
 def inspect_run(params, key, scale=1.0, max_steps=400):
     key, sk = jax.random.split(key)
-    state = reset(sk, DECK, HAND, scale)
+    state = new_run(sk, scale)
     print(f"=== one run at target scale {scale} ===")
     total = 0
     for step in range(max_steps):
@@ -92,7 +101,10 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
         elif A_BUY <= a < A_SELL:
             i = a - A_BUY
             it = int(state.shop_slots[i])
-            line += f"  {(JOKER_NAMES if int(state.shop_kind[i]) == 0 else CONS_NAMES)[it]}"
+            kind = int(state.shop_kind[i])
+            line += "  " + (JOKER_NAMES[it] if kind == IK_JOKER else
+                            "23456789TJQKA"[int(state.shop_rank[i])] + "CDHS"[int(state.shop_suit[i])]
+                            if kind == IK_CARD else CONS_NAMES[it])
         elif A_OPEN <= a < A_USE:
             line += f"  {PACK_NAMES[int(state.pack_slots[a - A_OPEN])]}"
         state, reward, done = _step(state, action)
@@ -110,7 +122,7 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
 # ---------- many runs, aggregate ----------
 def _run_batch(params, keys, scale, max_steps):
     def one(key):
-        state = reset(key, DECK, HAND, scale)
+        state = new_run(key, scale)
         def step(c, k):
             s, done = c
             action, st = act(params, s, k)
@@ -160,6 +172,20 @@ if __name__ == "__main__":
     key = jax.random.key(0)
     key, ik = jax.random.split(key)
     args = sys.argv[1:]
+    opt = {}
+    for flag in ("--deck", "--stake"):
+        if flag in args:
+            i = args.index(flag)
+            opt[flag] = args[i + 1]
+            del args[i:i + 2]
+    if os.path.exists(CKPT_PATH) and "fresh" not in args:      # the game the params were trained on
+        BACK, STAKE = load_ckpt().get("game", (B_RED, 1))
+    try:
+        BACK = parse_deck(opt["--deck"]) if "--deck" in opt else BACK
+        STAKE = parse_stake(opt["--stake"]) if "--stake" in opt else STAKE
+    except ValueError as e:
+        sys.exit(str(e))
+    print(f"game {BACK_NAMES[BACK]}, {STAKE_NAMES[STAKE - 1]}")
     scale = next((float(x) for x in args if x.replace(".", "", 1).isdigit()), 1.0)
     if "fresh" in args:
         params = init_params(ik)

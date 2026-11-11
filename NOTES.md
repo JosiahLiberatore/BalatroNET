@@ -630,6 +630,20 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
         switch (a custom_vmap cannot sit in a switch branch under vmap: the switch batches its consts).
       - RESULT: env_step 42 -> 25 ms; rollout 3280 -> 2150 ms; training 13k -> 16k steps/s.
       - TESTS: tests_run.run_compact_test (1-env buffer == env by env, lax.map).
+- [x] v1.0 review fixes (2026-11-10). A full read of the project; the rules checked in the Lua.
+      - Erosion counts from the deck size at the run start (game.lua start_run: starting_deck_size
+        = #G.playing_cards), not from 52: new state field deck_start. The Abandoned Deck gave +48
+        Mult on a new run. ref_balatro had the same 52.
+      - explain_play with Burnt Joker at The Hook lowered a hand level by 2 (~ on a Python True is
+        -2). env_step was correct; only the preview (GUI, debug_agent, scenarios) was wrong.
+      - train.py clear_rate: a won round is a new cash-out screen (or the win), not reward > 0 (a
+        won blind can pay $0 on the Red Stake and up).
+      - debug_agent.py: the deck and the stake of runs/ckpt_run.pkl (or --deck / --stake), not
+        always Red Deck, White Stake; the name of a shop playing card.
+      - CHECKED, NO CHANGE: Ankh needs room (card.lua check_use: #jokers >= card_limit = no
+        space); the first Ancient Joker suit can be Spades (start_run sets the suit to nil first).
+      - OPEN (rare, not done): Riff-raff makes at most 4 jokers a blind (the game: 2 per copy, to
+        the slots); a sold Invisible Joker copies with no room check.
 - [x] joker pipeline (the "v0.2 joker/scoring engine" spec at the bottom of the file is history)
 - [x] economy / shop / phase + curriculum (the "v0.2 economy/shop/phase + curriculum" spec at the bottom is history)
 

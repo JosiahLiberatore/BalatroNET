@@ -32,7 +32,8 @@ import sys
 import jax
 import jax.numpy as jnp
 
-from env import reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP, STAGE_SELECT
+from env import (reset, env_step, tree_where, STAGE_LOST, STAGE_WON, STAGE_SHOP, STAGE_SELECT,
+                 STAGE_CASHOUT)
 from agent import (init_params, act, masked_logits, log_prob_entropy, is_move, OBS_DIM,
                    A_PLAY, A_BUY, A_SELL, A_MOVE_JOKER, A_REROLL, A_OPEN, A_USE, A_SELL_CONS,
                    A_PICK, A_SKIP, A_REDEEM, N_ACTIONS)
@@ -130,7 +131,10 @@ def env_step_auto(params, state, run, key, scale):
     finished = {"done": done, "ret": run["ret"], "ante": nxt.ante.astype(jnp.float32),
                 "won": nxt.game_stage == STAGE_WON, "buys": run["buys"], "steps": run["steps"],
                 "pen": run["pen"],
-                "cleared": reward > 0, "failed": done & (nxt.game_stage == STAGE_LOST),
+                # a won round: the cash-out screen (or the win) is new; its $ can be 0
+                "cleared": (state.game_stage != STAGE_CASHOUT)
+                           & ((nxt.game_stage == STAGE_CASHOUT) | (nxt.game_stage == STAGE_WON)),
+                "failed": done & (nxt.game_stage == STAGE_LOST),
                 "in_shop": state.game_stage == STAGE_SHOP,
                 "sell": (a >= A_SELL) & (a < A_MOVE_JOKER), "move": moved,   # joker + card moves
                 "streak": streak, "reroll": a == A_REROLL,

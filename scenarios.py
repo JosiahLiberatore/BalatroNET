@@ -777,6 +777,13 @@ JOKERS = [
       blind(jokers=("Erosion",), deck_size=50),
       [play("KD KC")],
       [C("the Pair: mult 2 + 8", lambda r: float(r.play(0).mult), 10.0)]),
+    S("Jokers", "Erosion", "counts from the starting deck size",
+      """Erosion counts the cards below the deck size at the run start (starting_deck_size), not
+      below 52. A run that started with 50 cards and still has 50: +0 Mult. Pair: 30 x 2 = 60.""",
+      blind(jokers=("Erosion",), deck_size=50, deck_start=50),
+      [play("KD KC")],
+      [C("the Pair: mult 2 + 0", lambda r: float(r.play(0).mult), 2.0),
+       C("score", lambda r: int(r.play(0).score), 60)]),
     S("Jokers", "Misprint", "+0 to +23 Mult, at random",
       """Misprint adds a random whole number from 0 to 23 to the Mult.""",
       blind(jokers=("Misprint",), key=7),
@@ -2073,6 +2080,14 @@ BOSSES = [
          lambda r: len(set(r[1].hand) & {"2H", "3S", "4C", "6D", "7H", "8S"}), 4),
        C("cards in hand", lambda r: r[1].in_hand, 8), C("discards left", lambda r: r[1].discards, 2),
        C("score: the Pair as normal", _score(), 60)]),
+    S("Bosses", "The Hook + Burnt Joker", "The Hook's discard is not Burnt Joker's",
+      """The Hook's discard uses no discard and does not fire Burnt Joker (the first discard of
+      the round is still to come). Play KD alone: High Card stays level 1 in the preview and in
+      the step: (5 + 10) x 1 = 15.""",
+      boss("The Hook", jokers=("Burnt Joker",)),
+      [play("KD")],
+      [C("score (the preview)", _score(), 15), C("chips scored (the step)", lambda r: int(r.raw[1].chips_scored), 15),
+       C("High Card level", lambda r: r[1].level("high_card"), 1)]),
     S("Bosses", "The Ox", "the most played hand sets money to $0",
       """The Ox: playing the run's most played poker hand (as it was when the ante began) sets
       money to $0; the hand still scores. The Pair is the most played; play a Pair with $20.""",
@@ -3744,6 +3759,7 @@ DECKS = [
       _run_deck("Abandoned Deck"),
       [],
       [C("cards", lambda r: r[0].deck_size, 40), C("face cards", lambda r: _faces(r), 0),
+       C("starting deck size (Erosion counts from it)", lambda r: int(r.raw[0].deck_start), 40),
        C("suits (Clubs, Diamonds, Hearts, Spades)", lambda r: _suit_counts(r), [10, 10, 10, 10])]),
     S("Decks", "Checkered Deck", "26 Spades and 26 Hearts",
       """Checkered Deck: every Club becomes a Spade and every Diamond a Heart: 26 Spades, 26

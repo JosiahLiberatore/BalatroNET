@@ -286,6 +286,7 @@ class balatroEnvState(NamedTuple):
     deck         : jax.Array   # (128,) int32   -- permutation of instance slots, live first
     deck_size    : jax.Array   # scalar int32   -- live cards; rest are free slots
     deck_ptr     : jax.Array   # scalar int32   -- next card to deal
+    deck_start   : jax.Array   # scalar int32   -- the cards at the run start (starting_deck_size: Erosion)
 
     # budget
     handcount    : jax.Array   # scalar int32   -- hands granted this round
@@ -707,7 +708,7 @@ def build_ctx(state) -> jax.Array:
     .at[Q_JOKER_COUNT].set(held)
     .at[Q_MONEY].set(jnp.maximum(state.money, 0))
     .at[Q_OTHER_SELL].set(state.joker_sell_value.sum())        # minus its own, per slot
-    .at[Q_DECK_LOST].set(jnp.maximum(52 - d["size"], 0))
+    .at[Q_DECK_LOST].set(jnp.maximum(state.deck_start - d["size"], 0))
     .at[Q_DELAYED_GRAT].set(jnp.where(state.discards_used == 0, jnp.maximum(state.discards, 0), 0))
     .at[Q_DECK_STEEL_COUNT].set(d["steel"])
     .at[Q_DECK_STONE_COUNT].set(d["stone"])
@@ -1561,7 +1562,7 @@ def _discard_cards(state, cards, valid, hook, key):
     deb = card_debuffed(state, cards, mods) & valid
     first_discard = state.discards_used == 0
     dsc = _discard(pr, ps, valid, ids, state.joker_value, state.joker_state, targets(state), mods, pe, deb)
-    burnt = _effects(state, T_ON_DISCARD, E_LEVEL_UP).sum() * first_discard * ~hook
+    burnt = _effects(state, T_ON_DISCARD, E_LEVEL_UP).sum() * first_discard * jnp.logical_not(hook)
     dhand = detect(pr, ps, valid, mods, jnp.where(deb & (pe == ENH_WILD), ENH_NONE, pe)).handtype
     purple = (valid & (pseal == SEAL_PURPLE) & ~deb).sum()
     # Trading Card (not its copies): each one pays $3; the card is destroyed once
@@ -3068,6 +3069,7 @@ def reset(key, deckSize, handSize, target_scale=1.0, stake=1, back=B_RED):
         deck=deck,
         deck_size=n,
         deck_ptr=jnp.int32(0),
+        deck_start=n,
         hands=n_hands,
         discards=n_disc,
         handcount=n_hands,

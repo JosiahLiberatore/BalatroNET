@@ -209,7 +209,7 @@ def play_cards(rank, suit, valid, names=(), *, money=0, discards=3, deck_left=0,
 # ---------------------------------------------------------------------------
 # THE BUILDER — every field defaulted, so a new state field lands only here
 # ---------------------------------------------------------------------------
-def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
+def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52, deck_start=52,
           deck_ptr=None, hands=3, discards=2, handcount=4, discardcount=3,
           round=1, ante=1, chips_scored=0, blind_target=300,
           shop_slots=(EMPTY, EMPTY, EMPTY, EMPTY), jokers=(), consumables=(),
@@ -389,6 +389,7 @@ def state(hand="", *, valid=None, hand_size=None, deck=None, deck_size=52,
         deck=jnp.asarray(deck, dtype=jnp.int32),
         deck_size=jnp.int32(deck_size),
         deck_ptr=jnp.int32(deck_ptr),
+        deck_start=jnp.int32(deck_start),
         hands=jnp.int32(hands),
         discards=jnp.int32(discards),
         handcount=jnp.int32(handcount),
