@@ -642,8 +642,10 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
         always Red Deck, White Stake; the name of a shop playing card.
       - CHECKED, NO CHANGE: Ankh needs room (card.lua check_use: #jokers >= card_limit = no
         space); the first Ancient Joker suit can be Spades (start_run sets the suit to nil first).
-      - OPEN (rare, not done): Riff-raff makes at most 4 jokers a blind (the game: 2 per copy, to
-        the slots); a sold Invisible Joker copies with no room check.
+      - A sold Invisible Joker copies only with jokers <= slots (card.lua 2381, "No room!"); the
+        env copied always. It matters with more jokers than slots (a Negative one sold before).
+      - KEPT (2026-11-10, too rare): Riff-raff makes at most 4 jokers a blind (the game: 2 per
+        trigger, to the slots; Blueprint + Brainstorm + 8 slots make more).
 - [x] joker pipeline (the "v0.2 joker/scoring engine" spec at the bottom of the file is history)
 - [x] economy / shop / phase + curriculum (the "v0.2 economy/shop/phase + curriculum" spec at the bottom is history)
 

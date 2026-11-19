@@ -20,11 +20,12 @@ a debuffed card (the boss) has a red cross; Cerulean Bell's forced card says so.
 Keys:  1-8 toggle a card   Enter play (at the blind select: play the blind)   D discard
        R / S sort by rank / suit
        V deck view   N new run   Left / Right move the selected joker   Esc close a popup / quit
-Model: P model view on/off (hides the panel, the odds and the pick outline)
+Model: P model view on/off (hides the panel, the odds and the pick outline; on: face-down
+       cards and jokers show their face under a blue tint, off: only their back)
        M take the model's pick   A auto-play on/off   G greedy / sampled pick
        O card odds on/off.  The panel on the right always shows the model's
        odds for the current state, at every stage.
-       --params runs/params_run.pkl (default)   --scale 0.2 (the training curriculum scale)
+       --params FILE (default: the newest runs/params_*.pkl)   --scale 0.2 (the training curriculum scale)
 Dev:   +$10, the Add Joker and Add Tarot / Planet dropdowns (scroll wheel when the list is long)
        L shows the hand levels.
 Seed:  the seed box: click it, type a number, Enter starts that seed (Esc cancels)
@@ -1113,7 +1114,7 @@ class App:
 
     def model_step(self):
         """Carry out the model's pick through env_step, like any human action."""
-        if int(self.h.game_stage) not in (STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT):
+        if int(self.h.game_stage) not in (STAGE_BLIND, STAGE_SHOP, STAGE_PACK, STAGE_SELECT, STAGE_END, STAGE_CASHOUT):
             self.ai_auto = False
             return
         a, sel, src, dst = self.ai_choice()
@@ -1514,6 +1515,18 @@ class App:
         pygame.draw.line(surf, (90, 120, 200), inner.topleft, inner.bottomright, 2)
         pygame.draw.line(surf, (90, 120, 200), inner.topright, inner.bottomleft, 2)
 
+    def mark_down(self, rect, radius=9):
+        """The review peek (model view on): a face-down card or joker shows its face under a
+        blue tint with a "face down" tag. The model still does not see it (agent.observe)."""
+        tint = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(tint, BACK_C + (120,), tint.get_rect(), border_radius=radius)
+        self.screen.blit(tint, rect)
+        pygame.draw.rect(self.screen, (90, 120, 200), rect.inflate(-6, -6), 2, border_radius=6)
+        tag = pygame.Rect(0, 0, min(rect.w - 6, 74), 18)
+        tag.midbottom = (rect.centerx, rect.bottom - 3)
+        box(self.screen, tag, BACK_C, 5)
+        text(self.screen, self.fonts.small, "face down", TEXT, tag.center, "center")
+
     def mark_debuffed(self, rect):
         """The boss debuffs it: a red cross."""
         r = rect.inflate(-18, -18)
@@ -1527,7 +1540,7 @@ class App:
         surf, f = self.screen, self.fonts
         if forced:
             text(surf, f.small, "forced", DEBUFF_C, (rect.centerx, rect.bottom + 8), "midtop")
-        if down:
+        if down and not self.show_model:   # a player's view: only its back
             return self.draw_back(rect, selected)
         box(surf, rect.move(0, 5), (20, 44, 34), 9)
         edge = SEL_EDGE if selected else ED_EDGE.get(card.ed, CARD_EDGE)
@@ -1554,6 +1567,8 @@ class App:
             surf.blit(dim, rect)
         if debuffed:
             self.mark_debuffed(rect)
+        if down:
+            self.mark_down(rect)
 
     def draw_sidebar(self):
         s, f, h = self.screen, self.fonts, self.h
@@ -1665,7 +1680,7 @@ class App:
             jid = int(h.jokers[i])
             name = JOKER_NAMES[jid]
             ed = int(h.joker_ed[i])
-            if bool(h.joker_down[i]):                       # Amber Acorn: face down
+            if bool(h.joker_down[i]) and not self.show_model:   # Amber Acorn: face down
                 self.draw_back(r, i in (self.joker_sel, held_slot))
                 continue
             box(s, r, PANEL, 10, SEL_EDGE if i in (self.joker_sel, held_slot) else RARITY_C[int(JOKER_RARITY[jid])], 3)
@@ -1693,6 +1708,8 @@ class App:
             else:                                           # a narrow card: the label alone, 2 lines
                 for k, line in enumerate(wrap(f.small, label, r.w - 4)[:2]):
                     text(s, f.small, clip(f.small, line, r.w - 4), col, (r.centerx, r.bottom - 31 + 14 * k), "midtop")
+            if bool(h.joker_down[i]):
+                self.mark_down(r, 10)
 
     def draw_stickers(self, r, words, y):
         """A joker's stake stickers, one line across the card (each word in its color)."""
@@ -2262,7 +2279,12 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--scale", type=float, default=1.0,
                     help="blind target scale (the training curriculum dial); 1.0 = real game")
-    ap.add_argument("--params", default=PARAMS_PATH,
-                    help="trained params .pkl for the model panel (default runs/params_run.pkl)")
+    ap.add_argument("--params", default=None,
+                    help="trained params .pkl for the model panel (default: the newest runs/params_*.pkl)")
     args = ap.parse_args()
+    if args.params is None:                    # a start with no arguments (code runner): the newest saved model
+        import glob
+        found = sorted(glob.glob(os.path.join(os.path.dirname(PARAMS_PATH), "params_*.pkl")), key=os.path.getmtime)
+        args.params = found[-1] if found else PARAMS_PATH
+        print("model params:", args.params)
     App(args.seed, args.scale, args.params).run()

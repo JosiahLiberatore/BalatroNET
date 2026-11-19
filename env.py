@@ -2325,7 +2325,8 @@ def _redeem(state: balatroEnvState, action: balatroAction):
 def _sell(state: balatroEnvState, action: balatroAction):
     """SELL the joker in slot target (not an Eternal one): the other jokers see a card sold
     (Campfire); its own ability on a sale (Luchador: disable the boss; Diet Cola: a Double Tag;
-    Invisible Joker after 2 rounds: a copy of a random other joker); then the $ and it is gone.
+    Invisible Joker after 2 rounds: a copy of a random other joker, not with more jokers than
+    slots); then the $ and it is gone.
     A sold joker disables Verdant Leaf."""
     t = action.target
     slot = jnp.clip(t, 0, MAX_JOKERS - 1)
@@ -2351,6 +2352,9 @@ def _sell(state: balatroEnvState, action: balatroAction):
         & others.any()
     # the copy of an Invisible Joker starts at 0 rounds (card.lua: invis_rounds = 0; Ankh's copy keeps them)
     n_held = (s.jokers != J_EMPTY).sum()
+    # "No room!": no copy with more jokers than slots (card.lua 2381: #G.jokers.cards <= card_limit,
+    # the sold joker and a Negative one's slot still counted)
+    dup = dup & (n_held <= s.joker_slots)
     copied = copy_joker(s, _random_slot(k1, others))
     fresh = copied.jokers[n_held] == J_INVISIBLE
     copied = copied._replace(joker_value=copied.joker_value.at[n_held].set(

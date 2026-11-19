@@ -3148,6 +3148,15 @@ NEW_JOKERS = [
       shop(jokers=("Invisible Joker", "Bull"), joker_value=(1.0, 0.0)),
       [sell(0)],
       [C("jokers", lambda r: r[1].jokers, ["Bull"])]),
+    S("Jokers", "Invisible Joker", "no room: more jokers than slots, no copy",
+      """The sale copies only when the jokers (the Invisible Joker included) are not more than the
+      joker slots (card.lua: #G.jokers.cards <= card_limit, else "No room!"). 6 jokers in 5 slots
+      (a Negative Invisible Joker sold before can do this): no copy. With 5 in 5 it copies.""",
+      shop(jokers=("Invisible Joker", "Invisible Joker", "Bull", "Bull", "Bull", "Bull"),
+           joker_value=(2.0, 2.0, 0.0, 0.0, 0.0, 0.0)),
+      [sell(0), sell(0)],
+      [C("jokers after the 1st sale (6 in 5: no copy)", lambda r: len(r[1].jokers), 5),
+       C("jokers after the 2nd sale (5 in 5: a copy)", lambda r: r[2].jokers, ["Bull"] * 5)]),
     S("Jokers", "Invisible Joker", "counts the rounds",
       """Invisible Joker counts each round it is held.""",
       blind(clear=True, jokers=("Invisible Joker",), joker_value=(1.0,)),

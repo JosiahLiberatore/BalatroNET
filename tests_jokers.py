@@ -1380,7 +1380,7 @@ def check_step(c, tag, p, a, q, reward, out=None):
             if acts and en == "Diet Cola":
                 _add_tag(w, "Double Tag", 0)
             dup = None
-            if acts and nm == "Invisible Joker" and x0["v"] >= 2 and n > 1:
+            if acts and nm == "Invisible Joker" and x0["v"] >= 2 and n > 1 and n <= int(p.joker_slots):   # else "No room!"
                 q_names = [NAME[int(j)] for j in q.jokers if j >= 0]
                 if len(q_names) == n:
                     dup = q_names[-1]
