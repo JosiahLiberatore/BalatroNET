@@ -73,6 +73,7 @@ the MOVE pointers score the joker / card tokens, and the picker scores the card
 tokens.
 """
 
+import os
 from typing import NamedTuple
 
 import jax
@@ -620,10 +621,12 @@ JOKER_FEATS = ITEM_FEATS[:N_JOKERS]
 
 
 # --- the token encoder --------------------------------------------------------------
-TOK_D = 64                                  # token width
+# BNET_TOK_D / BNET_LAYERS / BNET_FF_D: a model size test sets these in the environment;
+# a model of another size loads only with the same values set.
+TOK_D = int(os.environ.get("BNET_TOK_D", 64))        # token width
 N_HEADS = 4
-N_LAYERS = 2
-FF_D = 128                                  # the feed-forward width in each layer
+N_LAYERS = int(os.environ.get("BNET_LAYERS", 2))
+FF_D = int(os.environ.get("BNET_FF_D", 2 * TOK_D))   # the feed-forward width in each layer
 # Tokens only for the slots the env can fill (held jokers are packed, lanes <
 # hand_size); the obs and the action layout keep all 32. tests_run checks the caps.
 J_TOK = 16                                  # held joker tokens (items.MAX_JOKER_SLOTS: 5 slots + Antimatter + Negatives)
