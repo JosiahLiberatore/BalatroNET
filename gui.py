@@ -27,6 +27,7 @@ Model: P model view on/off (hides the panel, the odds and the pick outline; on: 
        odds for the current state, at every stage.
        --params FILE (default: the newest runs/params_*.pkl)   --scale 0.2 (the training curriculum scale)
 Dev:   +$10, the Add Joker and Add Tarot / Planet dropdowns (scroll wheel when the list is long)
+       the stake dropdown (or K: the next stake): a new run of the same seed at that stake
        L shows the hand levels.
 Seed:  the seed box: click it, type a number, Enter starts that seed (Esc cancels)
        Restart = the same seed again   Random = a random seed   N = seed + 1
@@ -132,6 +133,19 @@ STICKER_C = {STK_ETERNAL: (190, 120, 255), STK_PERISH: (90, 200, 230), STK_RENTA
 STAKE_C   = [(225, 225, 225), (230, 70, 70), (70, 190, 110), (60, 60, 70), (70, 120, 230), (160, 80, 200),
              (240, 140, 50), (240, 200, 60)]
 SEAL_C    = {1: (243, 185, 68), 2: (230, 60, 60), 3: (60, 120, 230), 4: (150, 80, 200)}
+
+
+NEG_BG, NEG_FG = (245, 245, 255), (8, 8, 12)   # a Negative edition's tag: black on white
+
+
+def neg_tag(surf, font, midtop, width):
+    """The "NEGATIVE" tag of a Negative joker / consumable: black on a white pill."""
+    w = min(font.size("NEGATIVE")[0] + 14, width)
+    r = pygame.Rect(0, 0, w, 17)
+    r.midtop = (midtop[0], midtop[1] - 1)
+    pygame.draw.rect(surf, NEG_BG, r, border_radius=6)
+    pygame.draw.rect(surf, NEG_FG, r, 1, border_radius=6)
+    text(surf, font, clip(font, "NEGATIVE", w - 6), NEG_FG, r.center, "center")
 
 
 def odds_color(p):
@@ -561,7 +575,7 @@ class App:
         self.fonts = Fonts()
         self.clock = pygame.time.Clock()
         self.seed = seed
-        self.stake = 1                 # 1 White .. 8 Gold (K: the next stake, a new run)
+        self.stake = 1                 # 1 White .. 8 Gold (the stake dropdown, or K: the next stake; a new run)
         self.back = 0                  # the deck, items.BACK_NAMES (B: the next deck, a new run)
         self.log = []
         self.show_deck = False
@@ -571,6 +585,7 @@ class App:
                                    lambda jid: self.give_joker(jid))
         self.cons_menu = Dropdown((558, 710, 150, 30), "Add Card    ", self.cons_menu_rows,
                                   lambda cid: self.give_cons(cid), width=360)
+        self.stake_menu = Dropdown((824, 716, 100, 30), "White   ", self.stake_menu_rows, self.set_stake, width=450)
         self.show_levels = False
         self.test_mode = False         # T: the scenario tests
         self.test_scs = []             # the scenarios, listed on the first T, in the test menu's order
@@ -1250,8 +1265,6 @@ class App:
         b["deck"] = Button((1150, 710, 116, 36), "Deck (V)", PANEL_HI)
         b["levels"] = Button((928, 716, 86, 30), "Levels", AI_C if self.show_levels else PANEL_HI)
         b["tests"] = Button((716, 716, 104, 30), "Tests (T)", AI_C if self.test_mode else PANEL_HI)
-        b["stake"] = Button((824, 716, 100, 30), STAKE_NAMES[self.stake - 1].split()[0] + " (K)", PANEL_HI,
-                            not self.test_mode)
         b["back"] = Button((1076, 186, 190, 28), BACK_NAMES[self.back] + " (B)", PANEL_HI, not self.test_mode)
         b["model"] = Button((1020, 710, 120, 36), "Model (P)", AI_C if self.show_model else PANEL_HI,
                             not self.test_mode)
@@ -1288,6 +1301,8 @@ class App:
         if self.seed_edit is not None and not self.buttons()["seed"].hit(pos):
             self.seed_edit = None          # a click outside the seed box cancels it
         if self.joker_menu.click(pos) or self.cons_menu.click(pos):
+            return
+        if not self.test_mode and self.stake_menu.click(pos):
             return
         if self.test_mode and self.test_menu.click(pos):
             return
@@ -1376,8 +1391,6 @@ class App:
             self.new_run(int.from_bytes(os.urandom(4), "little") >> 1)
         elif name == "dev_money":
             self.give_money(10)
-        elif name == "stake":
-            self.next_stake()
         elif name == "back":
             self.next_back()
         elif name == "deck":
@@ -1412,11 +1425,21 @@ class App:
         self.new_run(self.seed)
         self.say(f"{BACK_NAMES[self.back]}: {BACK_DESC[self.back]}.")
 
-    def next_stake(self):
-        """The next stake (Gold goes back to White): a new run with the same seed."""
-        self.stake = self.stake % N_STAKES + 1
+    def stake_menu_rows(self, query=""):
+        q = query.lower().strip()
+        return [(name + ("  (now)" if st == self.stake else ""), STAKE_DESC[st - 1], STAKE_C[st - 1], True, st)
+                for st, name in enumerate(STAKE_NAMES, 1) if q in name.lower()]
+
+    def set_stake(self, stake):
+        """The stake dropdown's pick: a new run with the same seed at that stake."""
+        self.stake_menu.open = False
+        self.stake = int(stake)
         self.new_run(self.seed)
         self.say(f"{STAKE_NAMES[self.stake - 1]}: {STAKE_DESC[self.stake - 1]}.")
+
+    def next_stake(self):
+        """K: the next stake (Gold goes back to White)."""
+        self.set_stake(self.stake % N_STAKES + 1)
 
     def toggle(self, lane):
         if lane in self.selected:
@@ -1686,8 +1709,11 @@ class App:
             box(s, r, PANEL, 10, SEL_EDGE if i in (self.joker_sel, held_slot) else RARITY_C[int(JOKER_RARITY[jid])], 3)
             if ed:
                 pygame.draw.rect(s, ED_EDGE[ed], r.inflate(-6, -6), 2, border_radius=8)
-                text(s, f.small, clip(f.small, ED_NAMES[ed], r.w - 8), ED_EDGE[ed] if ed != 4 else DIM,
-                     (r.centerx, r.bottom - 48), "midtop")
+                if ed == 4:
+                    neg_tag(s, f.small, (r.centerx, r.bottom - 48), r.w - 8)
+                else:
+                    text(s, f.small, clip(f.small, ED_NAMES[ed], r.w - 8), ED_EDGE[ed],
+                         (r.centerx, r.bottom - 48), "midtop")
             stk = sticker_words(h.joker_sticker[i], h.joker_perish[i])
             if stk:
                 self.draw_stickers(r, stk, r.bottom - (64 if ed else 48))
@@ -1733,7 +1759,10 @@ class App:
         text(s, fit(f, name, r.w - 10), name, TEXT, (r.centerx, r.y + 8), "midtop")
         yy = r.y + 34
         if tag:
-            text(s, f.small, tag, edge, (r.centerx, yy), "midtop")
+            if ed == 4:
+                neg_tag(s, f.small, (r.centerx, yy), r.w - 8)
+            else:
+                text(s, f.small, tag, edge, (r.centerx, yy), "midtop")
             yy += 17
         for line in wrap(f.small, desc, r.w - 14)[:4]:
             text(s, f.small, line, DIM, (r.centerx, yy), "midtop")
@@ -1910,7 +1939,7 @@ class App:
                 text(s, f.small, line, DIM, (r.centerx, yy + 4), "midtop")
                 yy += 16
             if int(h.cons_ed[i]) == 4:                       # Perkeo's copy: Negative, no slot
-                text(s, f.small, "Negative", DIM, (r.centerx, r.bottom - 38), "midtop")
+                neg_tag(s, f.small, (r.centerx, r.bottom - 38), r.w - 8)
             if int(h.cons_sell[i]) > 1:                      # Gift Card raised it
                 text(s, f.small, f"sells ${int(h.cons_sell[i])}", MONEY_C, (r.centerx, r.bottom - 20), "midtop")
 
@@ -2228,6 +2257,10 @@ class App:
         text(s, self.fonts.small, "dev", DIM, (14, 694))
         self.joker_menu.draw(s, self.fonts)        # last, so the open list sits on top
         self.cons_menu.draw(s, self.fonts)
+        sm = self.stake_menu                       # the button shows the stake of the run
+        sm.button.label, sm.button.enabled = STAKE_NAMES[self.stake - 1].split()[0] + "   ", not self.test_mode
+        sm.open = sm.open and not self.test_mode
+        sm.draw(s, self.fonts)
         if self.test_mode:
             self.test_menu.draw(s, self.fonts)
         if self.show_deck:
@@ -2240,9 +2273,10 @@ class App:
         while True:
             for e in pygame.event.get():
                 if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE and (
-                        self.joker_menu.open or self.cons_menu.open or self.test_menu.open or self.show_deck
-                        or self.show_levels or self.seed_edit is not None):
+                        self.joker_menu.open or self.cons_menu.open or self.test_menu.open or self.stake_menu.open
+                        or self.show_deck or self.show_levels or self.seed_edit is not None):
                     self.joker_menu.open = self.cons_menu.open = self.test_menu.open = False   # Esc closes popups first
+                    self.stake_menu.open = False
                     self.show_deck = self.show_levels = False
                     self.seed_edit = None
                     continue
@@ -2255,7 +2289,8 @@ class App:
                     self.release(e.pos)
                 if e.type == pygame.MOUSEMOTION and self.drag:
                     self.drag[3] = e.pos
-                menu = next((m for m in (self.joker_menu, self.cons_menu, self.test_menu) if m.open), None)
+                menu = next((m for m in (self.joker_menu, self.cons_menu, self.test_menu, self.stake_menu)
+                             if m.open), None)
                 if e.type == pygame.MOUSEWHEEL and menu:
                     menu.wheel(e.y)
                 if e.type == pygame.TEXTINPUT and menu:
