@@ -29,6 +29,7 @@ wandb/
 # Editors / OS
 tempCodeRunnerFile.py
 .vscode/
+.claude/
 .idea/
 Thumbs.db
 .DS_Store
