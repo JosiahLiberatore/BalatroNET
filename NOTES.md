@@ -685,7 +685,7 @@ Sanity target: reset with a known seed, print the hand, score it with scoreHand 
 - Crimson Heart with no joker to pick (a perished joker and the last pick): the env picks none
   (the game: pseudorandom_element on an empty list, a Lua error)
 - the round's chips stop at 2^31 - 1, a hand's score at 2,147,483,520 (int32; the game: a double,
-  up to ~1e308). No result changes: the run ends at ante 8, whose largest target is 300,000
+  up to ~1e308). No result changes: the run ends at ante 8, whose largest target is 2,400,000 (200,000 x 6 Violet Vessel x 2 Plasma Deck)
 - found in the Lua review (2026-11-04), kept as they are:
   - the score floor is float32 (+-1 chip only at an exact target); retrigger caps 12 scored /
     6 held (only Showman duplicates or long copy chains pass them)
