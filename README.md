@@ -9,6 +9,31 @@ BalatroNET has three parts:
 The environment is one pure function, `env_step(state, action)`. It works with `jit` and `vmap`, so
 1,024 runs go in parallel on one GPU. The rules follow the Lua code of Balatro 1.0.1o.
 
+## Setup
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install jax numpy pygame tensorboardX tensorboard
+```
+
+JAX uses only the CPU on Windows. Training on a GPU needs WSL2 or Linux.
+
+## Run
+
+```bash
+python gui.py                    # play by hand, or look at the model (--seed N, --params FILE)
+python train.py fresh            # start a training run (Red Deck, White Stake)
+python train.py                  # resume from runs/ckpt_run.pkl
+python train.py --deck plasma --stake gold --steps 100000
+python debug_agent.py            # one run step by step, then the numbers of 512 runs
+python tests.py                  # all test suites
+tensorboard --logdir runs        # the training curves
+```
+
+`train.py` writes a checkpoint to `runs/` every 500 updates. `--grad-chunks 16` splits the gradient
+pass so that it fits in 8 GB of GPU memory.
+
 ## Initial release
 
 ### The environment
@@ -135,31 +160,6 @@ The goal is an agent that wins about 50% of its runs on Gold Stake. The work in 
 
 - A larger model (4 layers at width 128). A test on White Stake is running.
 - Maybe look into splitting the reward between passing a blind and money? So the agent is focused on clears instead of maximizing cash
-
-## Setup
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install jax numpy pygame tensorboardX tensorboard
-```
-
-JAX uses only the CPU on Windows. Training on a GPU needs WSL2 or Linux.
-
-## Run
-
-```bash
-python gui.py                    # play by hand, or look at the model (--seed N, --params FILE)
-python train.py fresh            # start a training run (Red Deck, White Stake)
-python train.py                  # resume from runs/ckpt_run.pkl
-python train.py --deck plasma --stake gold --steps 100000
-python debug_agent.py            # one run step by step, then the numbers of 512 runs
-python tests.py                  # all test suites
-tensorboard --logdir runs        # the training curves
-```
-
-`train.py` writes a checkpoint to `runs/` every 500 updates. `--grad-chunks 16` splits the gradient
-pass so that it fits in 8 GB of GPU memory.
 
 ## History
 
