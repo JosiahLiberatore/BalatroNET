@@ -83,7 +83,7 @@ from agent import (observe, encode, legal_mask, move_masks, masked_logits, sampl
                    pick_query, pick_bounds, uses_picker, init_params, action_name, is_move, OBS_DIM,
                    O_GLOB, N_ACTIONS, ACTION_VERB, ACTION_TARGET, A_PLAY, A_DISCARD, A_BUY, A_SELL,
                    A_MOVE_JOKER, A_MOVE_CARD, A_REROLL, A_OPEN, A_USE, A_SELL_CONS, A_PICK, A_SKIP,
-                   A_REDEEM)
+                   A_REDEEM, value_parts)
 from train import load_params, PARAMS_PATH, REWARD_SCALE
 
 GW = 1280                  # the game area; the model panel sits to its right
@@ -658,6 +658,13 @@ class App:
         if errs:
             self.say("INVARIANT BROKEN: " + "; ".join(errs))
             print("INVARIANT BROKEN:", errs, file=sys.stderr)
+
+    def value_text(self):
+        """The model's value of this state: the money stream in $, and the win stream when
+        the params have it (a cleared blind is BLIND_REWARD, the win adds WIN_BONUS)."""
+        vw, vm = value_parts(np.asarray(self.ai["value"]))
+        out = f"V = ${float(vm) / REWARD_SCALE:.1f} expected from here"
+        return out if vw is None else out + f", win stream {float(vw):.1f}"
 
     def say(self, msg):
         self.log.append(msg)
@@ -2023,7 +2030,7 @@ class App:
         text(s, f.bold, "MODEL", AI_C, (x, 22))
         text(s, f.small, self.model_label, DIM, (x0 + PANEL_W - 28, 26), "topright")
         text(s, f.small, f"{'greedy' if self.ai_greedy else 'sampled'} pick   "
-                         f"V = ${float(self.ai['value']) / REWARD_SCALE:.1f} expected from here",
+                         + self.value_text(),
              DIM, (x, 46))
 
         a, sel, src, dst = self.ai_choice()

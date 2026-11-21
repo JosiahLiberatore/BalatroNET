@@ -733,6 +733,15 @@ def encode(params, obs) -> Encoded:
 
 # --- network --------------------------------------------------------------------
 HIDDEN = 256
+# The value heads, one per reward stream of train.py. Params from before the win stream
+# have one head, the money (value_parts reads both forms).
+N_VALUES = 2
+V_WIN, V_MONEY = 0, 1
+
+
+def value_parts(value):
+    """Heads.value -> (the win stream's value or None, the money stream's value)."""
+    return (value[..., V_WIN] if value.shape[-1] == N_VALUES else None), value[..., -1]
 N_SCORED = 7                                # token-scored action groups: BUY, SELL, OPEN, USE, SELL_CONS, PICK, REDEEM
 
 
@@ -790,7 +799,7 @@ def init_params(key, obs_dim=None):
     p["Wpv"] = dense(D, PICK_D, 1.0)[0]
     p["Wn"] = table(MAX_PICK + 1, PICK_D)                      # how many picked so far
     p["vo"], p["vs"], p["bstop"] = jnp.zeros(PICK_D), jnp.zeros(PICK_D), jnp.zeros(1)   # start uniform
-    p["Wv"], p["bv"] = dense(HIDDEN, 1, 1.0)
+    p["Wv"], p["bv"] = dense(HIDDEN, N_VALUES, 1.0)            # the value heads: win, money
     return p
 
 
@@ -805,11 +814,11 @@ class Heads(NamedTuple):
     k     : jax.Array   # (MAX_HAND_SIZE, PICK_D)  per-lane key   (for the lanes picked so far)
     w     : jax.Array   # (MAX_HAND_SIZE, PICK_D)  per-lane value (for the lanes picked so far)
     ptr   : jax.Array   # (4, N_PTR)
-    value : jax.Array   # ()
+    value : jax.Array   # (N_VALUES,)  win, money (see value_parts)
 
 
 def policy(params, obs, src, enc: Encoded = None):
-    """obs -> raw (action (N_ACTIONS,), picker query (4, PICK_D), pointer (4, 32), value (), Encoded).
+    """obs -> raw (action (N_ACTIONS,), picker query (4, PICK_D), pointer (4, 32), value (N_VALUES,), Encoded).
     The two dst rows are conditioned on src (the joker src for row 1, the card
     src for row 3; one src serves both, only the verb's own pair is read).
     enc = encode(params, obs) when the caller already has it."""
@@ -830,7 +839,7 @@ def policy(params, obs, src, enc: Encoded = None):
                      ct @ qp[2],
                      ct @ (qp[3] + ct[s] @ Rp[1]) + Pm[1, s]])
     return (a, (h @ params["Wq"] + params["bq"]).reshape(4, PICK_D), ptr,
-            (h @ params["Wv"] + params["bv"])[0], enc)
+            h @ params["Wv"] + params["bv"], enc)
 
 
 def masked_logits(params, obs, legal, hand_valid, mmask, src=0, enc: Encoded = None) -> Heads:
@@ -1007,4 +1016,4 @@ if __name__ == "__main__":
     print("params", sum(x.size for x in jax.tree.leaves(params)))
     a, st = act(params, s, jax.random.key(1))
     print("sampled", action_name(st.a, st.src, st.dst), "select", st.sel[:8].astype(int),
-          "value", float(st.value), "logp", float(st.logp), "lo/hi", int(st.lo), int(st.hi))
+          "value", [float(x) for x in st.value], "logp", float(st.logp), "lo/hi", int(st.lo), int(st.hi))

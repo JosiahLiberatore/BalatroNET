@@ -32,7 +32,7 @@ from env import reset, env_step, explain_play, _card_name, STAGE_BLIND, STAGE_WO
 from env import BLIND_NAMES
 from agent import (init_params, act, action_name, masked_logits, legal_mask, move_masks, observe,
                    is_move, A_PLAY, A_DISCARD, A_MOVE_CARD, A_BUY, A_SELL, A_OPEN, A_USE, A_SELL_CONS,
-                   N_ACTIONS)
+                   N_ACTIONS, value_parts)
 from env import STAGE_PACK, STAGE_NAMES, card_id
 from items import CONS_NAMES, PACK_NAMES, BACK_NAMES, STAKE_NAMES, IK_JOKER, IK_CARD, B_RED
 from jokers import JOKER_NAMES
@@ -111,7 +111,8 @@ def inspect_run(params, key, scale=1.0, max_steps=400):
         total += int(reward)
         if int(reward):
             line += f"  -> cashout ${int(reward)}"
-        print(line + f"  V={float(value):.2f}")
+        vw, vm = value_parts(value)
+        print(line + (f"  Vwin={float(vw):.2f}" if vw is not None else "") + f"  V$={float(vm):.2f}")
         if bool(done):
             break
     end = {STAGE_WON: "WON", STAGE_LOST: "LOST"}.get(int(state.game_stage), "cut off")
